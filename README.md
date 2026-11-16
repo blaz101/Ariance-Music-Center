@@ -2,17 +2,9 @@
 
 ## What's new in 1.28
 
-- **Equalizer.** A 25-band graphical EQ (20 Hz – 20 kHz, 0.1 dB steps) and a
-  parametric EQ (peak, low-shelf and high-shelf bands with frequency, gain and Q).
-  Each tab keeps its own curve, so switching between them changes nothing.
-- **Presets and profiles.** Save named curves for each tab, and import or export
-  Equalizer APO profiles (`.txt`) or Nebula JSON profiles.
-- **Per-band readouts.** Every graphic band shows its gain above the slider.
-- **Bit-perfect switch.** Bypasses the equalizer and disables its controls. The
-  exclusive output path itself is not part of this release.
-- **Equalizer needs ffmpeg.** The equalised audio is rendered with the system
-  `ffmpeg` when a track starts, and the package recommends it. Without ffmpeg the
-  window still opens for editing, but nothing is applied.
+-Added 25-band graphic and parametric EQ
+-EQ profile import & export
+-bit perfect output
 
 ## What's new in 1.27.1
 
