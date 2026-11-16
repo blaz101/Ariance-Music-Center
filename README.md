@@ -2,9 +2,9 @@
 
 ## What's new in 1.28
 
--Added 25-band graphic and parametric EQ
--EQ profile import & export
--bit perfect output
+-**Added 25-band graphic and parametric EQ**
+-**EQ profile import & export**
+-**bit perfect output**
 
 ## What's new in 1.27.1
 
