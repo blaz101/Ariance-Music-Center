@@ -2,36 +2,15 @@
 
 ## What's new in 1.29
 
-- **Lyrics support.** Local `.lrc` sidecars and lyrics embedded as ID3 `USLT`,
-  Vorbis `LYRICS` or MP4 `©lyr` are read alongside LRCLIB and lyrics.ovh.
-  Preferences > Lyrics sets the source order and switches each source on or off;
-  LRCLIB can return plain or synchronized lyrics, and a track with more than one
-  match can choose between them.
-- **Full LRC creation and editing.** The player's lyrics button opens a three-line
-  synchronized view with a live countdown through blank timed lines. The Timed
-  Lyrics Editor creates and updates `.lrc` files with Lyrics, Syncer, Preview,
-  Metadata and Save tabs, waveform and transport controls, keyboard timing,
-  per-track and per-line adjustments, and Save/Revert. Its song picker searches the
-  music library and only browses music folders.
-- **Gapless playback.** The next track is loaded on a spare deck before the current
-  one ends, so there is no gap between tracks.
-- **Crossfade.** Playback can overlap the end of one track with the next, with a
-  0-12 second length set from its own dialog. Crossfade takes over gapless while it
-  is on, and the Playback menu shows the current length.
-- **Play random album.** Music > Play random album chooses an album at random and
-  queues it in disc/track order.
-- **Sleep timer.** Playback > Sleep timer pauses after a chosen number of minutes,
-  with Cancel sleep timer.
-- **Automatic library scanning.** Music folders are watched, and a quiet rescan
-  runs when files or folders change; a rescan requested during a running scan is
-  queued instead of dropped.
-- **Verify copies after sync.** A per-profile and per-preset option reads every
-  copied file back from the device and checks its SHA-256, including transcoded
-  copies. A failed check is logged and the copy record is invalidated so the next
-  compare repairs it.
-- **New inspiration credit.** The About window now credits
-  [Subtitle Tools](https://subtitletools.com/premium) alongside Mp3Tag, Strawberry
-  Music Player and FreeFileSync.
+- New Inspiration credit
+- Added lyric support for .lrc, ID3 USLT, Vorbis LYRICS, MP4 ©lyr), LRCLIB, and lyrics.ovh 
+- Full LRC creation and editing
+- Gapless playback
+- Crossfade
+- Play albums in random order
+- Sleep timer
+- Auto-scan library folders on change
+- Verify files after sync
 
 ## What's new in 1.28
 
