@@ -24,6 +24,8 @@ import tempfile
 import time
 import wave
 
+import mutagen
+
 HOME = tempfile.mkdtemp(prefix="nebula-deep-")
 os.environ["HOME"] = HOME
 DATA = os.path.join(HOME, "Nebula")
@@ -38,12 +40,13 @@ ASSETS = os.path.join(ROOT, "assets")
 sys.path.insert(0, ROOT)
 sys.path.insert(0, ASSETS)
 
-from mutagen.id3 import ID3, TALB, TCON, TDRC, TIT2, TPE1, TRCK  # noqa: E402
+from mutagen.id3 import ID3, TALB, TCON, TDRC, TIT2, TPE1, TRCK, USLT  # noqa: E402
 from mutagen.wave import WAVE  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtGui import QTextCursor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,  # noqa: E402
-                               QMessageBox, QPushButton)
+                               QLabel, QMessageBox, QPushButton, QToolButton)
 
 import nebula  # noqa: E402
 
@@ -167,7 +170,7 @@ dialog_calls = [
     and isinstance(node.func.value, ast.Name) and node.func.value.id == "QFileDialog"
     and node.func.attr.startswith("get")]
 check("every file dialog call passes the native chooser options",
-      len(dialog_calls) == 22 and all(
+      len(dialog_calls) == 23 and all(
           any(keyword.arg == "options" and isinstance(keyword.value, ast.Name)
               and keyword.value.id in {"FILE_DIALOG_OPTIONS", "DIRECTORY_DIALOG_OPTIONS"}
               for keyword in call.keywords)
@@ -182,13 +185,13 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.28", nebula.VERSION == "1.28", nebula.VERSION)
+check("version is 1.29", nebula.VERSION == "1.29", nebula.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Nebula Music Center 1.28\n"), readme[:40])
-check("README has a 1.28 section", "## What's new in 1.28" in readme)
+      readme.startswith("# Nebula Music Center 1.29\n"), readme[:40])
+check("README has a 1.29 section", "## What's new in 1.29" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.28", "\nV=1.28\n" in build, build[:200])
+check("the package script builds 1.29", "\nV=1.29\n" in build, build[:200])
 
 # ---------------------------------------------------------------- config
 section("config: defaults, types, backup and recovery")
@@ -305,6 +308,179 @@ check("FLAC tags are read", nebula.read_tags(FLAC1)["artist"] == "Boards of Cana
       nebula.read_tags(FLAC1))
 check("MP3 tags are read", nebula.read_tags(MP3A)["title"] == "Delta")
 
+section("lyrics: sidecars, embedded tags and source order")
+parsed = nebula.parse_lyrics("[ar:Test]\n[offset:100]\n"
+                             "[00:01.50][00:03.00]Hello\n[00:02.00]World\n")
+check("LRC timestamps, repeats and the offset tag parse",
+      parsed["synced"] and parsed["lines"] == [(1600, "Hello"), (2100, "World"),
+                                                (3100, "Hello")], parsed)
+plain = nebula.parse_lyrics("Plain one\n\nPlain two")
+check("plain lyrics keep their paragraphs",
+      not plain["synced"] and plain["text"] == "Plain one\n\nPlain two", plain)
+sidecar_audio = os.path.join(HOME, "lyrics-sidecar.mp3")
+with open(os.path.join(HOME, "lyrics-sidecar.lrc"), "w", encoding="utf-8") as handle:
+    handle.write("[00:00.00]Sidecar line one\n[00:02.00]Sidecar line two\n")
+check("a case-insensitive LRC sidecar is found",
+      nebula.parse_lyrics(nebula.read_lrc_lyrics(sidecar_audio))["text"]
+      == "Sidecar line one\nSidecar line two", nebula.read_lrc_lyrics(sidecar_audio))
+lyrics_mp3 = os.path.join(HOME, "lyrics-tag.mp3")
+shutil.copyfile(MP3A, lyrics_mp3)
+audio = mutagen.File(lyrics_mp3)
+audio.tags.add(USLT(encoding=3, lang="eng", desc="",
+                    text="Embedded line one\nEmbedded line two"))
+audio.save()
+check("USLT lyrics are read from an MP3",
+      nebula.read_embedded_lyrics(lyrics_mp3) == "Embedded line one\nEmbedded line two",
+      nebula.read_embedded_lyrics(lyrics_mp3))
+lyrics_wav = os.path.join(HOME, "lyrics-tag.wav")
+shutil.copyfile(WAV1, lyrics_wav)
+audio = mutagen.File(lyrics_wav)
+if audio.tags is None:
+    audio.add_tags()
+audio.tags.add(USLT(encoding=3, lang="eng", desc="", text="WAV line"))
+audio.save()
+check("USLT lyrics are read from a WAV",
+      nebula.read_embedded_lyrics(lyrics_wav) == "WAV line",
+      nebula.read_embedded_lyrics(lyrics_wav))
+blank_lyrics_audio = os.path.join(HOME, "lyrics-blank.mp3")
+shutil.copyfile(MP3A, blank_lyrics_audio)
+blank_sidecar = nebula.write_lrc_lyrics(
+    blank_lyrics_audio, lines=[(1000, ""), (2000, "Line")])
+blank_saved = nebula.read_lrc_lyrics(blank_sidecar)
+check("timed empty lines save as clear cues without the editor label",
+      blank_saved == "[00:01.00]\n[00:02.00]Line",
+      blank_saved)
+blank_result = nebula._lyrics_result(blank_saved, "lrc")
+check("timed empty lines survive loading a sidecar",
+      blank_result is not None
+      and blank_result["lines"] == [(1000, ""), (2000, "Line")],
+      blank_result)
+lyrics_flac = os.path.join(HOME, "lyrics-tag.flac")
+shutil.copyfile(FLAC1, lyrics_flac)
+audio = mutagen.File(lyrics_flac)
+audio["LYRICS"] = "Vorbis line one\nVorbis line two"
+audio.save()
+check("LYRICS is read from a Vorbis comment",
+      nebula.read_embedded_lyrics(lyrics_flac) == "Vorbis line one\nVorbis line two",
+      nebula.read_embedded_lyrics(lyrics_flac))
+lyrics_m4a = os.path.join(HOME, "lyrics-tag.m4a")
+shutil.copyfile(AB_CH1, lyrics_m4a)
+audio = mutagen.File(lyrics_m4a)
+audio["\xa9lyr"] = "M4A line"
+audio.save()
+check("©lyr lyrics are read from an M4A",
+      nebula.read_embedded_lyrics(lyrics_m4a) == "M4A line",
+      nebula.read_embedded_lyrics(lyrics_m4a))
+check("the default lyric order puts local sources first",
+      nebula.lyric_order(fresh_config()) == ["lrc", "tags", "lrclib", "lyrics_ovh"],
+      nebula.lyric_order(fresh_config()))
+local_only = fresh_config(lyric_order=[["lrc", True], ["tags", True],
+                                       ["lrclib", False], ["lyrics_ovh", False]])
+check("lyrics resolve from a sidecar first",
+      nebula.resolve_lyrics(sidecar_audio, local_only)["source"] == "lrc",
+      nebula.resolve_lyrics(sidecar_audio, local_only))
+check("lyrics fall through to the embedded tag",
+      nebula.resolve_lyrics(lyrics_mp3, local_only)["source"] == "tags",
+      nebula.resolve_lyrics(lyrics_mp3, local_only))
+calls = []
+def fake_lyrics_get(url, timeout=8):
+    calls.append(url)
+    return json.dumps({"instrumental": False,
+                       "syncedLyrics": "[00:01.00]Online line\n[00:03.00]Online two",
+                       "plainLyrics": "Online line\nOnline two"}).encode("utf-8")
+real_lyrics_get = nebula._lyrics_http_get
+nebula._lyrics_http_get = fake_lyrics_get
+try:
+    remote = nebula.lookup_lrclib(lyrics_mp3)
+finally:
+    nebula._lyrics_http_get = real_lyrics_get
+check("LRCLIB exact lookup returns synchronized lyrics",
+      remote and remote["source"] == "lrclib"
+      and remote["lines"] == [(1000, "Online line"), (3000, "Online two")]
+      and "/api/get?" in calls[0] and "duration=1" in calls[0],
+      (remote, calls))
+
+
+def fake_search_lyrics_get(url, timeout=8):
+    if "/api/get?" in url:
+        raise nebula.urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+    return json.dumps([
+        {"id": 1, "trackName": "Delta", "artistName": "MP3 Artist",
+         "albumName": "First", "duration": 1, "instrumental": False,
+         "syncedLyrics": "[00:01.00]First version", "plainLyrics": "First version"},
+        {"id": 2, "trackName": "Delta", "artistName": "MP3 Artist",
+         "albumName": "Second", "duration": 2, "instrumental": False,
+         "syncedLyrics": "[00:02.00]Second version", "plainLyrics": "Second version"},
+        {"id": 3, "trackName": "Delta", "artistName": "MP3 Artist",
+         "albumName": "Third", "duration": 10, "instrumental": False,
+         "syncedLyrics": "[00:01.00]Long version", "plainLyrics": "Plain long version"},
+    ]).encode("utf-8")
+remote_only = fresh_config(lyric_order=[["lrc", False], ["tags", False],
+                                        ["lrclib", True], ["lyrics_ovh", False]])
+nebula._lyrics_http_get = fake_search_lyrics_get
+try:
+    match_result = nebula.resolve_lyrics(lyrics_mp3, remote_only)
+finally:
+    nebula._lyrics_http_get = real_lyrics_get
+check("multiple LRCLIB matches are offered as choices",
+      match_result and len(match_result.get("choices") or []) == 3
+      and [choice["label"] for choice in match_result["choices"]]
+      == ["Delta - MP3 Artist · First (0:01)", "Delta - MP3 Artist · Second (0:02)",
+          "Delta - MP3 Artist · Third (0:10) · unsynced (length differs)"],
+      match_result)
+check("a length-mismatched match uses its plain lyrics",
+      match_result["choices"][2]["result"].get("duration_mismatch")
+      and match_result["choices"][2]["result"]["text"] == "Plain long version"
+      and not match_result["choices"][2]["result"]["lines"],
+      match_result["choices"][2]["result"])
+nebula.forget_lyrics_match(lyrics_mp3)
+check("lyric shifts default to zero and save per track",
+      nebula.get_lyrics_offset(lyrics_mp3) == 0.0
+      and nebula.save_lyrics_offset(lyrics_mp3, 1.25)
+      and abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      nebula.get_lyrics_offset(lyrics_mp3))
+nebula._LYRICS_MATCH_CACHE = None
+check("a lyric shift reloads from disk",
+      abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      nebula.get_lyrics_offset(lyrics_mp3))
+check("saving a match keeps the track's lyric shift",
+      nebula.save_lyrics_match(lyrics_mp3, 8, "Shifted match")
+      and abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      nebula.get_lyrics_match(lyrics_mp3))
+check("a zero shift removes only the shift",
+      nebula.save_lyrics_offset(lyrics_mp3, 0)
+      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0
+      and (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 8,
+      nebula.get_lyrics_match(lyrics_mp3))
+nebula.forget_lyrics_match(lyrics_mp3)
+check("a chosen LRCLIB match is saved for its track",
+      nebula.save_lyrics_match(lyrics_mp3, 2, "Second")
+      and (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
+      nebula.get_lyrics_match(lyrics_mp3))
+nebula._LYRICS_MATCH_CACHE = None
+check("a saved match reloads from disk",
+      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
+      nebula.get_lyrics_match(lyrics_mp3))
+saved_calls = []
+def fake_saved_lyrics_get(url, timeout=8):
+    saved_calls.append(url)
+    return json.dumps({"id": 2, "trackName": "Delta", "artistName": "MP3 Artist",
+                       "albumName": "Second", "duration": 2, "instrumental": False,
+                       "syncedLyrics": "[00:02.00]Saved version",
+                       "plainLyrics": "Saved version"}).encode("utf-8")
+nebula._lyrics_http_get = fake_saved_lyrics_get
+try:
+    saved_result = nebula.lookup_lrclib(lyrics_mp3)
+finally:
+    nebula._lyrics_http_get = real_lyrics_get
+check("a saved match is fetched by its LRCLIB id",
+      saved_result and saved_result.get("saved_match")
+      and saved_result.get("lrclib_id") == 2
+      and saved_result.get("lines") == [(2000, "Saved version")]
+      and saved_calls == ["https://lrclib.net/api/get/2"],
+      (saved_result, saved_calls))
+nebula.forget_lyrics_match(lyrics_mp3)
+
 section("tag writes: every field and format")
 tag_values = {
     "title": "Matrix Title", "artist": "Matrix Artist", "album": "Matrix Album",
@@ -346,10 +522,22 @@ check("tracks come back ordered", [r["title"] for r in rows][:2] == ["Alpha", "B
 check("the library knows a path", FLAC1 in library.by_path())
 library.scan([MUSIC])
 check("a rescan keeps the same track count", library.count() == 4, library.count())
+nebula.save_lyrics_match(WAV1, 7, "Alpha match")
+nebula.save_lyrics_offset(WAV1, 1.5)
 gone = library.forget_prefix(ALBUM_A)
 library.rescan = None
-check("forgetting a folder drops only its tracks",
-      gone == 2 and library.count() == 2, (gone, library.count()))
+check("forgetting a folder drops only its tracks and its saved lyrics state",
+      gone == 2 and library.count() == 2 and nebula.get_lyrics_match(WAV1) is None
+      and nebula.get_lyrics_offset(WAV1) == 0.0,
+      (gone, library.count(), nebula.get_lyrics_match(WAV1),
+       nebula.get_lyrics_offset(WAV1)))
+nebula.save_lyrics_match(lyrics_mp3, 9, "Removed match")
+nebula.save_lyrics_offset(lyrics_mp3, 2.0)
+library.remove_paths([lyrics_mp3])
+check("removing a track from the library forgets its saved lyrics state",
+      nebula.get_lyrics_match(lyrics_mp3) is None
+      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0,
+      (nebula.get_lyrics_match(lyrics_mp3), nebula.get_lyrics_offset(lyrics_mp3)))
 library.scan([MUSIC])
 check("a rescan brings a forgotten folder back", library.count() == 4, library.count())
 
@@ -405,6 +593,9 @@ nebula.save_config(boot)
 w = nebula.MainWindow()
 w.show()
 app.processEvents()
+check("the main window is titled Nebula Music Center",
+      w.windowTitle() == nebula.APP_NAME == "Nebula Music Center",
+      (w.windowTitle(), nebula.APP_NAME))
 titles = [w.tabs.tabText(i) for i in range(w.tabs.count())]
 check("the tabs are Music, Audiobooks, Tags, Devices, Syncing",
       titles == ["Music", "Audiobooks", "Tags", "Devices", "Syncing"], titles)
@@ -418,11 +609,502 @@ def menu_titles():
 
 
 check("the Music tab shows the player menus",
-      menu_titles() == ["Music", "Playlist", "Tools", "Help"], menu_titles())
+      menu_titles() == ["Music", "Playlist", "Tools", "Playback", "Help"], menu_titles())
 w.tabs.setCurrentWidget(w.audiobooks_tab)
 app.processEvents()
 check("the Audiobooks tab has its own menu set",
-      menu_titles() == ["Audiobooks", "Playlist", "Tools", "Help"], menu_titles())
+      menu_titles() == ["Audiobooks", "Playlist", "Tools", "Playback", "Help"],
+      menu_titles())
+playback_menu = next(a.menu() for a in w.menuBar().actions()
+                     if a.text().replace("&", "") == "Playback")
+playback_actions = [a.text() for a in playback_menu.actions() if a.text()]
+check("Playback holds stop-after, gapless, crossfade and the sleep timer",
+      playback_actions == ["Stop after this track", "Gapless playback", "Crossfade…",
+                           "Sleep timer…", "Cancel sleep timer"],
+      playback_actions)
+check("the Tools menu no longer holds the sleep timer",
+      "Sleep timer…" not in [a.text() for a in
+                             next(a.menu() for a in w.menuBar().actions()
+                                  if a.text().replace("&", "") == "Tools").actions()],
+      [a.text() for a in next(a.menu() for a in w.menuBar().actions()
+                              if a.text().replace("&", "") == "Tools").actions()])
+w._playback_after.setChecked(True)
+w._playback_gapless.setChecked(True)
+check("the Playback actions drive the player",
+      w.player.stop_after and w.player.gapless,
+      (w.player.stop_after, w.player.gapless))
+w._playback_after.setChecked(False)
+w._playback_gapless.setChecked(False)
+crossfade = nebula.CrossfadeDialog(w.player, w)
+crossfade.spin.setValue(2.5)
+check("the crossfade window updates the player and config",
+      abs(w.player.crossfade_seconds - 2.5) < 0.01
+      and abs(w.config["crossfade_seconds"] - 2.5) < 0.01,
+      (w.player.crossfade_seconds, w.config.get("crossfade_seconds")))
+w._sync_playback_menu()
+check("the Playback menu shows the crossfade length",
+      w._playback_crossfade.text() == "Crossfade… (2.5 s)",
+      w._playback_crossfade.text())
+crossfade.close()
+w.player.set_crossfade(0)
+w.player.set_queue([sidecar_audio], start=0)
+lyrics_dialog = nebula.LyricsDialog(w.player, fresh_config(
+    lyric_order=[["lrc", True], ["tags", False], ["lrclib", False], ["lyrics_ovh", False]]), w)
+lyrics_dialog.show()
+for _attempt in range(50):
+    app.processEvents()
+    if lyrics_dialog.source_label.text() != "Looking for lyrics…":
+        break
+    QTest.qWait(100)
+
+def lyric_text(index):
+    item = lyrics_dialog.list.item(index)
+    if item is None:
+        return ""
+    widget = lyrics_dialog.list.itemWidget(item)
+    label = widget.findChild(QLabel, "LyricText") if widget is not None else None
+    return label.text() if label is not None else item.text()
+
+def lyric_item_for(millis):
+    for index in range(lyrics_dialog.list.count()):
+        item = lyrics_dialog.list.item(index)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) == millis:
+            return item
+    return None
+
+check("the lyrics window uses the compact wider layout",
+      lyrics_dialog.windowTitle() == "Lyrics - Nebula Music Center"
+      and lyrics_dialog.width() >= 775
+      and lyrics_dialog.height() <= 460,
+      (lyrics_dialog.windowTitle(), lyrics_dialog.width(), lyrics_dialog.height()))
+check("the unchanged LRC has a disabled Save and Revert",
+      lyrics_dialog.save_lrc_btn.text() == "Save"
+      and not lyrics_dialog.save_lrc_btn.isEnabled()
+      and lyrics_dialog.revert_btn.text() == "Revert"
+      and not lyrics_dialog.revert_btn.isEnabled(),
+      (lyrics_dialog.save_lrc_btn.text(), lyrics_dialog.save_lrc_btn.isEnabled(),
+       lyrics_dialog.revert_btn.text(), lyrics_dialog.revert_btn.isEnabled()))
+check("the synced view keeps the helper note out of the way",
+      not lyrics_dialog.note.isVisible(), lyrics_dialog.note.isVisible())
+check("the lyrics window shows a three-line synced view centered on the current line",
+      lyrics_dialog.source_label.text() == "LRC file · synced"
+      and lyrics_dialog.list.count() == 3
+      and lyric_text(0) == ""
+      and lyric_text(1) == "Sidecar line one"
+      and lyric_text(2) == "Sidecar line two",
+      (lyrics_dialog.source_label.text(), lyrics_dialog.list.count(),
+       [lyric_text(i) for i in range(lyrics_dialog.list.count())]))
+lyrics_dialog._show_result({"source": "lrc", "lines": [(0, ""), (15000, "Next line")]})
+check("the lyrics window shows a blank line as a live countdown",
+      lyrics_dialog.list.count() == 3
+      and lyric_text(0) == ""
+      and lyric_text(1) == "Next lyric in 15.0s"
+      and lyric_text(2) == "Next line",
+      [lyric_text(i) for i in range(lyrics_dialog.list.count())])
+check("the lyrics window has a hundredth-second shift control",
+      lyrics_dialog.offset_spin.minimum() == -4.0
+      and lyrics_dialog.offset_spin.maximum() == 4.0
+      and lyrics_dialog.offset_spin.decimals() == 2
+      and abs(lyrics_dialog.offset_spin.singleStep() - 0.01) < 1e-9,
+      (lyrics_dialog.offset_spin.minimum(), lyrics_dialog.offset_spin.maximum(),
+       lyrics_dialog.offset_spin.decimals(), lyrics_dialog.offset_spin.singleStep()))
+nebula.forget_lyrics_match(lyrics_mp3)
+lyrics_dialog._lyrics_path = lyrics_mp3
+lyrics_dialog.offset_spin.setValue(1.5)
+check("the lyrics window saves a per-track shift",
+      abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.5) < 1e-9,
+      nebula.get_lyrics_offset(lyrics_mp3))
+lyrics_dialog._render(match_result or {})
+shifted_item = lyric_item_for(2500)
+check("a positive shift moves synced timestamps later",
+      shifted_item is not None
+      and "shift +1.50 s" in lyrics_dialog.source_label.text(),
+      (shifted_item.data(Qt.ItemDataRole.UserRole) if shifted_item else None,
+       lyrics_dialog.source_label.text()))
+check("the lyrics window lists multiple LRCLIB matches",
+      lyrics_dialog.match_row.isVisible()
+      and lyrics_dialog.match_combo.count() == 3
+      and "First version" in [lyric_text(i)
+                               for i in range(lyrics_dialog.list.count())],
+      (lyrics_dialog.match_combo.count(),
+       [lyric_text(i) for i in range(lyrics_dialog.list.count())]))
+check("the first match is saved for the track",
+      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 1,
+      nebula.get_lyrics_match(lyrics_mp3))
+lyrics_dialog.match_combo.setCurrentIndex(1)
+check("choosing another match switches the lyrics",
+      "Second version" in [lyric_text(i)
+                            for i in range(lyrics_dialog.list.count())]
+      and lyric_item_for(3500) is not None,
+      ([lyric_text(i) for i in range(lyrics_dialog.list.count())],
+       lyric_item_for(3500) is not None))
+lyrics_dialog.match_combo.setCurrentIndex(2)
+check("a length-mismatched match shows its plain lyrics",
+      lyric_text(0) == "Plain long version"
+      and "unsynced (length differs)" in lyrics_dialog.source_label.text()
+      and "not synchronized" in lyrics_dialog.note.text(),
+      (lyrics_dialog.source_label.text(), lyrics_dialog.note.text(),
+       [lyric_text(i) for i in range(lyrics_dialog.list.count())]))
+check("choosing a match replaces the saved one",
+      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 3,
+      nebula.get_lyrics_match(lyrics_mp3))
+lyrics_dialog.match_combo.setCurrentIndex(0)
+lrc_target = os.path.splitext(lyrics_mp3)[0] + ".lrc"
+check("Save as LRC is offered for a local track",
+      lyrics_dialog.save_lrc_btn.text() == "Save as LRC"
+      and lyrics_dialog.save_lrc_btn.isEnabled(),
+      (lyrics_dialog.save_lrc_btn.text(),
+       lyrics_dialog.save_lrc_btn.isEnabled(), lyrics_dialog._lyrics_path))
+lyrics_dialog.save_lrc_btn.click()
+with open(lrc_target, encoding="utf-8") as handle:
+    saved_lrc = handle.read()
+check("Save as LRC writes adjusted timestamps beside the audio",
+      saved_lrc.startswith("[00:02.50]First version")
+      and lyrics_dialog.source_label.text() == "LRC file · synced"
+      and lyric_item_for(2500) is not None,
+      (saved_lrc, lyrics_dialog.source_label.text(),
+       lyric_item_for(2500) is not None))
+check("saving as LRC clears the now-baked-in shift",
+      lyrics_dialog.offset_spin.value() == 0.0
+      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0,
+      (lyrics_dialog.offset_spin.value(), nebula.get_lyrics_offset(lyrics_mp3)))
+check("matching LRC disables Save as LRC",
+      lyrics_dialog.save_lrc_btn.text() == "Save"
+      and not lyrics_dialog.save_lrc_btn.isEnabled()
+      and not lyrics_dialog.revert_btn.isEnabled()
+      and lyrics_dialog.source_label.text() == "LRC file · synced",
+      (lyrics_dialog.save_lrc_btn.text(), lyrics_dialog.save_lrc_btn.isEnabled(),
+       lyrics_dialog.revert_btn.isEnabled(), lyrics_dialog.source_label.text()))
+with open(lrc_target, "w", encoding="utf-8") as handle:
+    handle.write("[ar:Test Artist]\n[00:02.50]First version\n")
+line_item = lyric_item_for(2500)
+line_widget = lyrics_dialog.list.itemWidget(line_item) if line_item else None
+line_buttons = line_widget.findChildren(QToolButton) if line_widget else []
+line_adjustment = (line_widget.findChild(QLabel, "LyricAdjustment")
+                   if line_widget else None)
+check("each synchronized lyric line shows its adjustment and controls",
+      len(line_buttons) == 2
+      and sorted(button.text() for button in line_buttons) == ["+", "-"]
+      and line_adjustment is not None
+      and line_adjustment.text() == "[+0.00]",
+      ([button.text() for button in line_buttons],
+       line_adjustment.text() if line_adjustment is not None else None))
+plus = next((button for button in line_buttons if button.text() == "+"), None)
+if plus is not None:
+    plus.click()
+QTest.qWait(10)
+line_item = lyric_item_for(2510)
+line_widget = lyrics_dialog.list.itemWidget(line_item) if line_item else None
+line_adjustment = (line_widget.findChild(QLabel, "LyricAdjustment")
+                   if line_widget else None)
+check("a line adjustment moves only that line's timestamp",
+      lyric_item_for(2510) is not None
+      and line_adjustment is not None
+      and line_adjustment.text() == "[+0.01]"
+      and lyrics_dialog.save_lrc_btn.text() == "Save"
+      and lyrics_dialog.save_lrc_btn.isEnabled()
+      and lyrics_dialog.revert_btn.isEnabled()
+      and "line edits" in lyrics_dialog.source_label.text(),
+      (lyric_item_for(2510) is not None,
+       line_adjustment.text() if line_adjustment is not None else None,
+       lyrics_dialog.save_lrc_btn.text(), lyrics_dialog.save_lrc_btn.isEnabled(),
+       lyrics_dialog.revert_btn.isEnabled(), lyrics_dialog.source_label.text()))
+lyrics_dialog.save_lrc_btn.click()
+with open(lrc_target, encoding="utf-8") as handle:
+    updated_lrc = handle.read()
+check("saving an existing LRC updates timestamps and keeps metadata",
+      updated_lrc == "[ar:Test Artist]\n[00:02.51]First version\n"
+      and lyrics_dialog.save_lrc_btn.text() == "Save"
+      and lyrics_dialog.source_label.text() == "LRC file · synced"
+      and not lyrics_dialog.save_lrc_btn.isEnabled()
+      and not lyrics_dialog.revert_btn.isEnabled(),
+      (updated_lrc, lyrics_dialog.save_lrc_btn.text(),
+       lyrics_dialog.source_label.text(),
+       lyrics_dialog.save_lrc_btn.isEnabled(), lyrics_dialog.revert_btn.isEnabled()))
+line_item = lyric_item_for(2510)
+line_widget = lyrics_dialog.list.itemWidget(line_item) if line_item else None
+line_buttons = line_widget.findChildren(QToolButton) if line_widget else []
+plus = next((button for button in line_buttons if button.text() == "+"), None)
+if plus is not None:
+    plus.click()
+QTest.qWait(10)
+check("changes after saving offer Revert",
+      lyric_item_for(2520) is not None
+      and lyrics_dialog.save_lrc_btn.isEnabled()
+      and lyrics_dialog.revert_btn.isEnabled(),
+      (lyric_item_for(2520) is not None,
+       lyrics_dialog.save_lrc_btn.isEnabled(), lyrics_dialog.revert_btn.isEnabled()))
+lyrics_dialog.revert_btn.click()
+QTest.qWait(10)
+check("Revert restores the LRC file and disables both buttons",
+      lyric_item_for(2510) is not None
+      and not lyrics_dialog.save_lrc_btn.isEnabled()
+      and not lyrics_dialog.revert_btn.isEnabled()
+      and lyrics_dialog.save_lrc_btn.text() == "Save",
+      (lyric_item_for(2510) is not None,
+       lyrics_dialog.save_lrc_btn.isEnabled(), lyrics_dialog.revert_btn.isEnabled(),
+       lyrics_dialog.save_lrc_btn.text()))
+nebula.forget_lyrics_match(lyrics_mp3)
+lyrics_dialog.close()
+w.player.set_queue([])
+
+section("lyrics editor")
+editor = nebula.LyricsEditorDialog(w.library, w.config, w.player, w)
+check("the lyrics editor has the reference tabs and a song chooser",
+      hasattr(editor, "song_btn")
+      and [editor.editor_tabs.tabText(i) for i in range(editor.editor_tabs.count())]
+      == ["Lyrics", "Syncer", "Preview", "Metadata", "Save"],
+      (hasattr(editor, "song_btn"),
+       [editor.editor_tabs.tabText(i) for i in range(editor.editor_tabs.count())]))
+chooser = nebula.LyricsSongChooserDialog(library, w.config, WAV1, w)
+check("the song chooser has a full-width library search",
+      chooser.search.placeholderText() == "Search the library"
+      and chooser.search.isVisibleTo(chooser),
+      (chooser.search.placeholderText(), chooser.search.isVisibleTo(chooser)))
+chooser.search.setText("Gamma")
+app.processEvents()
+search_paths = []
+stack = [chooser.tree.topLevelItem(i)
+         for i in range(chooser.tree.topLevelItemCount())]
+while stack:
+    item = stack.pop()
+    if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "file":
+        search_paths.append(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+    stack.extend(item.child(i) for i in range(item.childCount()))
+check("searching the song chooser finds library tracks",
+      FLAC1 in search_paths,
+      search_paths)
+chooser.search.clear()
+app.processEvents()
+chooser_roots = [chooser.tree.topLevelItem(i)
+                 for i in range(chooser.tree.topLevelItemCount())]
+music_root = next((item for item in chooser_roots
+                   if item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE) == MUSIC), None)
+check("the song chooser shows only music library folders",
+      music_root is not None and chooser.selected_path() == WAV1
+      and all(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE) != AB
+              for item in chooser_roots),
+      ([(item.text(0), item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+        for item in chooser_roots], chooser.selected_path()))
+if music_root is not None:
+    stack = [music_root]
+    while stack:
+        item = stack.pop()
+        if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "dir":
+            item.setExpanded(True)
+            app.processEvents()
+        stack.extend(item.child(i) for i in range(item.childCount()))
+chooser_paths = []
+stack = [chooser.tree.topLevelItem(i) for i in range(chooser.tree.topLevelItemCount())]
+while stack:
+    item = stack.pop()
+    if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "file":
+        chooser_paths.append(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+    stack.extend(item.child(i) for i in range(item.childCount()))
+check("the song chooser lazy-loads tracks inside folders",
+      WAV1 in chooser_paths and len(chooser_paths) >= 4,
+      chooser_paths)
+chooser.close()
+editor._load_track(lyrics_mp3)
+check("the lyrics editor opens an existing LRC",
+      editor.table.rowCount() == 1
+      and editor.table.item(0, 1).text() == "[00:02.51]"
+      and editor.table.item(0, 2).text() == "First version",
+      (editor.table.rowCount(),
+       editor.table.item(0, 1).text() if editor.table.rowCount() else "",
+       editor.table.item(0, 2).text() if editor.table.rowCount() else ""))
+check("the lyrics editor loads LRC metadata and defaults Tool to Nebula Music Center",
+      editor.meta_fields["ar"][0].isChecked()
+      and editor.meta_fields["ar"][1].text() == "Test Artist"
+      and editor.meta_fields["tool"][0].isChecked()
+      and editor.meta_fields["tool"][1].text() == nebula.APP_NAME,
+      (editor.meta_fields["ar"][0].isChecked(),
+       editor.meta_fields["ar"][1].text(),
+       editor.meta_fields["tool"][0].isChecked(),
+       editor.meta_fields["tool"][1].text()))
+editor._apply_lyrics_text("[tool:SubtitleTools.com]\n[00:01.00]Line A")
+check("a pasted Tool header cannot replace Nebula Music Center",
+      editor.meta_fields["tool"][1].text() == nebula.APP_NAME
+      and editor.table.rowCount() == 1,
+      (editor.meta_fields["tool"][1].text(), editor.table.rowCount()))
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
+check("pasted timestamps become the line times",
+      editor.table.rowCount() == 2
+      and editor.table.item(0, 1).text() == "[00:01.00]"
+      and editor.table.item(1, 1).text() == "[00:03.50]"
+      and editor.table.item(0, 2).text() == "Line A",
+      [(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+       for i in range(editor.table.rowCount())])
+check("the Lyrics tab is one plain-text document without row boxes",
+      isinstance(editor.lyrics_text, nebula.QPlainTextEdit)
+      and not editor.lyrics_text.isReadOnly()
+      and editor.table.isHidden()
+      and editor.lyrics_text.toPlainText() == "[00:01.00] Line A\n[00:03.50] Line B",
+      (type(editor.lyrics_text).__name__, editor.lyrics_text.isReadOnly(),
+       editor.table.isHidden(), editor.lyrics_text.toPlainText()))
+check("Tab 1 has no separate Paste lyrics button", not hasattr(editor, "paste_btn"),
+      hasattr(editor, "paste_btn"))
+editor.lyrics_text.moveCursor(QTextCursor.MoveOperation.Start)
+editor.lyrics_text.moveCursor(QTextCursor.MoveOperation.Down)
+app.processEvents()
+check("the plain-text caret selects the matching Syncer line",
+      editor.table.currentRow() == 1,
+      (editor.lyrics_text.textCursor().blockNumber(), editor.table.currentRow()))
+editor.lyrics_text.setPlainText("[00:01.00]Line A\n[00:04.00]Typed line")
+app.processEvents()
+check("editing the plain text updates the timed lyric rows",
+      editor.table.rowCount() == 2
+      and editor.table.item(1, 1).text() == "[00:04.00]"
+      and editor.table.item(1, 2).text() == "Typed line",
+      [(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+       for i in range(editor.table.rowCount())])
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
+editor.table.setCurrentCell(0, 2)
+editor._set_time_to_current()
+app.processEvents()
+check("R sets the current timestamp and advances to the next line",
+      editor.table.currentRow() == 1 and editor.sync_list.currentRow() == 1,
+      (editor.table.currentRow(), editor.sync_list.currentRow(),
+       editor.table.item(0, 1).text()))
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
+editor.table.setCurrentCell(1, 2)
+editor._insert_line()
+app.processEvents()
+check("T adds an untimed blank line in the gap before the current line",
+      editor.table.rowCount() == 3
+      and editor.table.currentRow() == 1
+      and editor.table.item(1, 1).text() == ""
+      and editor.table.item(1, 2).text() == ""
+      and editor.sync_list.item(1).text().strip() == "--:--.--"
+      and editor.lyrics_text.toPlainText()
+      == "[00:01.00] Line A\n\n[00:03.50] Line B",
+      ([(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+        for i in range(editor.table.rowCount())],
+       editor.lyrics_text.toPlainText(), editor.sync_list.item(1).text()))
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
+editor.table.setCurrentCell(1, 2)
+editor._insert_line(empty=True)
+app.processEvents()
+check("Y inserts a clear line before the current line",
+      editor.table.rowCount() == 3
+      and editor.table.currentRow() == 2
+      and editor.table.item(1, 1).text().startswith("[")
+      and editor.table.item(1, 2).text() == ""
+      and editor.sync_list.count() == 3
+      and "- clear previous lyric -" in editor.sync_list.item(1).text(),
+      ([(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+        for i in range(editor.table.rowCount())],
+       editor.sync_list.item(1).text() if editor.sync_list.count() > 1 else ""))
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
+check("the Syncer tab mirrors the lyric rows and follows selection",
+      editor.sync_list.count() == 2
+      and "00:01.00" in editor.sync_list.item(0).text()
+      and "Line A" in editor.sync_list.item(0).text(),
+      [editor.sync_list.item(i).text() for i in range(editor.sync_list.count())])
+editor.sync_list.setCurrentRow(1)
+app.processEvents()
+check("selecting a Syncer row selects the matching lyric row",
+      editor.table.currentRow() == 1, editor.table.currentRow())
+editor._select_relative(-1)
+check("Syncer keyboard selection moves to the previous line",
+      editor.table.currentRow() == 0, editor.table.currentRow())
+check("the Preview tab shows a three-line first-lyric countdown",
+      "First lyric in 1.0s" in editor.preview_current.text()
+      and editor.preview_prev.text() == ""
+      and "[00:01.00] Line A" in editor.preview_next.text(),
+      (editor.preview_prev.text(), editor.preview_current.text(),
+       editor.preview_next.text()))
+sample_lyrics = [(29860, "One more time"), (31810, ""),
+                 (45420, "One more time"), (47720, "")]
+sample_slots = nebula.lyric_display_slots(sample_lyrics, 33000)
+check("a blank current lyric becomes a live countdown to the next lyric",
+      nebula.lyric_slot_text(sample_slots[0], sample_lyrics, 33000,
+                             timestamp=True) == "[00:29.86] One more time"
+      and "[00:31.81] Next lyric in 12.4s"
+      == nebula.lyric_slot_text(sample_slots[1], sample_lyrics, 33000,
+                                timestamp=True)
+      and nebula.lyric_slot_text(sample_slots[2], sample_lyrics, 33000,
+                                 timestamp=True) == "[00:45.42] One more time",
+      [nebula.lyric_slot_text(slot, sample_lyrics, 33000, timestamp=True)
+       for slot in sample_slots])
+editor._save_lrc()
+with open(lrc_target, encoding="utf-8") as handle:
+    editor_lrc = handle.read()
+check("the lyrics editor saves timestamps and metadata",
+      "[tool:Nebula Music Center]" in editor_lrc
+      and "[ar:Test Artist]" in editor_lrc
+      and "[00:01.00] Line A" in editor_lrc
+      and "[00:03.50] Line B" in editor_lrc,
+      editor_lrc)
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:02.00]\n[00:03.50]Line B")
+check("a timestamp with no lyric is kept as an empty timing",
+      editor.table.rowCount() == 3
+      and editor.table.item(1, 1).text() == "[00:02.00]"
+      and editor.table.item(1, 2).text() == ""
+      and "- clear previous lyric -" in editor.sync_list.item(1).text(),
+      ([(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+        for i in range(editor.table.rowCount())],
+       editor.sync_list.item(1).text() if editor.sync_list.count() > 1 else ""))
+editor._save_lrc()
+with open(lrc_target, encoding="utf-8") as handle:
+    empty_timing_lrc = handle.read()
+check("empty timings are saved without a trailing lyric",
+      "[00:02.00]\n" in empty_timing_lrc,
+      empty_timing_lrc)
+check("the Syncer clear reminder is not written to the LRC",
+      "clear previous lyric" not in empty_timing_lrc,
+      empty_timing_lrc)
+editor.table.setCurrentCell(1, 2)
+QTest.keyClick(editor.sync_list, Qt.Key.Key_Backspace)
+app.processEvents()
+check("Backspace clears the timing but keeps the line",
+      editor.table.rowCount() == 3
+      and editor.table.item(1, 1).text() == ""
+      and editor.table.item(1, 2).text() == ""
+      and "- clear previous lyric -" not in editor.sync_list.item(1).text(),
+      ([(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
+        for i in range(editor.table.rowCount())],
+       editor.sync_list.item(1).text()))
+QTest.keyClick(editor.sync_list, Qt.Key.Key_Delete)
+app.processEvents()
+check("Delete removes the selected line",
+      editor.table.rowCount() == 2
+      and editor.sync_list.count() == 2
+      and editor.table.item(0, 2).text() == "Line A"
+      and editor.table.item(1, 2).text() == "Line B"
+      and editor.lyrics_text.toPlainText()
+      == "[00:01.00] Line A\n[00:03.50] Line B",
+      ([editor.table.item(i, 2).text() for i in range(editor.table.rowCount())],
+       editor.sync_list.count(), editor.lyrics_text.toPlainText()))
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:02.00]Line B")
+editor.shift_all.setChecked(True)
+editor._nudge_time(10)
+check("shift all moves the timestamps together",
+      editor.table.item(0, 1).text() == "[00:01.01]"
+      and editor.table.item(1, 1).text() == "[00:02.01]",
+      [editor.table.item(i, 1).text() for i in range(editor.table.rowCount())])
+editor.shift_all.setChecked(False)
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:02.00]Line B")
+editor.table.setCurrentCell(0, 2)
+QTest.keyClick(editor.table, Qt.Key.Key_Down)
+app.processEvents()
+check("the Syncer keyboard shortcut moves to the next line",
+      editor.table.currentRow() == 1, editor.table.currentRow())
+editor._apply_lyrics_text("[00:01.00]Line A\n[00:01.20]Line B")
+check("the Save tab warns about lyrics within 0.5 seconds",
+      "within 0.5 seconds" in editor.download_warning.text()
+      and not editor.download_warning.isHidden(),
+      (editor.download_warning.text(), editor.download_warning.isHidden()))
+editor._load_track(WAV1)
+check("the lyrics editor starts empty when there is no LRC",
+      editor.table.rowCount() == 0 and "No .lrc" in editor.status.text(),
+      (editor.table.rowCount(), editor.status.text()))
+editor.close()
+tools_menu = next(a.menu() for a in w.menuBar().actions()
+                  if a.text().replace("&", "") == "Tools")
+check("Tools includes the lyrics editor",
+      "Lyrics editor…" in [action.text() for action in tools_menu.actions()],
+      [action.text() for action in tools_menu.actions()])
 ab_menu = next(a.menu() for a in w.menuBar().actions() if a.text() == "&Audiobooks")
 ab_actions = [a.text() for a in ab_menu.actions() if a.text()]
 check("its menu has Select, Remove and Refresh",
@@ -471,8 +1153,24 @@ prefs = nebula.PreferencesDialog(w.library_tab, w)
 check("Preferences has an Audiobooks page",
       [prefs.sidebar.item(i).text() for i in range(prefs.sidebar.count())]
       == ["Theme", "Library", "Audiobooks", "Devices", "Playback", "Syncing",
-          "Backup", "Audio CD", "Identification"],
+          "Backup", "Audio CD", "Identification", "Lyrics"],
       [prefs.sidebar.item(i).text() for i in range(prefs.sidebar.count())])
+check("Preferences has a Lyrics source list in priority order",
+      [prefs.lyric_list.item(i).data(Qt.ItemDataRole.UserRole)
+       for i in range(prefs.lyric_list.count())]
+      == ["lrc", "tags", "lrclib", "lyrics_ovh"],
+      [prefs.lyric_list.item(i).text() for i in range(prefs.lyric_list.count())])
+prefs.lyric_list.setCurrentRow(1)
+prefs._lyric_move(-1)
+check("the Lyrics page can move a source up",
+      [prefs.lyric_list.item(i).data(Qt.ItemDataRole.UserRole)
+       for i in range(prefs.lyric_list.count())]
+      == ["tags", "lrc", "lrclib", "lyrics_ovh"],
+      [prefs.lyric_list.item(i).text() for i in range(prefs.lyric_list.count())])
+prefs.lyric_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+check("the Lyrics page can switch a source off",
+      prefs._lyric_order_value()[0] == ["tags", False], prefs._lyric_order_value())
+prefs.lyric_list.item(0).setCheckState(Qt.CheckState.Checked)
 check("Preferences no longer has .aax import settings",
       not any(key in prefs.widgets for key in
               ("audiobook_import_mode", "audiobook_import_artist_album",

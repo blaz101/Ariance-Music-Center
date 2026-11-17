@@ -1,4 +1,37 @@
-# Nebula Music Center 1.28
+# Nebula Music Center 1.29
+
+## What's new in 1.29
+
+- **Lyrics support.** Local `.lrc` sidecars and lyrics embedded as ID3 `USLT`,
+  Vorbis `LYRICS` or MP4 `©lyr` are read alongside LRCLIB and lyrics.ovh.
+  Preferences > Lyrics sets the source order and switches each source on or off;
+  LRCLIB can return plain or synchronized lyrics, and a track with more than one
+  match can choose between them.
+- **Full LRC creation and editing.** The player's lyrics button opens a three-line
+  synchronized view with a live countdown through blank timed lines. The Timed
+  Lyrics Editor creates and updates `.lrc` files with Lyrics, Syncer, Preview,
+  Metadata and Save tabs, waveform and transport controls, keyboard timing,
+  per-track and per-line adjustments, and Save/Revert. Its song picker searches the
+  music library and only browses music folders.
+- **Gapless playback.** The next track is loaded on a spare deck before the current
+  one ends, so there is no gap between tracks.
+- **Crossfade.** Playback can overlap the end of one track with the next, with a
+  0-12 second length set from its own dialog. Crossfade takes over gapless while it
+  is on, and the Playback menu shows the current length.
+- **Play random album.** Music > Play random album chooses an album at random and
+  queues it in disc/track order.
+- **Sleep timer.** Playback > Sleep timer pauses after a chosen number of minutes,
+  with Cancel sleep timer.
+- **Automatic library scanning.** Music folders are watched, and a quiet rescan
+  runs when files or folders change; a rescan requested during a running scan is
+  queued instead of dropped.
+- **Verify copies after sync.** A per-profile and per-preset option reads every
+  copied file back from the device and checks its SHA-256, including transcoded
+  copies. A failed check is logged and the copy record is invalidated so the next
+  compare repairs it.
+- **New inspiration credit.** The About window now credits
+  [Subtitle Tools](https://subtitletools.com/premium) alongside Mp3Tag, Strawberry
+  Music Player and FreeFileSync.
 
 ## What's new in 1.28
 
@@ -65,8 +98,8 @@ https://github.com/blaz101/Nebula-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf nebula-music-center_1.28.orig.tar.xz
-cd nebula-music-center-1.28
+tar -xf nebula-music-center_1.29.orig.tar.xz
+cd nebula-music-center-1.29
 ./run.sh
 ```
 
@@ -83,13 +116,13 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./nebula-music-center_1.28_amd64.deb
+sudo apt install ./nebula-music-center_1.29_amd64.deb
 nebula-music-center              # or pick it from the menu
 ```
 
 It installs to `/opt/nebula-music-center` with its own Qt, adds
 `/usr/bin/nebula-music-center` and a menu entry, and reads the same
-`~/Nebula` and `~/.cache/Nebula` folders as the source archive — so both ways of
+`~/Nebula` and `~/.cache/Nebula` folders as the source archive - so both ways of
 running it share one library. `apt remove nebula-music-center` takes the
 program away and leaves your music and settings alone (add `--purge` plus a delete of
 `~/Nebula` and `~/.cache/Nebula` if you want those gone too).
@@ -150,8 +183,8 @@ excludes, `AND`/`OR`/parentheses combine, `"quotes"` keep spaces. A bare word
 searches every text field. Numeric fields accept `k`/`M` suffixes and `m:ss`
 durations.
 
-**A–Z hierarchy.** The library shows exactly three levels — artist, album,
-track — inside letter sections:
+**A–Z hierarchy.** The library shows exactly three levels - artist, album,
+track - inside letter sections:
 
 ```
 A
@@ -170,7 +203,7 @@ Artist and album rows use the full tag values, and tracks are labelled
 away from the names. Each expandable row has a small solid triangle at its left edge
 (white on selection, accent on hover), so collapsed artists and albums are
 obvious. Letters, artists and albums are all collapsible; search results expand
-everything automatically. The detail table is still available — tick **Details
+everything automatically. The detail table is still available - tick **Details
 columns** in the wrench menu (it is off by default).
 
 **Grouping.** Presets: Artist / Album, Album artist / Album, Album, Genre, Year,
@@ -200,7 +233,7 @@ database file on disk.
 
 **Right-click menu.** Play now, Append to queue, Queue to play next, Replace
 current playlist, Open in new playlist, Add to playlist, Rating, Love/Unlove,
-Search for this, Edit tags, Organize files…, Rescan, Copy path / "Artist —
+Search for this, Edit tags, Organize files…, Rescan, Copy path / "Artist -
 Title", Show in file browser, Copy to device, **Look up metadata & cover…**,
 **Analyse ReplayGain**, and **Delete** →
 *Remove from library (keep file)*, *Move file to Trash* or
@@ -224,7 +257,7 @@ queue on the library tab).
 
 The tag panel on the left edits all selected files at once (mixed fields show
 `< keep >`). Labels sit above the fields, in two columns, with the cover art and
-the file count on top — the layout of current mp3tag rather than the old form.
+the file count on top - the layout of current mp3tag rather than the old form.
 
 The file list on the right uses mp3tag's columns: **Filename, Title, Track,
 Artist, Album artist, Album, Disc, Tag, Year, Genre, Comment**. *Tag* names the
@@ -242,7 +275,7 @@ files selected, keys are the union across them and differing values show `< keep
 The cover in the panel follows the selected file (the first file when nothing is selected).
 
 Right-click a file for **Extended tags…**, the whole-tag window: every tag the
-file carries — the core fields and its own keys in one list — with **＋** to add a
+file carries - the core fields and its own keys in one list - with **＋** to add a
 tag, **✎** to edit the selected value and **✕** to remove it, and the cover with
 its format, dimensions and size on the right. **‹‹ ››** move between the selected
 files and keep what you typed. OK hands the values back to the file list unsaved,
@@ -267,7 +300,7 @@ Archive front cover preview. From there:
 
 - **Save front cover** writes `cover.jpg`/`cover.png` next to the album's files.
 - **Apply album tags** fetches the release's track list and writes album, album
-  artist, year, genre, and — when the file count matches the release — track
+  artist, year, genre, and - when the file count matches the release - track
   titles, numbers and disc numbers. The library index is refreshed immediately.
 
 No API key is needed. The user agent identifies Nebula Music Center, covers are cached in
@@ -279,7 +312,7 @@ artist+album phrase finds nothing, the search retries with the album title
 before its bracket (e.g. `SERENS (A Selection…)` → `SERENS`).
 
 **Audio CDs** are named from their table of contents. CDDB and MusicBrainz are both
-matched by disc ID — each computes its own ID from the TOC — while Discogs is
+matched by disc ID - each computes its own ID from the TOC - while Discogs is
 searched by artist/album text after sign-in. Tools > Preferences > Identification
 sets which sources are used and in what order (default: CDDB, Discogs,
 MusicBrainz); inserting a disc tries them in that order and stops at the first one
@@ -348,10 +381,10 @@ by folder when there is no albumartist; a single track gets track tags only. If
   option says what the destination can store in a file name, because that decides
   whether a name may change on the way over: *exFAT* and *MTP (mtpfs)* carry UTF-16
   names, so a file keeps its PC name to the character, while *FAT32* drops
-  `* ? : " < > | \`, control characters and a trailing space or dot — the log's `NAME`
+  `* ? : " < > | \`, control characters and a trailing space or dot - the log's `NAME`
   line names any file whose name changed. FAT32 is the default, matching earlier
-  builds. Two library files that would land on the same device name — including two
-  that differ only by case, which these devices treat as one name — still get a
+  builds. Two library files that would land on the same device name - including two
+  that differ only by case, which these devices treat as one name - still get a
   ` (2)` suffix; that is the only editing any filesystem does to a name it can store.
 
   - *Bit-by-bit (exact)* (default) streams both copies byte-for-byte in bounded
@@ -372,8 +405,8 @@ by folder when there is no albumartist; a single track gets track tags only. If
     from the PC (the PC original is never deleted because the device lacks it). This
     mode is fast, not proof: an edit made outside the app that keeps both size and
     timestamp can go unnoticed, and MTP can't supply a trustworthy content hash.
-    **Verify content** — a button that appears beside Compare/Sync only while this mode
-    is chosen, never in Bit-by-bit where it would be redundant — reads every device file
+    **Verify content** - a button that appears beside Compare/Sync only while this mode
+    is chosen, never in Bit-by-bit where it would be redundant - reads every device file
     and compares it byte for byte when
     certainty is required, and rewrites each verified file's manifest record (digest, size
     and the listed timestamp) from that read, dropping the record of a file whose device
@@ -407,8 +440,8 @@ by folder when there is no albumartist; a single track gets track tags only. If
   unreadable. The same line shows **last sync** with the time the profile's last
   finished sync ran (`last sync 2026-10-20 14:03`), or *never synced*. Compare
   does not change it. The time is saved with the profile. A Fast hash profile also
-  shows *last verified 2026-10-27 09:05* — when the device contents were last read in
-  full — or *not verified in full* if that has never happened; a bit-by-bit sync needs
+  shows *last verified 2026-10-27 09:05* - when the device contents were last read in
+  full - or *not verified in full* if that has never happened; a bit-by-bit sync needs
   no such note, since reading both copies is what it does.
   While a task runs, its button turns blue, the other stays
   grey, and the tab bar shows the profile and percentage next to a sync glyph.
@@ -438,7 +471,7 @@ by folder when there is no albumartist; a single track gets track tags only. If
 - Smart playlists: `~/Nebula/settings/smart_playlists.json`
 - Sync profiles: `~/Nebula/settings/profiles.json`; PC hash cache:
   `~/Nebula/sync/hashdb/`; per-device sync manifests:
-  `~/Nebula/sync/manifests/` (both are only hints — see *Syncing*)
+  `~/Nebula/sync/manifests/` (both are only hints - see *Syncing*)
 - Library index: `~/Nebula/library/library.db` (SQLite; v2 databases are migrated
   in place). Extra collections: `~/Nebula/library/collections/*.db`
 - Playlists: `~/Nebula/library/playlists/*.m3u8`

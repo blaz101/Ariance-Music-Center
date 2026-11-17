@@ -264,7 +264,7 @@ online.close()
 
 tab.set_view("collection")
 dialog = nebula.CoverViewer(w.player._cover_bytes(w.player.current_path()),
-                             "Teardrop", "Massive Attack — Mezzanine", w)
+                             "Teardrop", "Massive Attack - Mezzanine", w)
 dialog.resize(760, 760)
 dialog.show()
 app.processEvents()

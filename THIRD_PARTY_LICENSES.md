@@ -1,7 +1,7 @@
 # Third-party licence audit for Nebula Music Center
 
 Audited: 2026-11-12  
-Target: Nebula Music Center 1.28, released under **GPL-3.0-only**.
+Target: Nebula Music Center 1.29, released under **GPL-3.0-only**.
 
 This is a distribution audit, not legal advice. It covers the files actually shipped
 in the source tree and in the `.deb`, plus the external programs the app invokes.
@@ -32,7 +32,7 @@ Qt VirtualKeyboard and Qt PDF are not bundled because the app does not use them.
 | Nebula code, UI text, `nebula.png`, docs | project root | Copyright (C) 2026 Roger Barthares; GPL-3.0-only | **Licensed.** `LICENSE`, source headers and source offer are present. |
 | Lucide icons: repeat, repeat-one, shuffle and file-clock | vector paths in `nebula.py`; `sync-log.png` | ISC, with Feather-derived portions under MIT | **Compatible.** Ship the full `LICENSES/Lucide.txt` and keep the icon notice. |
 
-## Not shipped in 1.28
+## Not shipped since 1.28
 
 The following are no longer shipped:
 
@@ -84,7 +84,7 @@ configuration: ... --enable-gpl ... --enable-libx264 --enable-libx265 ...
 That is acceptable for a separate-process dependency. It is not acceptable to copy
 those GPL libraries into a differently licensed bundle.
 
-## Release requirements met in 1.28
+## Release requirements met in 1.29
 
 1. The full **GPL-3.0** licence text is in `LICENSE`, with copyright and SPDX headers
    in the application, launcher, build script and tests.
@@ -113,5 +113,5 @@ those GPL libraries into a differently licensed bundle.
   PDF were removed in 1.28.
 - The GPL FAQ / licence-compatibility guidance for LGPL-2.1+ and GPLv2+ combinations.
 - A source-tree search confirming no `rcrack`, `.aax`, activation-byte or
-  rainbow-table code or settings remain in 1.28.
-- A package audit confirming no VirtualKeyboard/PDF files are present in 1.28.
+  rainbow-table code or settings remain in 1.29.
+- A package audit confirming no VirtualKeyboard/PDF files are present in 1.29.

@@ -59,11 +59,11 @@ try:  # ID3 inside WAV/AIFF needs explicit container classes
 except ImportError:  # pragma: no cover
     ID3_CONTAINERS = ()
 
-from PySide6.QtCore import (QObject, QThread, QUrl, Qt, Signal, QPoint, QPointF, QRectF, QSize,
-                            QTimer, QEvent, QBuffer)
+from PySide6.QtCore import (QObject, QThread, QUrl, Qt, Signal, QPoint, QPointF, QRect, QRectF,
+                            QSize, QTimer, QEvent, QBuffer, QFileSystemWatcher)
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon,
                            QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap, QPolygonF, QShortcut)
+                           QPixmap, QPolygonF, QShortcut, QTextCursor)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -143,8 +143,8 @@ except ImportError:  # no multimedia module at all
 # core/config.py
 # ======================================================================
 APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
-APP_SHORT = "Nebula"                 # what the title bar and menus call it
-VERSION = "1.28"
+APP_SHORT = "Nebula"                 # short name used in menus and messages
+VERSION = "1.29"
 SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -256,12 +256,22 @@ DEFAULT_CONFIG = {
     "view": "collection",
     "queue": [],
     "queue_index": -1,
+    # where playback was when the window closed; applied on the next Play
+    "last_track": "",
+    "last_position": 0,
+    # shuffle/repeat remembered per playlist, keyed by playlist name
+    "playlist_modes": {},
     "tab": 0,
+    # the order Preferences > Lyrics tries sources in ([key, enabled], ...)
+    "lyric_order": [],
     # how many compares/syncs each profile's log keeps (Preferences > Syncing)
     "sync_log_keep": 10,
     "shuffle": False,
     "repeat": "off",
     "stop_after": False,
+    # gapless playback and crossfade (0 = crossfade off)
+    "gapless": False,
+    "crossfade_seconds": 0.0,
     # clicking the time bar jumps to that point (Preferences > Playback)
     "seek_click": True,
     "window": [1360, 860],
@@ -768,6 +778,802 @@ def read_specs(path):
     if not out["bitrate"] and out["sample_rate"] and out["channels"] and out["bits_per_sample"]:
         out["bitrate"] = int(out["sample_rate"] * out["channels"] * out["bits_per_sample"])
     return out
+
+
+# ======================================================================
+# lyrics: an LRC sidecar, a USLT / lyrics tag, and online lookup
+# ======================================================================
+# Keys are stored in Preferences > Lyrics. The order there is the order the
+# sources are tried in; each row can be switched off without being removed.
+LYRIC_SOURCES = {
+    "lrc": "LRC file",
+    "tags": "Embedded lyrics (USLT)",
+    "lrclib": "LRCLIB",
+    "lyrics_ovh": "lyrics.ovh",
+}
+LYRIC_SOURCE_HELP = {
+    "lrc": "A .lrc file beside the track; timestamps drive the synced-line highlight.",
+    "tags": "USLT in MP3/WAV/AIFF, LYRICS or UNSYNCEDLYRICS in FLAC/OGG, and ©lyr in M4A.",
+    "lrclib": "Online. The best free source: plain and synchronized lyrics, no API key.",
+    "lyrics_ovh": "Online. Plain-text fallback when LRCLIB has no match.",
+}
+DEFAULT_LYRIC_ORDER = [["lrc", True], ["tags", True], ["lrclib", True],
+                       ["lyrics_ovh", True]]
+# LRCLIB's exact endpoint only matches a duration within two seconds. Search
+# candidates use this fixed window for deciding whether their timestamps fit.
+LYRIC_LENGTH_TOLERANCE = 4.0
+MAX_LYRIC_OFFSET = 4.0
+LYRIC_LINE_STEP = 0.01
+LRC_METADATA_FIELDS = {
+    "ti": "Title", "ar": "Artist", "al": "Album", "length": "Length",
+    "au": "Author", "lr": "Lyricist", "by": "LRC author", "tool": "Tool",
+    "re": "Tool (re)", "ve": "Version", "offset": "Offset",
+}
+LYRICS_UA = f"{APP_NAME}/{VERSION} ( {SOURCE_URL} )"
+# Chosen LRCLIB records and per-track lyric offsets, keyed by the local track
+# path. A track removed from the library drops its entry; a changed file also
+# drops it, so a replacement at the same path cannot inherit another recording.
+LYRICS_MATCH_FILE = os.path.join(SETTINGS_DIR, "lyrics_matches.json")
+LYRICS_MATCH_LIMIT = 5000
+_LYRICS_MATCH_LOCK = threading.Lock()
+_LYRICS_MATCH_CACHE = None
+_LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+_LRC_META_RE = re.compile(r"^\s*\[(ar|ti|al|by|offset|length|re|ve|au|lr|tool):", re.I)
+_EMBEDDED_LYRIC_KEYS = {
+    "\xa9lyr", "©lyr", "lyr", "lyrics", "unsyncedlyrics", "unsynced lyrics",
+    "lyric", "wm/lyrics", "wm/lyrics_synchronised",
+}
+
+
+def lyric_order_entries(cfg):
+    """The lyric source order as Preferences shows it, with new sources added."""
+    saved = [[key, bool(enabled)] for key, enabled in (cfg.get("lyric_order") or [])
+             if key in LYRIC_SOURCES]
+    known = {key for key, _enabled in saved}
+    for key, enabled in reversed(DEFAULT_LYRIC_ORDER):
+        if key not in known:
+            saved.insert(0, [key, enabled])
+    return saved
+
+
+def lyric_order(cfg):
+    """The enabled lyric sources, in the priority order the user set."""
+    return [key for key, enabled in lyric_order_entries(cfg) if enabled]
+
+
+def _lyrics_track_key(path):
+    path = str(path or "")
+    if not path or not os.path.isabs(path):
+        return ""
+    return os.path.normpath(path)
+
+
+def _lyrics_file_stamp(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return [int(stat.st_size), int(stat.st_mtime_ns)]
+
+
+def _lyrics_matches_locked():
+    global _LYRICS_MATCH_CACHE
+    if _LYRICS_MATCH_CACHE is None:
+        data = load_json(LYRICS_MATCH_FILE, {})
+        _LYRICS_MATCH_CACHE = ({str(key): value for key, value in data.items()
+                                if isinstance(value, dict)}
+                               if isinstance(data, dict) else {})
+    return _LYRICS_MATCH_CACHE
+
+
+def _save_lyrics_matches_locked(data):
+    try:
+        save_json(LYRICS_MATCH_FILE, data)
+        return True
+    except OSError:
+        return False
+
+
+def _lyrics_entry(path):
+    """The current store entry for a track, dropping a stale or missing one."""
+    key = _lyrics_track_key(path)
+    if not key:
+        return None
+    with _LYRICS_MATCH_LOCK:
+        data = _lyrics_matches_locked()
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            return None
+        stamp = _lyrics_file_stamp(path)
+        if stamp is None:
+            data.pop(key, None)
+            _save_lyrics_matches_locked(data)
+            return None
+        if (entry.get("size") is not None
+                and (entry.get("size") != stamp[0] or entry.get("mtime") != stamp[1])):
+            data.pop(key, None)
+            _save_lyrics_matches_locked(data)
+            return None
+        return key, dict(entry)
+
+
+def get_lyrics_match(path):
+    """The saved LRCLIB record for a track, or None when it is stale."""
+    found = _lyrics_entry(path)
+    if not found:
+        return None
+    entry = found[1]
+    return entry if entry.get("id") not in (None, "") else None
+
+
+def get_lyrics_offset(path):
+    """The saved shift for a track, in seconds (positive = later)."""
+    found = _lyrics_entry(path)
+    if not found:
+        return 0.0
+    try:
+        value = float(found[1].get("offset") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-MAX_LYRIC_OFFSET, min(MAX_LYRIC_OFFSET, value))
+
+
+def save_lyrics_match(path, match_id, label=""):
+    """Remember the selected LRCLIB record for one local track."""
+    key = _lyrics_track_key(path)
+    stamp = _lyrics_file_stamp(path)
+    if not key or match_id in (None, "") or stamp is None:
+        return False
+    with _LYRICS_MATCH_LOCK:
+        data = _lyrics_matches_locked()
+        entry = dict(data.get(key) or {})
+        entry.update({"id": match_id, "label": str(label or "")[:300],
+                      "size": stamp[0], "mtime": stamp[1]})
+        data[key] = entry
+        while len(data) > LYRICS_MATCH_LIMIT:
+            data.pop(next(iter(data)))
+        return _save_lyrics_matches_locked(data)
+
+
+def save_lyrics_offset(path, offset):
+    """Remember a per-track lyric shift; 0 removes the offset, not the match."""
+    key = _lyrics_track_key(path)
+    stamp = _lyrics_file_stamp(path)
+    if not key or stamp is None:
+        return False
+    try:
+        value = max(-MAX_LYRIC_OFFSET, min(MAX_LYRIC_OFFSET, float(offset or 0.0)))
+    except (TypeError, ValueError):
+        value = 0.0
+    value = round(value, 2)
+    if abs(value) < 0.005:
+        value = 0.0
+    with _LYRICS_MATCH_LOCK:
+        data = _lyrics_matches_locked()
+        entry = dict(data.get(key) or {})
+        if value:
+            entry["offset"] = value
+        else:
+            entry.pop("offset", None)
+        if entry:
+            entry["size"], entry["mtime"] = stamp[0], stamp[1]
+            data[key] = entry
+        else:
+            data.pop(key, None)
+        return _save_lyrics_matches_locked(data)
+
+
+def forget_lyrics_matches(paths):
+    keys = {_lyrics_track_key(path) for path in paths}
+    keys.discard("")
+    if not keys:
+        return
+    with _LYRICS_MATCH_LOCK:
+        data = _lyrics_matches_locked()
+        removed = False
+        for key in keys:
+            if data.pop(key, None) is not None:
+                removed = True
+        if removed:
+            _save_lyrics_matches_locked(data)
+
+
+def forget_lyrics_match(path):
+    forget_lyrics_matches([path])
+
+
+def forget_lyrics_matches_prefix(folder):
+    key = _lyrics_track_key(folder)
+    if not key:
+        return
+    prefix = key.rstrip(os.sep) + os.sep
+    with _LYRICS_MATCH_LOCK:
+        data = _lyrics_matches_locked()
+        keys = [path for path in data if path == key or path.startswith(prefix)]
+        if keys:
+            for path in keys:
+                data.pop(path, None)
+            _save_lyrics_matches_locked(data)
+
+
+def _lyrics_clean(value):
+    """Normalize a tag value or a lyrics file into display text."""
+    if isinstance(value, (list, tuple)):
+        return "\n".join(part for part in (_lyrics_clean(v) for v in value) if part)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    text = str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip()
+
+
+def _lrc_time_ms(match, offset=0):
+    minutes = int(match.group(1))
+    seconds = int(match.group(2))
+    fraction = match.group(3) or ""
+    millis = minutes * 60000 + seconds * 1000
+    if fraction:
+        millis += int(fraction.ljust(3, "0")[:3])
+    return max(0, millis + int(offset or 0))
+
+
+def parse_lyrics(text, preserve_empty=False):
+    """Parse plain lyrics or LRC into {text, lines, synced}.
+
+    LRC timestamps may appear together on one line (a repeated chorus), use a
+    dot or colon before the fraction, and carry an [offset:ms] metadata tag.
+    A file with no timestamps is still shown in full, just without highlighting.
+    """
+    text = _lyrics_clean(text)
+    if not text:
+        return {"text": "", "lines": [], "synced": False}
+    offset = 0
+    for line in text.splitlines():
+        match = re.match(r"^\s*\[offset:\s*([+-]?\d+)\s*\]\s*$", line, re.I)
+        if match:
+            try:
+                offset = int(match.group(1))
+            except ValueError:
+                offset = 0
+            break
+    lines = []
+    plain = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            if not lines:
+                plain.append("")
+            continue
+        if _LRC_META_RE.match(raw):
+            continue
+        matches = list(_LRC_TIME_RE.finditer(raw))
+        if matches:
+            content = _LRC_TIME_RE.sub("", raw).strip()
+            if content or preserve_empty:
+                for match in matches:
+                    lines.append((_lrc_time_ms(match, offset), content))
+        elif not lines:
+            plain.append(raw.rstrip())
+    if lines:
+        lines.sort(key=lambda row: row[0])
+        seen = set()
+        unique = []
+        for millis, content in lines:
+            entry = (millis, content)
+            if entry not in seen:
+                seen.add(entry)
+                unique.append(entry)
+        return {"text": "\n".join(content for _millis, content in unique),
+                "lines": unique, "synced": True}
+    return {"text": "\n".join(plain).strip("\n"), "lines": [], "synced": False}
+
+
+def _read_lyrics_file(path):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return ""
+    for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            text = data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if "\x00" not in text:
+            return _lyrics_clean(text)
+    return ""
+
+
+def read_lrc_lyrics(path):
+    """The matching sidecar's text, or "" when there is none."""
+    sidecar = _lrc_sidecar(path)
+    return _read_lyrics_file(sidecar) if sidecar else ""
+
+
+def _lrc_timestamp(millis):
+    """Format milliseconds as an LRC timestamp with hundredths."""
+    total = int(round(max(0, int(millis)) / 10.0))
+    minutes, rest = divmod(total, 6000)
+    seconds, hundredths = divmod(rest, 100)
+    return f"[{minutes:02d}:{seconds:02d}.{hundredths:02d}]"
+
+
+def _lrc_clock(millis):
+    """The same timestamp without the editor's brackets."""
+    return _lrc_timestamp(millis)[1:-1]
+
+
+def _editor_clock(millis):
+    """Editor transport time, e.g. 0:00.00."""
+    total = int(round(max(0, int(millis or 0)) / 10.0))
+    minutes, rest = divmod(total, 6000)
+    seconds, hundredths = divmod(rest, 100)
+    return f"{minutes}:{seconds:02d}.{hundredths:02d}"
+
+
+def _parse_lrc_clock(value):
+    """Parse an editor timestamp, returning milliseconds or None."""
+    text = str(value or "").strip().strip("[]")
+    if not text:
+        return None
+    match = re.match(r"^(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?$", text)
+    if match:
+        millis = int(match.group(1)) * 60000 + int(match.group(2)) * 1000
+        fraction = match.group(3) or ""
+        if fraction:
+            millis += int(fraction.ljust(3, "0")[:3])
+        return max(0, millis)
+    try:
+        return max(0, int(round(float(text) * 1000)))
+    except (TypeError, ValueError):
+        return None
+
+
+def lyric_display_slots(entries, position):
+    """The previous/current/next slots for the three-line lyric display.
+
+    ``entries`` is a timestamp-sorted sequence of ``(millis, text[, ...])``.
+    A blank line is a timed clear; when it is current (or the next row), its
+    display text is the live countdown to the next actual lyric.  The returned
+    list always has exactly three entries, with empty slots represented by
+    ``{"kind": "blank"}``.
+    """
+    entries = list(entries)
+    if not entries:
+        return [{"kind": "blank"} for _index in range(3)]
+    position = max(0, int(position or 0))
+    current = -1
+    for index, entry in enumerate(entries):
+        try:
+            millis = int(entry[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if millis <= position:
+            current = index
+        else:
+            break
+    if current < 0:
+        target = next((index for index, entry in enumerate(entries)
+                       if str(entry[1]).strip()), 0)
+        return [{"kind": "blank"},
+                {"kind": "first", "index": target},
+                {"kind": "line", "entry": entries[0], "index": 0,
+                 "role": "next"}]
+    current_entry = entries[current]
+    previous = ({"kind": "line", "entry": entries[current - 1],
+                 "index": current - 1, "role": "prev"}
+                if current > 0 else {"kind": "blank"})
+    if str(current_entry[1]).strip():
+        next_index = current + 1 if current + 1 < len(entries) else None
+    else:
+        next_index = next((index for index in range(current + 1, len(entries))
+                           if str(entries[index][1]).strip()), None)
+    following = ({"kind": "line", "entry": entries[next_index],
+                  "index": next_index, "role": "next"}
+                 if next_index is not None else {"kind": "blank"})
+    return [previous,
+            {"kind": "line", "entry": current_entry, "index": current,
+             "role": "current"},
+            following]
+
+
+def lyric_slot_text(slot, entries, position, timestamp=False):
+    """Render one display slot, including a blank row's live countdown."""
+    kind = (slot or {}).get("kind")
+    if kind in (None, "blank"):
+        return ""
+    entries = list(entries)
+    position = max(0, int(position or 0))
+    if kind == "first":
+        index = int(slot.get("index", 0))
+        if not 0 <= index < len(entries):
+            return ""
+        target = max(0, int(entries[index][0]) - position) / 1000.0
+        return f"First lyric in {target:.1f}s"
+    entry = slot.get("entry")
+    if entry is None:
+        return ""
+    millis = max(0, int(entry[0]))
+    text = str(entry[1])
+    body = text
+    if not body.strip():
+        index = int(slot.get("index", -1))
+        target = None
+        for following in entries[max(0, index + 1):]:
+            if str(following[1]).strip():
+                target = int(following[0])
+                break
+        if target is not None:
+            remaining = max(0, target - position) / 1000.0
+            body = f"Next lyric in {remaining:.1f}s" if remaining > 0 else ""
+        else:
+            body = ""
+    if timestamp:
+        return f"[{_lrc_clock(millis)}] {body}".rstrip()
+    return body
+
+
+def _lrc_metadata_values(text):
+    """The recognized `[key:value]` headers in an LRC document."""
+    values = {}
+    for raw in str(text or "").splitlines():
+        match = re.match(r"^\s*\[([A-Za-z]+):(.*)\]\s*$", raw)
+        if not match:
+            continue
+        key = match.group(1).lower()
+        if key in LRC_METADATA_FIELDS:
+            values[key] = match.group(2).strip()
+    return values
+
+
+def write_lrc_document(path, content):
+    """Write a complete LRC document beside an audio file, atomically."""
+    audio = os.path.abspath(str(path or ""))
+    if not os.path.isfile(audio):
+        raise OSError("The audio file is no longer available.")
+    if not str(content or "").strip():
+        raise ValueError("There are no lyrics to save.")
+    target = _lrc_sidecar(audio) or os.path.splitext(audio)[0] + ".lrc"
+    folder = os.path.dirname(target) or "."
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(target) + ".",
+                                     suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(str(content).rstrip() + "\n")
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return target
+
+
+def write_lrc_lyrics(path, lines=None, text="", preserve_metadata=False):
+    """Write the displayed lyrics to the track's LRC sidecar.
+
+    `lines` must already carry any user shift, so the file is a snapshot of
+    what is on screen. Plain text is written unchanged when no timestamps are
+    available. When `preserve_metadata` is true, title/artist-style headers
+    from an existing sidecar are carried over, but its old `[offset:]` tag is
+    dropped because the new timestamps already contain the adjustment.
+    Returns the sidecar path.
+    """
+    audio = os.path.abspath(str(path or ""))
+    if not os.path.isfile(audio):
+        raise OSError("The audio file is no longer available.")
+    target = _lrc_sidecar(audio) or os.path.splitext(audio)[0] + ".lrc"
+    metadata = []
+    if preserve_metadata:
+        for raw in _read_lyrics_file(target).splitlines():
+            line = raw.strip()
+            if (_LRC_META_RE.match(line)
+                    and not re.match(r"^\s*\[offset:", line, re.I)):
+                metadata.append(line)
+    rows = []
+    for entry in lines or []:
+        try:
+            millis, line = entry
+            millis = max(0, int(round(float(millis))))
+        except (TypeError, ValueError):
+            continue
+        line = _lyrics_clean(line).replace("\n", " ").strip()
+        # Keep timed empty lines: they are the LRC clear cue.  Only the
+        # Syncer's "- clear previous lyric -" reminder is display-only.
+        rows.append((millis, line))
+    rows.sort(key=lambda row: row[0])
+    body = [f"{_lrc_timestamp(millis)}{line}" for millis, line in rows]
+    if not body:
+        body = [line.rstrip() for line in _lyrics_clean(text).splitlines()]
+    if not any(line.strip() for line in body):
+        raise ValueError("There are no lyrics to save.")
+    content = "\n".join(metadata + body).rstrip() + "\n"
+    folder = os.path.dirname(target) or "."
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(target) + ".",
+                                     suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return target
+
+
+def read_embedded_lyrics(path):
+    """Lyrics in an audio file's tag, covering ID3, Vorbis/APE and MP4."""
+    try:
+        audio = mutagen.File(path)
+    except Exception:
+        return ""
+    tags = getattr(audio, "tags", None) if audio is not None else None
+    if tags is None:
+        return ""
+
+    def pick(value):
+        return _lyrics_clean(value)
+
+    # ID3 USLT and TXXX:LYRICS (MP3, and the ID3 tags inside WAV/AIFF).
+    if hasattr(tags, "getall"):
+        for frame in tags.getall("USLT"):
+            text = pick(getattr(frame, "text", ""))
+            if text:
+                return text
+        for frame in tags.getall("TXXX"):
+            desc = str(getattr(frame, "desc", "") or "").lower()
+            if desc in ("lyrics", "unsyncedlyrics", "unsynced lyrics", "lyr"):
+                text = pick(getattr(frame, "text", ""))
+                if text:
+                    return text
+
+    # MP4 ©lyr and direct Vorbis/APE/ASF keys.
+    for key in ("\xa9lyr", "©lyr", "lyr", "LYRICS", "UNSYNCEDLYRICS", "UNSYNCED LYRICS",
+                "LYRIC", "WM/Lyrics", "WM/Lyrics_Synchronised"):
+        try:
+            text = pick(tags.get(key))
+        except Exception:
+            text = ""
+        if text:
+            return text
+
+    # Vorbis comments and APE tags are case-insensitive enough in practice, but
+    # walking the items also catches LYRICS-eng and similar language variants.
+    try:
+        items = list(tags.items())
+    except Exception:
+        items = []
+    for key, value in items:
+        name = str(key).strip().lower()
+        if name in _EMBEDDED_LYRIC_KEYS or name.startswith("lyrics-"):
+            text = pick(value)
+            if text:
+                return text
+    return ""
+
+
+def _lyrics_http_get(url, timeout=8):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": LYRICS_UA,
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+def _lyrics_metadata(path):
+    tags = read_tags(path)
+    title = (tags.get("title") or "").strip()
+    artist = (tags.get("artist") or tags.get("albumartist") or "").strip()
+    album = (tags.get("album") or "").strip()
+    if not title:
+        title = os.path.splitext(os.path.basename(str(path or "")))[0]
+        title = re.sub(r"^\s*\d{1,3}[\s._-]+", "", title).strip()
+    try:
+        duration = float(read_specs(path).get("length") or 0)
+    except Exception:
+        duration = 0.0
+    return title, artist, album, duration
+
+
+def _lyrics_result(text, source):
+    # Timed empty lines are the clear/countdown cues, so loading a sidecar must
+    # not quietly discard them.
+    parsed = parse_lyrics(text, preserve_empty=True)
+    if not parsed["text"] and not parsed["lines"]:
+        return None
+    parsed["source"] = source
+    return parsed
+
+
+def _lyrics_norm(value):
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
+
+
+def _lyrics_duration_gap(record, duration):
+    """(difference from the local length, the record's length), or (0, 0)."""
+    try:
+        record_duration = float(record.get("duration") or 0)
+    except (TypeError, ValueError):
+        record_duration = 0.0
+    try:
+        local_duration = float(duration or 0)
+    except (TypeError, ValueError):
+        local_duration = 0.0
+    gap = (abs(record_duration - local_duration)
+           if local_duration > 0 and record_duration > 0 else 0.0)
+    return gap, record_duration
+
+
+def _lrclib_record(record, synced_ok=True):
+    if not isinstance(record, dict):
+        return None
+    if record.get("instrumental"):
+        return {"text": "", "lines": [], "synced": False,
+                "source": "lrclib", "instrumental": True}
+    synced = record.get("syncedLyrics") or ""
+    plain = record.get("plainLyrics") or ""
+    # Timestamps only line up with the recording they were written for. If the
+    # local file's length is outside the allowed window, use the plain version
+    # instead of showing a sync that cannot match this track.
+    text = (synced or plain) if synced_ok else plain
+    result = _lyrics_result(text, "lrclib")
+    if result:
+        if record.get("id") not in (None, ""):
+            result["lrclib_id"] = record.get("id")
+        if not synced_ok:
+            result["duration_mismatch"] = True
+    return result
+
+
+def lookup_lrclib(path, use_saved=True, clear_saved=True):
+    """LRCLIB: exact metadata lookup first, then a strict text-search fallback."""
+    title, artist, album, duration = _lyrics_metadata(path)
+    if not title or not artist:
+        return None
+
+    # A match the user already chose wins over another search. Refresh passes
+    # use_saved=False so the user can deliberately change it.
+    if use_saved:
+        saved = get_lyrics_match(path)
+        if saved:
+            match_id = saved.get("id")
+            try:
+                raw = _lyrics_http_get("https://lrclib.net/api/get/"
+                                       + quote(str(match_id), safe=""))
+                record = json.loads(raw.decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    forget_lyrics_match(path)
+                else:
+                    return None
+            except Exception:
+                return None
+            else:
+                gap, _record_duration = _lyrics_duration_gap(record, duration)
+                result = _lrclib_record(record,
+                                        not duration or gap <= LYRIC_LENGTH_TOLERANCE)
+                if result:
+                    result["saved_match"] = True
+                    result["match_label"] = saved.get("label", "")
+                    return result
+                forget_lyrics_match(path)
+    elif clear_saved:
+        forget_lyrics_match(path)
+
+    params = {"artist_name": artist, "track_name": title}
+    if album:
+        params["album_name"] = album
+    # LRCLIB rejects a duration outside 1..3600; a long audiobook still gets a
+    # title/artist lookup, just without the extra duration check.
+    seconds = int(round(duration))
+    if 1 <= seconds <= 3600:
+        params["duration"] = str(seconds)
+    try:
+        raw = _lyrics_http_get("https://lrclib.net/api/get?" + urllib.parse.urlencode(params))
+        record = json.loads(raw.decode("utf-8"))
+        gap, _record_duration = _lyrics_duration_gap(record, duration)
+        result = _lrclib_record(record, not duration or gap <= LYRIC_LENGTH_TOLERANCE)
+        if result:
+            return result
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return None
+    except Exception:
+        return None
+
+    # A different album/duration often makes the exact endpoint miss; search
+    # only accepts the same normalized title and artist, so a B-side or a
+    # karaoke cover cannot take the place of the track being played.
+    try:
+        query = urllib.parse.urlencode({"track_name": title, "artist_name": artist})
+        raw = _lyrics_http_get("https://lrclib.net/api/search?" + query)
+        records = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(records, list):
+        return None
+    wanted_title = _lyrics_norm(title)
+    wanted_artist = _lyrics_norm(artist)
+    matches = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if _lyrics_norm(record.get("trackName")) != wanted_title:
+            continue
+        record_artist = _lyrics_norm(record.get("artistName"))
+        if wanted_artist and wanted_artist not in record_artist and record_artist not in wanted_artist:
+            continue
+        gap, record_duration = _lyrics_duration_gap(record, duration)
+        synced_ok = not duration or gap <= LYRIC_LENGTH_TOLERANCE
+        result = _lrclib_record(record, synced_ok=synced_ok)
+        if not result:
+            continue
+        ident = record.get("id") or (_lyrics_norm(record.get("albumName")),
+                                     record.get("duration"), result.get("text"))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        label = " - ".join(part for part in (
+            str(record.get("trackName") or "").strip(),
+            str(record.get("artistName") or "").strip()) if part)
+        album_name = str(record.get("albumName") or "").strip()
+        if album_name:
+            label += " · " + album_name
+        if record_duration > 0:
+            label += " (" + fmt_time(record_duration) + ")"
+        if result.get("duration_mismatch"):
+            label += " · unsynced (length differs)"
+        matches.append({"gap": gap, "label": label, "result": result})
+    matches.sort(key=lambda item: item["gap"])
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]["result"]
+    return {"choices": matches, "source": "lrclib", "tried": []}
+
+
+def lookup_lyrics_ovh(path):
+    """lyrics.ovh: a free plain-text fallback, with no synchronized lyrics."""
+    title, artist, _album, _duration = _lyrics_metadata(path)
+    if not title or not artist:
+        return None
+    url = ("https://api.lyrics.ovh/v1/" + quote(artist, safe="") + "/"
+           + quote(title, safe=""))
+    try:
+        data = json.loads(_lyrics_http_get(url).decode("utf-8"))
+    except Exception:
+        return None
+    return _lyrics_result((data or {}).get("lyrics") or "", "lyrics_ovh")
+
+
+def resolve_lyrics(path, cfg, cancel=None, force_lookup=False):
+    """Try the enabled lyric sources in order and return the first match."""
+    if not path or is_cd_entry(path):
+        return {"text": "", "lines": [], "synced": False, "source": "", "tried": []}
+    tried = []
+    for key in lyric_order(cfg):
+        if cancel is not None and cancel():
+            return None
+        label = LYRIC_SOURCES.get(key, key)
+        tried.append(label)
+        result = None
+        try:
+            if key == "lrc":
+                text = read_lrc_lyrics(path)
+                if text:
+                    result = _lyrics_result(text, key)
+            elif key == "tags":
+                text = read_embedded_lyrics(path)
+                if text:
+                    result = _lyrics_result(text, key)
+            elif key == "lrclib":
+                result = lookup_lrclib(path, use_saved=not force_lookup)
+            elif key == "lyrics_ovh":
+                result = lookup_lyrics_ovh(path)
+        except Exception:
+            result = None
+        if result:
+            result["tried"] = tried
+            return result
+    return {"text": "", "lines": [], "synced": False, "source": "", "tried": tried}
 
 
 # ======================================================================
@@ -1525,7 +2331,7 @@ def mb_search_releases(artist, album, limit=10, timeout=10):
     titles = []
     if album:
         titles.append(album)
-        base = re.split(r"\s*[\(\[]", album, maxsplit=1)[0].strip(" -–—")
+        base = re.split(r"\s*[\(\[]", album, maxsplit=1)[0].strip(" -–-")
         if base and base.lower() != album.lower():
             titles.append(base)
     queries = []
@@ -1935,6 +2741,8 @@ class Library:
                     progress(i, len(files), path)
             gone = [p for p in known if p not in seen]
             c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in gone])
+        if gone:
+            forget_lyrics_matches(gone)
         if progress:
             progress(len(files), len(files), "")
 
@@ -1950,6 +2758,7 @@ class Library:
         """Drop a row (used when a file is renamed)."""
         with self._lock, self._conn() as c:
             c.execute("DELETE FROM tracks WHERE path=?", (path,))
+        forget_lyrics_match(path)
 
     def forget_prefix(self, folder):
         """Drop every row below `folder` (used when a music folder is removed)."""
@@ -1959,6 +2768,7 @@ class Library:
             paths = [r[0] for r in c.execute("SELECT path FROM tracks")]
             gone = [p for p in paths if p == folder or p.startswith(prefix)]
             c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in gone])
+        forget_lyrics_matches_prefix(folder)
         return len(gone)
 
     def play_count(self, path):
@@ -1990,6 +2800,7 @@ class Library:
         """Forget rows without touching the files on disk."""
         with self._lock, self._conn() as c:
             c.executemany("DELETE FROM tracks WHERE path=?", [(p,) for p in paths])
+        forget_lyrics_matches(paths)
 
     def delete_paths(self, paths, to_trash=True):
         """Delete the files (to the trash by default) and drop their rows.
@@ -3122,26 +3933,26 @@ MODES = {
     "update": "Update (copy new/changed, never delete)",
 }
 COMPARE_METHODS = {
-    "bytes": "Bit-by-bit (exact) — reads every file on the device",
-    "hash": "Fast hash (SHA-256, cached) — trusts the sync manifest, not exact",
+    "bytes": "Bit-by-bit (exact) - reads every file on the device",
+    "hash": "Fast hash (SHA-256, cached) - trusts the sync manifest, not exact",
 }
 # What the device's filesystem can put in a file name. MTP sends names as UTF-16 and
 # exFAT stores them as UTF-16, so those carry the whole range and a synced file keeps
 # its PC name to the character. FAT32 refuses a few characters and cannot store a name
 # that ends in a space or a dot, so those names change a little on the device.
 FILESYSTEMS = {
-    "fat32": "FAT32 — a few characters cannot be stored, so names are adjusted",
-    "exfat": "exFAT — names are kept exactly as on the PC",
-    "mtp": "MTP (mtpfs) — names are kept exactly as on the PC",
+    "fat32": "FAT32 - a few characters cannot be stored, so names are adjusted",
+    "exfat": "exFAT - names are kept exactly as on the PC",
+    "mtp": "MTP (mtpfs) - names are kept exactly as on the PC",
 }
 PLAIN_NAME_FILESYSTEMS = ("exfat", "mtp")   # filesystems that store the name unchanged
 # Force transcode: what a file is re-encoded to on its way to the device. "" is off. The
 # quality is one fixed, perceptually transparent setting per codec (see RIP_QUALITY).
 TRANSCODE_CODECS = {
-    "": ("Off — copy the file as it is", ""),
-    "mp3": ("MP3 (LAME) — plays almost anywhere", ".mp3"),
-    "m4a": ("AAC (.m4a) — iPods, phones", ".m4a"),
-    "opus": ("Opus (.opus) — smallest", ".opus"),
+    "": ("Off - copy the file as it is", ""),
+    "mp3": ("MP3 (LAME) - plays almost anywhere", ".mp3"),
+    "m4a": ("AAC (.m4a) - iPods, phones", ".m4a"),
+    "opus": ("Opus (.opus) - smallest", ".opus"),
 }
 TRANSCODE_DEFAULTS = {"mp3": ("vbr", 2), "m4a": ("cbr", 256), "opus": ("vbr", 128)}
 # The bitrates a forced transcode offers, per codec: (mode, value, label). The entry that
@@ -3203,9 +4014,9 @@ FILESYSTEM_NOTES = {
               "space or a dot, so those are left out on the device. Spaces and every "
               "other character are kept, and the log names any file whose name changed."),
     "exfat": ("exFAT stores names as UTF-16, so every file reaches the device with the "
-              "name it has on the PC — not one character is changed."),
+              "name it has on the PC - not one character is changed."),
     "mtp": ("MTP carries names as UTF-16, so every file reaches the device with the name "
-            "it has on the PC — not one character is changed. If the device still refuses "
+            "it has on the PC - not one character is changed. If the device still refuses "
             "a name, the copy fails and the ERROR line names the file."),
 }
 HASH_DIR = os.path.join(SYNC_DIR, "hashdb")            # local hash cache, one file per profile
@@ -3241,6 +4052,7 @@ class Profile:
     autosync: bool = False
     audio_only: bool = True
     include_lrc: bool = False   # also send the .lrc beside selected audio
+    verify_after: bool = False  # read each copied file back after a sync
     last_sync: str = ""          # "YYYY-MM-DD HH:MM" when the last sync finished, "" if never
     last_sync_method: str = ""   # COMPARE_METHODS key the last finished sync used
     last_verified: str = ""      # when the device contents were last read in full
@@ -3318,6 +4130,7 @@ class DevicePreset:
     transcode_quality: int = 0
     audio_only: bool = True
     include_lrc: bool = False
+    verify_after: bool = False
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def apply_to(self, profile):
@@ -3336,6 +4149,7 @@ class DevicePreset:
         profile.transcode_quality = self.transcode_quality
         profile.audio_only = self.audio_only
         profile.include_lrc = self.include_lrc
+        profile.verify_after = self.verify_after
 
 
 def load_presets():
@@ -3549,7 +4363,7 @@ class Action:
 # characters FAT32 refuses in a file name; they are dropped
 def _fat_name(part):
     """A name FAT32 can store: the characters it refuses and any control character are
-    left out, and a trailing space or dot goes too — FAT cannot store those at all.
+    left out, and a trailing space or dot goes too - FAT cannot store those at all.
     Everything else, spaces included, is kept."""
     cleaned = "".join(ch for ch in part if ch not in '*?:"<>|\\' and ord(ch) >= 32
                       and ch != "\x7f")
@@ -4013,6 +4827,40 @@ def _hash_device_file(backend, rel, chunk=1 << 20, fresh=False):
     return h.hexdigest()
 
 
+def _verify_copied_files(backend, copies, progress=None, log=None, cancel=lambda: False,
+                         offset=0, total=0, on_failure=None):
+    """Read each file written by this run back from the device and hash it.
+
+    copies is [(relative path, device path, SHA-256 of the bytes that were sent)].
+    The read is forced past the PC's page cache, because verifying the memory left by
+    the copy would not prove that the device holds those bytes. A mismatch is an error
+    and on_failure is called so the caller can drop the manifest record that would
+    otherwise let a later Fast hash compare trust the bad copy.
+    """
+    failed = 0
+    for j, (rel, dest, expected) in enumerate(copies):
+        if cancel():
+            break
+        if progress:
+            progress(offset + j, max(total, 1), f"Verifying {rel}")
+        try:
+            got = _hash_device_file(backend, dest, fresh=True)
+            if not expected or got != expected:
+                raise OSError("the device copy does not match the bytes that were sent")
+            if log:
+                log(f"VERIFIED {rel}")
+        except Exception as e:
+            failed += 1
+            if log:
+                log(f"ERROR    {rel}: copied file did not verify: {e}")
+            if on_failure is not None:
+                try:
+                    on_failure(rel, dest)
+                except Exception:
+                    pass
+    return failed
+
+
 def _library_match(src_sizes, store, size, digest, src_files):
     """The library file that holds exactly this content, or "" if none does.
 
@@ -4168,14 +5016,14 @@ def _compare_hashed(profile, backend, progress=None, cancel=lambda: False, verif
 
     A device file counts as equal when the manifest says this app wrote that exact
     content and a fresh listing still shows the same size and timestamp. Without a
-    manifest record — a file written by an older build, or by another profile — it is
+    manifest record - a file written by an older build, or by another profile - it is
     read once and compared byte for byte rather than recopied blindly.
 
     verify=True is Verify content, and it is a different shape of pass: every file in the
     device folder is read in full and hashed, not only the ones this profile syncs, and
     the manifest is rewritten from those hashes. Each record holds the SHA-256 of the
     device's own bytes and no timestamp at all, so nothing about the result depends on a
-    device clock — a phone that rewrites its file times on every mount changes nothing.
+    device clock - a phone that rewrites its file times on every mount changes nothing.
     Equality is then the digests being equal, which is exact: a record can only say "the
     device holds these bytes" because those bytes were read, and the manifest ends the
     pass as an exact index of what is on the device. Drop the record and the file is read
@@ -4477,16 +5325,22 @@ def _verify_device_names(profile, backend, manifest, prefix, queue, log=None, ca
     return failed
 
 
-def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lambda: False):
+def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lambda: False,
+                    verify=False):
     """Run a hash plan. Every device write and delete goes through one worker thread,
     so MTP operations are serialized. Records change only after a device op succeeds,
-    so a failed or interrupted transfer is never mistaken for a verified file."""
+    so a failed or interrupted transfer is never mistaken for a verified file.
+
+    verify=True reads every file this run wrote back from the device and checks its
+    SHA-256 against the bytes that were sent. A mismatch removes the manifest record,
+    so the next compare cannot trust a copy that did not arrive intact."""
     target = profile.target.strip("/")
     prefix = (target + "/") if target else ""
     store = HashStore(profile)
     manifest = DeviceManifest(profile)
     files = profile_sync_files(profile, False)
     work = [a for a in plan if a.kind != "equal"]
+    copies = []
     errors, done = 0, 0
     queue = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="mtp")
     try:
@@ -4514,6 +5368,16 @@ def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lamb
                                     and rec.get("profile") == profile.id
                                     and rec.get("rel") == a.rel):
                                 manifest.files.pop(key, None)
+                    if verify:
+                        try:
+                            expected = a.hash or file_hash256(source_path)
+                        except OSError as e:
+                            errors += 1
+                            if log:
+                                log(f"ERROR    {a.rel}: copied but could not be read for "
+                                    f"verification: {e}")
+                        else:
+                            copies.append((a.rel, dest, expected))
                     if log and dev != a.rel:
                         log(f"NAME     {a.rel}: stored on the device as {dev}")
                 elif a.kind == "delete":
@@ -4533,6 +5397,22 @@ def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lamb
                 errors += 1
                 if log:
                     log(f"ERROR    {a.rel}: {e}")
+        if verify and copies and not cancel():
+            def failed_copy(rel, dest):
+                manifest.forget(dest)
+                rec = store.records.get(rel)
+                if rec is not None:
+                    rec.pop("synced_hash", None)
+                    rec.pop("dev", None)
+            verify_errors = _verify_copied_files(
+                backend, copies, progress, log, cancel, offset=len(work),
+                total=len(work) + len(copies), on_failure=failed_copy)
+            errors += verify_errors
+            if log:
+                log(f"VERIFIED {len(copies) - verify_errors} of {len(copies)} copied "
+                    f"file(s) read back from the device")
+        elif verify and log and not cancel():
+            log("VERIFIED no file needed to be copied")
         if not cancel():
             errors += _verify_device_names(profile, backend, manifest, prefix, queue, log, cancel)
         cleanup = profile.mode == "mirror" and (
@@ -4547,10 +5427,15 @@ def _execute_hashed(profile, backend, plan, progress=None, log=None, cancel=lamb
         store.save()
         manifest.save()
     if errors and log:
-        log(f"{errors} file(s) could not be written and were skipped; the rest was synced. "
-            "Check the ERROR lines above.")
+        if verify:
+            log(f"{errors} error(s) occurred while copying or verifying; the rest was "
+                f"synced. Check the ERROR lines above.")
+        else:
+            log(f"{errors} file(s) could not be written and were skipped; the rest was "
+                f"synced. Check the ERROR lines above.")
     if progress:
-        progress(len(work), len(work), "Sync finished")
+        steps = len(work) + (len(copies) if verify else 0)
+        progress(steps, steps, "Sync finished")
     return errors
 
 
@@ -4653,16 +5538,23 @@ def compare(profile, backend, progress=None, cancel=lambda: False, verify=False,
     return plan
 
 
-def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: False):
+def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: False,
+            verify=False):
     """Run a plan. Bit-by-bit transfers are recorded in the device manifest too, so
-    switching a profile to Fast hash can trust them without reading the device."""
+    switching a profile to Fast hash can trust them without reading the device.
+
+    verify=True reads every file this run wrote back from the device and compares its
+    SHA-256 with the bytes that were sent. For a transcoded copy the encoded bytes are
+    what is checked, which proves the transfer without pretending the encode is
+    bit-identical to the source."""
     if profile.method == "hash" and not profile.transcode:
-        return _execute_hashed(profile, backend, plan, progress, log, cancel)
+        return _execute_hashed(profile, backend, plan, progress, log, cancel, verify)
     target = profile.target.strip("/")
     prefix = (target + "/") if target else ""
     manifest = DeviceManifest(profile)
     files = profile_sync_files(profile, False)
     work = [a for a in plan if a.kind != "equal"]
+    copies = []
     errors = 0
     tmp = tempfile.mkdtemp(prefix="nebula-transcode-", dir=TMP_DIR) if profile.transcode else None
     transcode_mode, transcode_quality = (profile.transcode_choice()
@@ -4684,6 +5576,16 @@ def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: Fals
                                                       transcode_mode, transcode_quality))
                     try:
                         backend.copy_in(send, dest)
+                        if verify:
+                            try:
+                                expected = file_hash256(send)
+                            except OSError as e:
+                                errors += 1
+                                if log:
+                                    log(f"ERROR    {a.rel}: copied but could not be read "
+                                        f"for verification: {e}")
+                            else:
+                                copies.append((a.rel, dest, expected))
                     finally:
                         if send != src and os.path.exists(send):
                             os.remove(send)
@@ -4702,9 +5604,25 @@ def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: Fals
                 errors += 1
                 if log:
                     log(f"ERROR    {a.rel}: {e}")
+        if verify and copies and not cancel():
+            def failed_copy(_rel, dest):
+                manifest.forget(dest)
+            verify_errors = _verify_copied_files(
+                backend, copies, progress, log, cancel, offset=len(work),
+                total=len(work) + len(copies), on_failure=failed_copy)
+            errors += verify_errors
+            if log:
+                log(f"VERIFIED {len(copies) - verify_errors} of {len(copies)} copied "
+                    f"file(s) read back from the device")
+        elif verify and log and not cancel():
+            log("VERIFIED no file needed to be copied")
         if errors and log:
-            log(f"{errors} file(s) could not be written and were skipped; the rest was synced. "
-                "Check the ERROR lines above.")
+            if verify:
+                log(f"{errors} error(s) occurred while copying or verifying; the rest was "
+                    f"synced. Check the ERROR lines above.")
+            else:
+                log(f"{errors} file(s) could not be written and were skipped; the rest was "
+                    f"synced. Check the ERROR lines above.")
         cleanup = profile.mode == "mirror" and (
             profile.selection_mode != "selected" or any(a.kind == "delete" for a in plan))
         if cleanup and not cancel():
@@ -4717,7 +5635,8 @@ def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: Fals
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
     if progress:
-        progress(len(work), len(work), "Sync finished")
+        steps = len(work) + (len(copies) if verify else 0)
+        progress(steps, steps, "Sync finished")
     return errors
 # ======================================================================
 # ui/common.py - worker thread, theme, player bar, spectrum, cover viewer
@@ -7467,6 +8386,10 @@ QTreeWidget::item:hover {{ background: {HOVER_ALT}; }}
 QListWidget {{ padding: 2px; }}
 QListWidget::item {{ padding: 5px 4px; border-radius: 3px; }}
 QListWidget::item:hover {{ background: {HOVER}; }}
+QListWidget#LyricsList::item {{ padding: 0; border-radius: 4px; }}
+QWidget#LyricLineRow, QWidget#LyricLineRow QLabel, QWidget#LyricLineRow QToolButton {{
+    background: transparent; }}
+
 QTreeWidget::item:selected, QTableWidget::item:selected, QListWidget::item:selected {{
     background: {ACCENT}; color: {ON_ACCENT}; }}
 QTableWidget::item:hover {{ background: {HOVER_ALT}; }}
@@ -7494,7 +8417,7 @@ QProgressBar {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 
 QProgressBar::chunk {{ background: {ACCENT}; }}
 /* Check boxes and radios are painted by BranchArrowStyle, not here: Fusion's own box
    blends into a dark palette and disappears on Black AMOLED. Do not add a stylesheet
-   rule for the indicator sub-control — it would take the drawing away from the style,
+   rule for the indicator sub-control - it would take the drawing away from the style,
    and the tick inside a filled box would go with it. */
 QCheckBox, QRadioButton {{ spacing: 6px; }}
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: 4px; margin-top: 14px; padding-top: 8px; }}
@@ -7777,8 +8700,8 @@ def mode_icon(kind, size=18):
     """Shuffle / repeat: struck through and muted while off, plain and in the text colour
     while on (as a player shows it).
 
-    Off and on are filled for every role, because a button that has focus — or the
-    pointer over it — asks Qt for QIcon.Active rather than Normal. Leaving Active+Off
+    Off and on are filled for every role, because a button that has focus - or the
+    pointer over it - asks Qt for QIcon.Active rather than Normal. Leaving Active+Off
     out let Qt fall back to the on pixmap, so either button painted white whatever it
     was set to.
     """
@@ -7825,7 +8748,8 @@ class PreferencesDialog(QDialog):
                             ("Syncing", self._sync_page(cfg)),
                             ("Backup", self._backup_page(cfg)),
                             ("Audio CD", self._cd_page(cfg)),
-                            ("Identification", self._identify_page(cfg))):
+                            ("Identification", self._identify_page(cfg)),
+                            ("Lyrics", self._lyrics_page(cfg))):
             self.sidebar.addItem(title)
             self.pages.addWidget(page)
         self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -8457,6 +9381,63 @@ class PreferencesDialog(QDialog):
                  self.id_list.item(i).checkState() == Qt.CheckState.Checked]
                 for i in range(self.id_list.count())]
 
+    def _lyrics_page(self, cfg):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        note = QLabel("For the current track, the sources that are on are tried in this order. "
+                      "LRC files and embedded tags work offline. LRCLIB is the recommended "
+                      "online source because it returns both plain and synchronized lyrics; "
+                      "lyrics.ovh is a plain-text fallback. A chosen LRCLIB match is remembered "
+                      "for that track, and removing the track from the library forgets it.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        body = QHBoxLayout()
+        self.lyric_list = QListWidget()
+        for key, enabled in lyric_order_entries(cfg):
+            if key not in LYRIC_SOURCES:
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                          | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            item.setToolTip(LYRIC_SOURCE_HELP.get(key, ""))
+            self.lyric_list.addItem(item)
+        self._lyric_numbers()
+        body.addWidget(self.lyric_list, 1)
+        arrows = QVBoxLayout()
+        up = QPushButton("Move up")
+        down = QPushButton("Move down")
+        up.clicked.connect(lambda: self._lyric_move(-1))
+        down.clicked.connect(lambda: self._lyric_move(1))
+        arrows.addWidget(up)
+        arrows.addWidget(down)
+        arrows.addStretch()
+        body.addLayout(arrows)
+        lay.addLayout(body, 1)
+        return page
+
+    def _lyric_numbers(self):
+        for i in range(self.lyric_list.count()):
+            item = self.lyric_list.item(i)
+            item.setText(f"{i + 1}. {LYRIC_SOURCES[item.data(Qt.ItemDataRole.UserRole)]}")
+
+    def _lyric_move(self, step):
+        row = self.lyric_list.currentRow()
+        target = row + step
+        if row < 0 or not 0 <= target < self.lyric_list.count():
+            return
+        item = self.lyric_list.takeItem(row)
+        self.lyric_list.insertItem(target, item)
+        self.lyric_list.setCurrentRow(target)
+        self._lyric_numbers()
+
+    def _lyric_order_value(self):
+        return [[self.lyric_list.item(i).data(Qt.ItemDataRole.UserRole),
+                 self.lyric_list.item(i).checkState() == Qt.CheckState.Checked]
+                for i in range(self.lyric_list.count())]
+
     def _discogs_refresh(self, cfg):
         if not DISCOGS_CONSUMER_KEY:
             text = "Discogs sign-in is not set up in this build."
@@ -8516,6 +9497,7 @@ class PreferencesDialog(QDialog):
         devices_changed = (dict(cfg.get("removed_devices") or {}) != self.removed_devices)
         cfg.update(self._collect())
         cfg["id_order"] = self._id_order_value()
+        cfg["lyric_order"] = self._lyric_order_value()
         save_config(cfg)
         window = self.library_tab.window()
         window.apply_theme()
@@ -8525,6 +9507,9 @@ class PreferencesDialog(QDialog):
         window.sync_tab.trim_logs()        # a smaller limit applies to logs already kept
         if devices_changed:
             window.devices_tab.refresh_list()   # a restored device comes back right away
+        lyrics = getattr(window, "_lyrics_dialog", None)
+        if lyrics is not None and lyrics.isVisible():
+            lyrics.refresh()
         self.library_tab.preferences_changed()
 
     def _ok(self):
@@ -8813,6 +9798,7 @@ class AudioTap(QObject):
         self.spectrum = spectrum
         self.enabled = False
         self.mode = ""
+        self.active = True
         self.decoder = None
         self._out = None
         if _HAS_AUDIO_TAP:
@@ -8830,8 +9816,12 @@ class AudioTap(QObject):
                 self.enabled = True
                 self.mode = "decoder"
 
+    def set_active(self, active):
+        """Only the deck that is audible feeds the spectrum."""
+        self.active = bool(active)
+
     def _on_buffer(self, buf):
-        if not self.spectrum.playing:
+        if not self.active or not self.spectrum.playing:
             return
         try:
             fmt = buf.format()
@@ -8850,7 +9840,7 @@ class AudioTap(QObject):
             self.decoder.load(path)
 
     def on_position(self, ms):
-        if self.decoder is not None and self.spectrum.playing:
+        if self.active and self.decoder is not None and self.spectrum.playing:
             levels = self.decoder.levels_at(ms)
             if levels:
                 self.spectrum.push_levels(levels)
@@ -8877,13 +9867,13 @@ class SpectrumWidget(QWidget):
     def _set_tooltip(self):
         if self.live and self.mode == "decoder":
             self.setToolTip("Spectrum decoded from the playing file with QAudioDecoder"
-                            + ((" — " + self.note) if self.note else ""))
+                            + ((" - " + self.note) if self.note else ""))
         elif self.live:
             self.setToolTip("Live spectrum of the playing audio")
         elif self.note:
             self.setToolTip("Spectrum: " + self.note)
         else:
-            self.setToolTip("Animated spectrum placeholder — no audio decoder is available "
+            self.setToolTip("Animated spectrum placeholder - no audio decoder is available "
                             "in this Qt build; bars are not derived from the audio")
 
     def set_live(self, live, mode=""):
@@ -9263,6 +10253,31 @@ def format_eq_profile(profile):
     return "\n".join(lines) + "\n"
 
 
+def lyrics_icon_pixmap(color, px=18):
+    """The show-lyrics glyph (lyrics lines with a music note), painted at any size."""
+    pixmap = QPixmap(px, px)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.0, px * 2.0 / 24.0))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    scale = px / 24.0
+    for x0, y0, x1, y1 in ((3.0, 1.5, 14.0, 1.5), (3.0, 5.5, 14.0, 5.5),
+                           (3.0, 9.5, 14.0, 9.5), (3.0, 17.5, 6.0, 17.5),
+                           (3.0, 13.5, 7.5, 13.5)):
+        painter.drawLine(QPointF(x0 * scale, y0 * scale), QPointF(x1 * scale, y1 * scale))
+    painter.drawPolyline(QPolygonF([QPointF(22.5 * scale, 7.0 * scale),
+                                    QPointF(17.5 * scale, 1.5 * scale),
+                                    QPointF(17.5 * scale, 17.0 * scale)]))
+    painter.drawEllipse(QPointF(13.5 * scale, 17.0 * scale), 4.0 * scale, 4.0 * scale)
+    painter.end()
+    return pixmap
+
+
 def eq_icon_pixmap(color, px=18):
     """The custom six-bar EQ mark from assets/icons/eq.svg, painted at any size."""
     pixmap = QPixmap(px, px)
@@ -9610,7 +10625,7 @@ class EQDialog(QDialog):
             QMessageBox.warning(self, "Import failed", str(exc))
             return
         self._load_profile(profile)
-        self._touch("Profile imported — it applies when this window closes.")
+        self._touch("Profile imported - it applies when this window closes.")
 
     def _export(self):
         path, chosen = QFileDialog.getSaveFileName(
@@ -9669,7 +10684,7 @@ class EQDialog(QDialog):
         if name not in presets:
             return
         self._load_profile(eq_profile_from_config({"eq_profile": presets[name]}))
-        self._touch(f"Preset \u201c{name}\u201d loaded — applies when this window closes.")
+        self._touch(f"Preset \u201c{name}\u201d loaded - applies when this window closes.")
 
     def _save_preset(self):
         name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
@@ -9731,6 +10746,2148 @@ class EQDialog(QDialog):
         super().closeEvent(event)
 
 
+class CrossfadeDialog(QDialog):
+    """Playback > Crossfade: a small window for the overlap between tracks."""
+
+    def __init__(self, player, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self._loading = True
+        self.setWindowTitle("Crossfade")
+        self.setObjectName("Panel")
+        self.setModal(False)
+        self.setMinimumWidth(420)
+        self.resize(460, 210)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        title = QLabel("Crossfade")
+        title.setObjectName("Heading")
+        root.addWidget(title)
+        note = QLabel("The next track starts before this one ends and the two are "
+                      "faded together. Set it to 0 to turn crossfade off.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 120)       # tenths of a second
+        self.slider.setSingleStep(5)
+        self.slider.setPageStep(10)
+        self.slider.setToolTip("Crossfade length")
+        row.addWidget(self.slider, 1)
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(0.0, 12.0)
+        self.spin.setDecimals(1)
+        self.spin.setSingleStep(0.5)
+        self.spin.setSuffix(" s")
+        self.spin.setFixedWidth(80)
+        row.addWidget(self.spin)
+        root.addLayout(row)
+
+        self.readout = QLabel("")
+        self.readout.setObjectName("Muted")
+        root.addWidget(self.readout)
+        root.addStretch()
+
+        foot = QHBoxLayout()
+        foot.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        foot.addWidget(close)
+        root.addLayout(foot)
+
+        self._load()
+        self._loading = False
+        self.slider.valueChanged.connect(self._slider_changed)
+        self.spin.valueChanged.connect(self._spin_changed)
+
+    def _load(self):
+        try:
+            seconds = float(self.player.crossfade_seconds)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        seconds = max(0.0, min(12.0, seconds))
+        self.slider.setValue(int(round(seconds * 10)))
+        self.spin.setValue(seconds)
+        self._readout(seconds)
+
+    def _readout(self, seconds):
+        if seconds <= 0:
+            self.readout.setText("Crossfade is off"
+                                 + (" - gapless playback is on" if self.player.gapless else ""))
+        else:
+            self.readout.setText(f"{seconds:.1f} seconds of overlap")
+
+    def _apply(self, seconds):
+        seconds = max(0.0, min(12.0, float(seconds)))
+        for widget, value in ((self.slider, int(round(seconds * 10))),
+                              (self.spin, seconds)):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._readout(seconds)
+        self.player.set_crossfade(seconds, save=False)
+
+    def closeEvent(self, event):
+        self.player.set_crossfade(self.spin.value())
+        super().closeEvent(event)
+
+    def _slider_changed(self, value):
+        if not self._loading:
+            self._apply(value / 10.0)
+
+    def _spin_changed(self, value):
+        if not self._loading:
+            self._apply(value)
+
+
+class LyricLineRow(QWidget):
+    """One synchronized lyric row: seek on click, nudge with its own buttons."""
+
+    seek_requested = Signal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.seek_requested.emit()
+        super().mousePressEvent(event)
+
+
+class LyricsDialog(QDialog):
+    """The lyrics window, with source lookup and synced-line highlighting."""
+
+    def __init__(self, player, config, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self.config = config
+        self._worker = None
+        self._token = 0
+        self._lines = []
+        self._synced = False
+        self._active_row = -1
+        self._match_choices = []
+        self._lyrics_path = ""
+        self._current_result = None
+        self._display_suffix = ""
+        self._raw_lines = []
+        self._line_adjustments = []
+        self._line_indices = []
+        self._visible_labels = []
+
+        self.setWindowTitle("Lyrics - Nebula Music Center")
+        self.setObjectName("Panel")
+        self.setModal(False)
+        self.setMinimumSize(620, 340)
+        self.resize(775, 460)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("Lyrics")
+        title.setObjectName("Heading")
+        head.addWidget(title)
+        head.addStretch()
+        self.source_label = QLabel("")
+        self.source_label.setObjectName("Muted")
+        self.source_label.setWordWrap(False)
+        self.source_label.setAlignment(Qt.AlignmentFlag.AlignRight
+                                       | Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(self.source_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setToolTip("Look up the current track again; this also lets you "
+                                    "change a saved match")
+        self.refresh_btn.clicked.connect(lambda _checked=False: self.refresh(force=True))
+        head.addWidget(self.refresh_btn)
+        root.addLayout(head)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(8)
+        self.track_label = QLabel("")
+        self.track_label.setObjectName("NowSub")
+        self.track_label.setWordWrap(True)
+        meta_row.addWidget(self.track_label, 1)
+        shift_label = QLabel("Shift")
+        shift_label.setObjectName("Muted")
+        shift_label.setMinimumHeight(24)
+        shift_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        shift_label.setToolTip("Positive values show the lyrics later; negative values "
+                               "show them earlier. The shift is saved for this track.")
+        meta_row.addWidget(shift_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-MAX_LYRIC_OFFSET, MAX_LYRIC_OFFSET)
+        self.offset_spin.setDecimals(2)
+        self.offset_spin.setSingleStep(0.01)
+        self.offset_spin.setSuffix(" s")
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.setFixedWidth(92)
+        self.offset_spin.setToolTip("Shift synchronized lyrics by this many seconds")
+        self.offset_spin.setEnabled(False)
+        self.offset_spin.valueChanged.connect(self._offset_changed)
+        meta_row.addWidget(self.offset_spin, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(meta_row)
+
+        self.match_row = QWidget()
+        match_lay = QHBoxLayout(self.match_row)
+        match_lay.setContentsMargins(0, 0, 0, 0)
+        match_lay.setSpacing(8)
+        match_label = QLabel("Match")
+        match_label.setObjectName("Muted")
+        match_label.setToolTip("LRCLIB found more than one version of this track.")
+        match_lay.addWidget(match_label)
+        self.match_combo = QComboBox()
+        self.match_combo.setToolTip("Choose the lyrics that match this recording.")
+        self.match_combo.setMinimumWidth(300)
+        self.match_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.match_combo.setMinimumContentsLength(30)
+        self.match_combo.currentIndexChanged.connect(self._choose_match)
+        match_lay.addWidget(self.match_combo, 1)
+        self.match_row.setVisible(False)
+        root.addWidget(self.match_row)
+
+        self.list = QListWidget()
+        self.list.setObjectName("LyricsList")
+        self.list.setWordWrap(True)
+        self.list.setSpacing(2)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.itemClicked.connect(self._seek)
+        root.addWidget(self.list, 1)
+
+        self.note = QLabel("")
+        self.note.setObjectName("Muted")
+        self.note.setWordWrap(True)
+        self.note.setVisible(False)
+        root.addWidget(self.note)
+
+        foot = QHBoxLayout()
+        self.save_lrc_btn = QPushButton("Save")
+        self.save_lrc_btn.setToolTip("Save changes to the LRC file")
+        self.save_lrc_btn.setEnabled(False)
+        self.save_lrc_btn.clicked.connect(self._save_as_lrc)
+        foot.addWidget(self.save_lrc_btn)
+        self.revert_btn = QPushButton("Revert")
+        self.revert_btn.setToolTip("Discard unsaved timing changes and reload the LRC file")
+        self.revert_btn.setEnabled(False)
+        self.revert_btn.clicked.connect(self._revert)
+        foot.addWidget(self.revert_btn)
+        foot.addStretch()
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        foot.addWidget(close)
+        root.addLayout(foot)
+
+        self._timer = QTimer(self, interval=200, timeout=self._sync)
+        self.player.track_changed.connect(self._track_changed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "list") and self._synced:
+            QTimer.singleShot(0, self._resize_line_rows)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._timer.start()
+        self.refresh()
+
+    def closeEvent(self, event):
+        self._token += 1
+        self._timer.stop()
+        self._cancel_worker()
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(1500)
+        super().closeEvent(event)
+
+    def _track_changed(self, _path=""):
+        if self.isVisible():
+            self.refresh()
+
+    def _cancel_worker(self):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+
+    def _track_text(self, path):
+        title = self.player.now_title.text().strip()
+        artist = self.player.now_sub.text().strip()
+        if not title or title == "Nothing playing":
+            title = os.path.splitext(os.path.basename(str(path or "")))[0]
+        return f"{title} - {artist}" if title and artist else title
+
+    def _message(self, text):
+        self.list.clear()
+        self._visible_labels = []
+        item = QListWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.list.addItem(item)
+
+    def _set_note(self, text):
+        self.note.setText(str(text or ""))
+        self.note.setVisible(bool(str(text or "").strip()))
+
+    def _clear_matches(self):
+        self._match_choices = []
+        self.match_combo.blockSignals(True)
+        self.match_combo.clear()
+        self.match_combo.blockSignals(False)
+        self.match_row.setVisible(False)
+
+    def refresh(self, force=False):
+        path = self.player.current_path()
+        self._token += 1
+        token = self._token
+        self._cancel_worker()
+        self._lyrics_path = path
+        self._lines = []
+        self._synced = False
+        self._active_row = -1
+        self._current_result = None
+        self._display_suffix = ""
+        self._raw_lines = []
+        self._line_adjustments = []
+        self._line_indices = []
+        self._set_note("")
+        self._clear_matches()
+        self._update_save_button()
+        offset = get_lyrics_offset(path) if path else 0.0
+        self.offset_spin.blockSignals(True)
+        self.offset_spin.setValue(offset)
+        self.offset_spin.blockSignals(False)
+        self.offset_spin.setEnabled(bool(path))
+        self.track_label.setText(self._track_text(path))
+        if not path:
+            self.source_label.setText("")
+            self._message("Nothing is playing.")
+            self.refresh_btn.setEnabled(True)
+            return
+        self.source_label.setText("Looking for lyrics…")
+        self._message("Looking for lyrics…")
+        self.refresh_btn.setEnabled(False)
+        worker = Worker(lambda progress, log, cancel: resolve_lyrics(
+            path, self.config, cancel, force_lookup=force), self)
+        worker.done.connect(lambda result, t=token: self._ready(t, result))
+        worker.failed.connect(lambda error, t=token: self._failed(t, error))
+        worker.finished.connect(lambda w=worker: self._worker_finished(w))
+        self._worker = worker
+        worker.start()
+
+    def _worker_finished(self, worker):
+        if worker is self._worker:
+            self._worker = None
+
+    def _ready(self, token, result):
+        if token != self._token:
+            return
+        self.refresh_btn.setEnabled(True)
+        self._render(result or {})
+
+    def _failed(self, token, _error):
+        if token != self._token:
+            return
+        self.refresh_btn.setEnabled(True)
+        self._clear_matches()
+        self._current_result = None
+        self._raw_lines = []
+        self._line_adjustments = []
+        self._line_indices = []
+        self._lines = []
+        self._synced = False
+        self._set_note("")
+        self.source_label.setText("")
+        self._message("Could not load lyrics.")
+        self._update_save_button()
+
+    def _render(self, result):
+        self._clear_matches()
+        if result.get("choices"):
+            self._show_matches(result)
+            return
+        self._show_result(result)
+        if result.get("source") == "lrclib" and not result.get("saved_match"):
+            self._remember_match(result)
+
+    def _remember_match(self, result, label=""):
+        match_id = result.get("lrclib_id")
+        if self._lyrics_path and match_id not in (None, ""):
+            save_lyrics_match(self._lyrics_path, match_id,
+                              label or result.get("match_label", ""))
+
+    def _show_matches(self, result):
+        choices = [choice for choice in (result.get("choices") or [])
+                   if isinstance(choice, dict) and isinstance(choice.get("result"), dict)]
+        if not choices:
+            self._show_result({"text": "", "tried": result.get("tried") or []})
+            return
+        self._match_choices = choices
+        self.match_combo.blockSignals(True)
+        self.match_combo.clear()
+        for choice in choices:
+            label = str(choice.get("label") or "LRCLIB match")
+            self.match_combo.addItem(label)
+            self.match_combo.setItemData(self.match_combo.count() - 1, label,
+                                         Qt.ItemDataRole.ToolTipRole)
+        self.match_combo.setCurrentIndex(0)
+        self.match_combo.blockSignals(False)
+        self.match_row.setVisible(True)
+        self._show_result(choices[0]["result"], f" · {len(choices)} matches")
+        self._remember_match(choices[0]["result"], choices[0].get("label", ""))
+
+    def _choose_match(self, index):
+        if 0 <= index < len(self._match_choices):
+            self._show_result(self._match_choices[index]["result"],
+                              f" · {len(self._match_choices)} matches")
+            self._remember_match(self._match_choices[index]["result"],
+                                 self._match_choices[index].get("label", ""))
+
+    def _offset_changed(self, value):
+        if self._lyrics_path:
+            save_lyrics_offset(self._lyrics_path, float(value))
+        if self._raw_lines:
+            self._render_synced_lines()
+        else:
+            self._update_save_button()
+
+    def _show_result(self, result, suffix=""):
+        self._current_result = result
+        self._display_suffix = suffix
+        self.list.clear()
+        self._set_note("")
+        self._lines = []
+        self._raw_lines = []
+        self._line_adjustments = []
+        self._line_indices = []
+        self._visible_labels = []
+        self._synced = False
+        self._active_row = -1
+        self._update_save_button()
+        source = str(result.get("source") or "")
+        label = LYRIC_SOURCES.get(source, source or "Unknown")
+        if result.get("duration_mismatch"):
+            self._display_suffix += " · unsynced (length differs)"
+        if result.get("saved_match"):
+            self._display_suffix += " · saved"
+        if result.get("instrumental"):
+            self.source_label.setText(label + self._display_suffix)
+            self._set_note("No synchronized lyrics for this track.")
+            self._message("Instrumental track - no lyrics.")
+            self._update_save_button()
+            return
+        lines = []
+        for entry in result.get("lines") or []:
+            try:
+                millis, text = entry
+                lines.append((max(0, int(millis)), _lyrics_clean(text)))
+            except (TypeError, ValueError):
+                continue
+        text = _lyrics_clean(result.get("text") or "")
+        if lines:
+            self._raw_lines = lines
+            self._line_adjustments = [0.0] * len(lines)
+            self._synced = True
+            self._render_synced_lines()
+            return
+        if not text:
+            tried = result.get("tried") or []
+            self.source_label.setText("")
+            note = "No lyrics found."
+            if tried:
+                note += " Tried: " + ", ".join(str(name) for name in tried) + "."
+            self._message(note)
+            self._update_save_button()
+            return
+        self._set_note("These lyrics are not synchronized to the track.")
+        for line in text.splitlines():
+            item = QListWidgetItem(line)
+            item.setData(Qt.ItemDataRole.UserRole, -1)
+            self.list.addItem(item)
+        if not self.list.count():
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, -1)
+            self.list.addItem(item)
+        self.source_label.setText(label + self._display_suffix)
+        self._update_save_button()
+
+    def _render_synced_lines(self):
+        """Draw a three-line window around the current synced line."""
+        if not self._raw_lines:
+            return
+        self.list.clear()
+        self._lines = []
+        self._line_indices = []
+        self._synced = True
+        self._active_row = -1
+        offset = float(self.offset_spin.value())
+        shift = int(round(offset * 1000.0))
+        rows = []
+        for index, (millis, text) in enumerate(self._raw_lines):
+            try:
+                extra = int(round(float(self._line_adjustments[index]) * 1000.0))
+            except (IndexError, TypeError, ValueError):
+                extra = 0
+            rows.append((max(0, int(millis) + shift + extra), text, index))
+        rows.sort(key=lambda row: row[0])
+        self._lines = [(millis, text) for millis, text, _index in rows]
+        self._line_indices = [index for _millis, _text, index in rows]
+        self._render_lyric_window()
+        source = str((self._current_result or {}).get("source") or "")
+        label = LYRIC_SOURCES.get(source, source or "Unknown")
+        shift_note = f" · shift {offset:+.2f} s" if shift else ""
+        edited = any(abs(value) >= 0.005 for value in self._line_adjustments)
+        edit_note = " · line edits" if edited else ""
+        self._set_note("")
+        self.source_label.setText(label + self._display_suffix + shift_note
+                                  + edit_note + " · synced")
+        self._update_save_button()
+        QTimer.singleShot(0, self._resize_line_rows)
+        self._sync()
+
+    def _display_entries(self):
+        return [(millis, text, index)
+                for (millis, text), index in zip(self._lines, self._line_indices)]
+
+    def _render_lyric_window(self):
+        """Show exactly three slots, with the active line in the middle."""
+        if not self._synced:
+            return
+        entries = self._display_entries()
+        position = max(0, int(self.player.player.position() or 0))
+        slots = lyric_display_slots(entries, position)
+        self.list.clear()
+        self._visible_labels = []
+        self._visible_entries = entries
+        for slot in slots:
+            item = QListWidgetItem("")
+            item.setSizeHint(QSize(0, 38))
+            kind = slot.get("kind")
+            if kind == "line":
+                millis, text, index = slot["entry"]
+                item.setData(Qt.ItemDataRole.UserRole, millis)
+                item.setData(Qt.ItemDataRole.UserRole + 1, index)
+                item.setData(Qt.ItemDataRole.UserRole + 2, text)
+                item.setToolTip(fmt_time(millis / 1000.0))
+                body = lyric_slot_text(slot, entries, position, timestamp=False)
+                widget = self._line_row(millis, text, index,
+                                         role=slot.get("role", "line"), body=body)
+                self.list.addItem(item)
+                self.list.setItemWidget(item, widget)
+                label = widget.findChild(QLabel, "LyricText")
+                if label is not None:
+                    self._visible_labels.append((label, slot))
+            elif kind == "first":
+                widget = self._placeholder_row(
+                    lyric_slot_text(slot, entries, position, timestamp=False),
+                    role="current")
+                self.list.addItem(item)
+                self.list.setItemWidget(item, widget)
+                label = widget.findChild(QLabel, "LyricText")
+                if label is not None:
+                    self._visible_labels.append((label, slot))
+            else:
+                self.list.addItem(item)
+        current_slot = next((slot for slot in slots
+                             if slot.get("role") == "current"), None)
+        self._active_row = (int(current_slot.get("index", -1))
+                            if current_slot is not None else -1)
+        self.list.setCurrentRow(-1)
+        self._update_visible_text(position)
+        QTimer.singleShot(0, self._resize_line_rows)
+
+    def _update_visible_text(self, position):
+        entries = getattr(self, "_visible_entries", [])
+        for label, slot in getattr(self, "_visible_labels", []):
+            label.setText(lyric_slot_text(slot, entries, position, timestamp=False))
+
+    def _line_row(self, millis, text, index, role="line", body=None):
+        row = LyricLineRow()
+        row.setObjectName("LyricLineRow")
+        row.setAutoFillBackground(False)
+        row.setMinimumHeight(30)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+        timestamp = QLabel(_lrc_timestamp(millis), row)
+        timestamp.setObjectName("Muted")
+        timestamp.setMinimumWidth(72)
+        timestamp.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label = QLabel(str(body if body is not None else text), row)
+        label.setObjectName("LyricText")
+        label.setWordWrap(True)
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        if role == "current":
+            label.setStyleSheet(f"color: {ACCENT}; font-weight: bold;")
+            timestamp.setStyleSheet(f"color: {ACCENT};")
+        try:
+            value = float(self._line_adjustments[index])
+        except (IndexError, TypeError, ValueError):
+            value = 0.0
+        adjustment = QLabel(f"[{value:+.2f}]", row)
+        adjustment.setObjectName("LyricAdjustment")
+        adjustment.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        adjustment.setMinimumWidth(54)
+        adjustment.setToolTip("This line's timing adjustment")
+        plus = QToolButton(row)
+        plus.setText("+")
+        plus.setToolTip("Move this line 0.01 seconds later")
+        plus.setAutoRaise(True)
+        plus.setFixedSize(20, 20)
+        plus.clicked.connect(lambda _checked=False, i=index:
+                             self._adjust_line(i, LYRIC_LINE_STEP))
+        minus = QToolButton(row)
+        minus.setText("-")
+        minus.setToolTip("Move this line 0.01 seconds earlier")
+        minus.setAutoRaise(True)
+        minus.setFixedSize(20, 20)
+        minus.clicked.connect(lambda _checked=False, i=index:
+                              self._adjust_line(i, -LYRIC_LINE_STEP))
+        layout.addWidget(timestamp)
+        layout.addWidget(label, 1)
+        layout.addWidget(adjustment)
+        layout.addWidget(plus)
+        layout.addWidget(minus)
+        row.seek_requested.connect(lambda ms=millis: self._seek_millis(ms))
+        return row
+
+    def _placeholder_row(self, text, role="current"):
+        row = QWidget()
+        row.setObjectName("LyricLineRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+        label = QLabel(str(text), row)
+        label.setObjectName("LyricText")
+        label.setWordWrap(True)
+        if role == "current":
+            label.setStyleSheet(f"color: {ACCENT};")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(label, 1)
+        return row
+
+    def _resize_line_rows(self):
+        if not self._synced:
+            return
+        width = max(80, self.list.viewport().width() - 210)
+        for index in range(self.list.count()):
+            item = self.list.item(index)
+            widget = self.list.itemWidget(item) if item is not None else None
+            label = widget.findChild(QLabel, "LyricText") if widget is not None else None
+            if label is None:
+                continue
+            rect = label.fontMetrics().boundingRect(
+                QRect(0, 0, width, 10000), int(Qt.TextFlag.TextWordWrap), label.text())
+            item.setSizeHint(QSize(0, max(32, rect.height() + 12)))
+
+    def _adjust_line(self, index, delta):
+        if not 0 <= index < len(self._line_adjustments):
+            return
+        value = round(float(self._line_adjustments[index]) + float(delta), 2)
+        if abs(value) < 0.005:
+            value = 0.0
+        self._line_adjustments[index] = value
+        self._render_synced_lines()
+
+    def _can_save_lrc(self):
+        path = self._lyrics_path
+        if not path or not os.path.isfile(path):
+            return False
+        current = self._current_signature()
+        if current is None:
+            return False
+        return self._sidecar_signature(path) != current
+
+    def _current_signature(self):
+        if self._synced and self._lines:
+            return ("lines", tuple(self._lines))
+        text = _lyrics_clean((self._current_result or {}).get("text") or "")
+        return ("text", text) if text else None
+
+    def _sidecar_signature(self, path):
+        sidecar = _lrc_sidecar(path)
+        if not sidecar:
+            return None
+        parsed = parse_lyrics(_read_lyrics_file(sidecar), preserve_empty=True)
+        if parsed["lines"]:
+            return ("lines", tuple(parsed["lines"]))
+        text = _lyrics_clean(parsed["text"])
+        return ("text", text) if text else None
+
+    def _can_revert(self):
+        source = str((self._current_result or {}).get("source") or "")
+        return source == "lrc" and self._can_save_lrc()
+
+    def _update_save_button(self):
+        source = str((self._current_result or {}).get("source") or "")
+        looked_up = bool(source) and source != "lrc"
+        self.save_lrc_btn.setText("Save as LRC" if looked_up else "Save")
+        self.save_lrc_btn.setToolTip(
+            "Write these lyrics beside the audio as an .lrc file, including the "
+            "current timing adjustments" if looked_up
+            else "Save changes to the LRC file")
+        self.save_lrc_btn.setEnabled(self._can_save_lrc())
+        self.revert_btn.setEnabled(self._can_revert())
+
+    def _revert(self):
+        """Discard local timing edits and show the LRC file as it is on disk."""
+        if not self._can_revert():
+            return
+        path = self._lyrics_path
+        self.offset_spin.blockSignals(True)
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.blockSignals(False)
+        if path:
+            save_lyrics_offset(path, 0.0)
+        text = read_lrc_lyrics(path) if path else ""
+        result = _lyrics_result(text, "lrc") if text else None
+        self._show_result(result or {"text": "", "source": "lrc"})
+
+    def _save_as_lrc(self):
+        """Write the current view as a sidecar and show that sidecar again."""
+        path = self._lyrics_path
+        if not path:
+            return
+        lines = list(self._lines) if self._synced else []
+        text = "" if lines else _lyrics_clean((self._current_result or {}).get("text") or "")
+        source = str((self._current_result or {}).get("source") or "")
+        try:
+            target = write_lrc_lyrics(path, lines=lines, text=text,
+                                      preserve_metadata=(source == "lrc"))
+        except (OSError, ValueError) as exc:
+            self._set_note("Could not save the LRC file: " + str(exc))
+            return
+        # The timestamps now include every adjustment, so keeping the old
+        # offset would apply it a second time when the new sidecar is shown.
+        self.offset_spin.blockSignals(True)
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.blockSignals(False)
+        save_lyrics_offset(path, 0.0)
+        self._clear_matches()
+        self._show_result(_lyrics_result(read_lrc_lyrics(path), "lrc") or
+                          {"text": "", "source": "lrc"})
+        message = f"Saved {os.path.basename(target)}."
+        if lines:
+            message += " The timestamps include the adjustments."
+        self.note.setText(message)
+
+    def _seek_millis(self, millis):
+        if isinstance(millis, int) and millis >= 0:
+            self.player.player.setPosition(millis)
+
+    def _sync(self):
+        if not self._synced or not self._lines:
+            return
+        position = max(0, int(self.player.player.position() or 0))
+        row = -1
+        for index, (millis, _text) in enumerate(self._lines):
+            if millis <= position:
+                row = index
+            else:
+                break
+        if row != self._active_row:
+            self._active_row = row
+            self._render_lyric_window()
+        else:
+            self._update_visible_text(position)
+
+    def _seek(self, item):
+        self._seek_millis(item.data(Qt.ItemDataRole.UserRole))
+
+
+class LyricsWaveform(QWidget):
+    """A waveform-shaped seek bar for the lyrics editor.
+
+    The reference editor draws a waveform above its transport controls. This is a
+    deterministic visualisation rather than a decoded waveform, so opening a long
+    file stays instant; it still gives the same played/unplayed position cue and
+    can be clicked to seek.
+    """
+
+    seek_requested = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.duration = 0
+        self.position = 0
+        self.setMinimumHeight(82)
+        self.setMaximumHeight(118)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Click to seek")
+
+    def set_duration(self, millis):
+        self.duration = max(0, int(millis or 0))
+        self.update()
+
+    def set_position(self, millis):
+        self.position = max(0, min(self.duration, int(millis or 0)))
+        self.update()
+
+    @staticmethod
+    def _level(index):
+        # A stable, speech-like contour: no random() means repainting never flickers.
+        wave = (math.sin(index * 0.37) + 0.55 * math.sin(index * 1.11 + 1.7)
+                + 0.32 * math.sin(index * 2.03 + 0.4))
+        return 0.16 + 0.78 * abs(wave) / 1.87
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QColor(PANEL))
+        width, height = rect.width(), rect.height()
+        mid = height / 2.0
+        # A bar every three pixels keeps the reference's dense waveform while
+        # staying cheap to paint on large windows.
+        count = max(32, min(360, width // 3))
+        gap = 1.0
+        bar_width = max(1.0, (width - gap * (count - 1)) / count)
+        played_x = (self.position / self.duration * width) if self.duration else 0.0
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index in range(count):
+            x = index * (bar_width + gap)
+            level = self._level(index)
+            bar_height = max(2.0, level * (height - 10))
+            color = QColor(ACCENT) if x <= played_x else QColor(BORDER)
+            if x > played_x:
+                color.setAlpha(185)
+            painter.setBrush(QBrush(color))
+            painter.drawRect(QRectF(x, mid - bar_height / 2, bar_width, bar_height))
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.drawLine(0, int(mid), width, int(mid))
+        if self.duration:
+            painter.setPen(QPen(QColor(TEXT), 1.5))
+            painter.drawLine(int(played_x), 0, int(played_x), height)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.duration:
+            fraction = max(0.0, min(1.0, event.position().x() / max(1, self.width())))
+            self.seek_requested.emit(int(round(fraction * self.duration)))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class LyricsSongChooserDialog(QDialog):
+    """Pick a library track with search and a lazy folder browser."""
+
+    PATH_ROLE = int(Qt.ItemDataRole.UserRole)
+    KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+    LOADED_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+
+    def __init__(self, library, config, current_path="", parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.config = config or {}
+        self._current_path = str(current_path or "")
+        self._selected = ""
+        self._meta = {}
+        try:
+            self._meta = library.by_path() if library is not None else {}
+        except Exception:
+            self._meta = {}
+        self.setWindowTitle("Choose a song")
+        self.setModal(True)
+        self.resize(700, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search the library")
+        self.search.setClearButtonEnabled(True)
+        self.search.setToolTip("Search song titles, artists, albums, genres and composers")
+        self.search.textChanged.connect(self._search_changed)
+        root.addWidget(self.search)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Song", "Length"])
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.tree.setColumnWidth(1, 90)
+        self.tree.itemExpanded.connect(self._populate_folder)
+        self.tree.itemDoubleClicked.connect(self._double_clicked)
+        self.tree.currentItemChanged.connect(self._selection_changed)
+        root.addWidget(self.tree, 1)
+
+        self.selection_label = QLabel("Select a track.")
+        self.selection_label.setObjectName("Muted")
+        self.selection_label.setWordWrap(True)
+        root.addWidget(self.selection_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.choose_btn = QPushButton("Choose")
+        self.choose_btn.setObjectName("Primary")
+        self.choose_btn.setEnabled(False)
+        self.choose_btn.clicked.connect(self._choose)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.choose_btn)
+        root.addLayout(buttons)
+
+        self._populate_roots(self._current_path)
+
+    def _search_changed(self, text):
+        query = str(text or "").strip()
+        if query:
+            self._populate_search(query)
+        else:
+            self._populate_roots(self._current_path)
+
+    def _clear_selection(self, message="Select a track."):
+        self._selected = ""
+        self.choose_btn.setEnabled(False)
+        self.selection_label.setText(message)
+        self.selection_label.setToolTip("")
+
+    def _populate_search(self, query):
+        """Show matching library tracks grouped by artist."""
+        self.tree.clear()
+        self._clear_selection()
+        rows = []
+        if self.library is not None:
+            try:
+                rows = self.library.tracks(search=query)
+            except Exception:
+                rows = []
+        groups = {}
+        for row in rows:
+            path = str((row or {}).get("path") or "")
+            if not path:
+                continue
+            artist = str((row or {}).get("albumartist")
+                         or (row or {}).get("artist") or "").strip()
+            label = artist or "Unknown artist"
+            groups.setdefault(label.casefold(), [label, []])[1].append(path)
+        if not groups:
+            item = QTreeWidgetItem(["No matching songs", ""])
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.tree.addTopLevelItem(item)
+            self.selection_label.setText("No matching songs in the library.")
+            return
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for key in sorted(groups):
+                label, paths = groups[key]
+                group = QTreeWidgetItem([label, ""])
+                group.setData(0, self.KIND_ROLE, "group")
+                group.setToolTip(0, label)
+                group.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                self.tree.addTopLevelItem(group)
+                for path in paths:
+                    self._track_item(group, path)
+                group.setExpanded(True)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+    def _placeholder(self, parent):
+        item = QTreeWidgetItem(parent, ["Loading…", ""])
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        item.setData(0, self.KIND_ROLE, "placeholder")
+        return item
+
+    def _folder_item(self, parent, path):
+        label = os.path.basename(os.path.normpath(path)) or path
+        item = (QTreeWidgetItem(parent, [label, ""]) if parent is not None
+                else QTreeWidgetItem([label, ""]))
+        item.setData(0, self.PATH_ROLE, path)
+        item.setData(0, self.KIND_ROLE, "dir")
+        item.setToolTip(0, path)
+        item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+        item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
+        self._placeholder(item)
+        return item
+
+    def _track_item(self, parent, path):
+        meta = self._meta.get(path) or {}
+        title = str(meta.get("title") or os.path.splitext(os.path.basename(path))[0])
+        artist = str(meta.get("artist") or meta.get("albumartist") or "")
+        length = meta.get("length")
+        try:
+            length_text = fmt_time(float(length)) if float(length or 0) > 0 else ""
+        except (TypeError, ValueError):
+            length_text = ""
+        item = QTreeWidgetItem(parent, [title, length_text])
+        item.setData(0, self.PATH_ROLE, path)
+        item.setData(0, self.KIND_ROLE, "file")
+        item.setToolTip(0, path + ((" - " + artist) if artist else ""))
+        item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+        return item
+
+    def _populate_roots(self, current_path):
+        self.tree.clear()
+        self._clear_selection()
+        current_item = None
+        if current_path and os.path.isfile(str(current_path)):
+            current_item = QTreeWidgetItem(
+                ["Current - " + os.path.basename(str(current_path)), ""])
+            current_item.setData(0, self.PATH_ROLE, str(current_path))
+            current_item.setData(0, self.KIND_ROLE, "file")
+            current_item.setToolTip(0, str(current_path))
+            current_item.setIcon(
+                0, self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            self.tree.addTopLevelItem(current_item)
+
+        folders = []
+        seen = set()
+        # This chooser is for the music library only. Audiobook and podcast
+        # roots are deliberately excluded, even when they are configured.
+        for folder in self.config.get("library_folders") or []:
+            folder = str(folder or "")
+            if not folder:
+                continue
+            try:
+                path = os.path.abspath(os.path.expanduser(folder))
+            except (OSError, ValueError):
+                continue
+            if path in seen or not os.path.isdir(path):
+                continue
+            seen.add(path)
+            folders.append(path)
+        folders.sort(key=lambda path: (os.path.basename(path).casefold(), path.casefold()))
+        first_folder = None
+        for folder in folders:
+            item = self._folder_item(None, folder)
+            self.tree.addTopLevelItem(item)
+            if first_folder is None:
+                first_folder = item
+        if not folders and current_item is None:
+            item = QTreeWidgetItem(
+                ["No library folders configured - use Choose file… in the editor", ""])
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.tree.addTopLevelItem(item)
+        target = current_item or first_folder
+        if target is not None:
+            self.tree.setCurrentItem(target)
+            self.tree.scrollToItem(target)
+
+    def _populate_folder(self, item):
+        if item is None or item.data(0, self.KIND_ROLE) != "dir":
+            return
+        if item.data(0, self.LOADED_ROLE):
+            return
+        item.setData(0, self.LOADED_ROLE, True)
+        path = str(item.data(0, self.PATH_ROLE) or "")
+        item.takeChildren()
+        entries = []
+        try:
+            with os.scandir(path) as scan:
+                for entry in scan:
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        is_file = entry.is_file(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if is_dir:
+                        entries.append((0, entry.name.casefold(), entry.path, True))
+                    elif is_file and (is_audio(entry.name) or is_audiobook(entry.name)):
+                        entries.append((1, entry.name.casefold(), entry.path, False))
+        except OSError:
+            item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless)
+            return
+        entries.sort(key=lambda row: (row[0], row[1]))
+        for _kind, _name, child_path, is_dir in entries:
+            if is_dir:
+                self._folder_item(item, child_path)
+            else:
+                self._track_item(item, child_path)
+        if item.childCount() == 0:
+            item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless)
+
+    def _double_clicked(self, item, _column):
+        if item is None:
+            return
+        kind = item.data(0, self.KIND_ROLE)
+        if kind == "file":
+            self._selected = str(item.data(0, self.PATH_ROLE) or "")
+            self.accept()
+        elif kind in ("dir", "group"):
+            item.setExpanded(not item.isExpanded())
+
+    def _selection_changed(self, current, _previous):
+        kind = current.data(0, self.KIND_ROLE) if current is not None else ""
+        path = str(current.data(0, self.PATH_ROLE) or "") if current is not None else ""
+        self._selected = path if kind == "file" else ""
+        self.choose_btn.setEnabled(bool(self._selected))
+        if self._selected:
+            self.selection_label.setText("Selected: " + self._selected)
+            self.selection_label.setToolTip(self._selected)
+        elif kind == "dir":
+            self.selection_label.setText("Open the folder and choose a track below it.")
+        else:
+            self.selection_label.setText("Select a track.")
+
+    def _choose(self):
+        if self._selected:
+            self.accept()
+
+    def selected_path(self):
+        return self._selected
+
+
+class LyricsEditorDialog(QDialog):
+    """Tools > Lyrics editor: build or update the .lrc beside a track."""
+
+    def __init__(self, library, config, player, parent=None):
+        super().__init__(parent)
+        self.library = library
+        self.config = config
+        self.main_player = player
+        self._path = ""
+        self._duration_ms = 0
+        self._loading = False
+        self._syncing_selection = False
+        self._syncing_lyrics_text = False
+        self._lookup_worker = None
+        self._lookup_path = ""
+        self._media = QMediaPlayer(self)
+        self._audio = QAudioOutput(self)
+        self._media.setAudioOutput(self._audio)
+        try:
+            volume = float(config.get("volume", 70)) / 100.0
+        except (TypeError, ValueError):
+            volume = 0.7
+        self._audio.setVolume(max(0.0, min(1.0, volume)))
+        self.setWindowTitle("Timed Lyrics Editor")
+        self.setObjectName("Panel")
+        self.setModal(False)
+        self.resize(1040, 800)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+        head = QHBoxLayout()
+        title = QLabel("Timed Lyrics Editor")
+        title.setObjectName("Heading")
+        head.addWidget(title)
+        head.addStretch()
+        self.track_label = QLabel("Choose a song")
+        self.track_label.setObjectName("Muted")
+        head.addWidget(self.track_label)
+        root.addLayout(head)
+
+        picker = QHBoxLayout()
+        picker.setSpacing(8)
+        picker.addWidget(QLabel("Song"))
+        self.song_value = QLabel("Choose a song from the library or a file.")
+        self.song_value.setObjectName("Muted")
+        self.song_value.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.song_value.setToolTip("")
+        picker.addWidget(self.song_value, 1)
+        self.song_btn = QPushButton("Choose song…")
+        self.song_btn.setToolTip("Pick a track from the library folder tree")
+        self.song_btn.clicked.connect(self._choose_song)
+        picker.addWidget(self.song_btn)
+        self.file_btn = QPushButton("Choose file…")
+        self.file_btn.clicked.connect(self._choose_file)
+        picker.addWidget(self.file_btn)
+        root.addLayout(picker)
+
+        self._build_transport(root)
+
+        self.editor_tabs = QTabWidget()
+        self.editor_tabs.addTab(self._lyrics_page(), "Lyrics")
+        self.editor_tabs.addTab(self._syncer_page(), "Syncer")
+        self.editor_tabs.addTab(self._preview_page(), "Preview")
+        self.editor_tabs.addTab(self._metadata_page(), "Metadata")
+        self.editor_tabs.addTab(self._save_page(), "Save")
+        root.addWidget(self.editor_tabs, 1)
+
+        foot = QHBoxLayout()
+        self.status = QLabel("Choose a track from the library or a file.")
+        self.status.setObjectName("Muted")
+        self.status.setWordWrap(True)
+        foot.addWidget(self.status, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        foot.addWidget(close)
+        root.addLayout(foot)
+
+        self._media.durationChanged.connect(self._media_duration)
+        self._media.positionChanged.connect(self._media_position)
+        self._media.playbackStateChanged.connect(self._media_state)
+        self._load_initial_track()
+
+    def _build_transport(self, root):
+        """The reference editor keeps its waveform and player above every tab."""
+        self.waveform = LyricsWaveform()
+        self.waveform.seek_requested.connect(self._seek_preview)
+        root.addWidget(self.waveform)
+        transport = QHBoxLayout()
+        transport.setSpacing(8)
+        self.play_btn = QPushButton()
+        self.play_btn.setFixedSize(42, 32)
+        self.play_btn.setIconSize(QSize(20, 20))
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.play_btn.setToolTip("Play / pause the preview")
+        self.play_btn.clicked.connect(self._toggle_play)
+        transport.addWidget(self.play_btn)
+        self.seek = SeekSlider()
+        self.seek.setRange(0, 0)
+        self.seek.setToolTip("Seek the preview track")
+        self.seek.clicked.connect(self._seek_preview)
+        self.seek.sliderMoved.connect(self._seek_preview)
+        transport.addWidget(self.seek, 1)
+        self.top_time = QLabel("0:00.00 / 0:00")
+        self.top_time.setObjectName("Muted")
+        self.top_time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        transport.addWidget(self.top_time)
+        root.addLayout(transport)
+
+    def _lyrics_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        bar = QHBoxLayout()
+        self.lookup_btn = QPushButton("Lookup")
+        self.lookup_btn.setToolTip("Look up synchronized lyrics on LRCLIB")
+        self.lookup_btn.clicked.connect(self._lookup_lyrics)
+        bar.addWidget(self.lookup_btn)
+        bar.addStretch()
+        self.lyrics_hints = QLabel("Type or paste lyrics, one line each - timestamps optional")
+        self.lyrics_hints.setObjectName("Muted")
+        self.lyrics_hints.setToolTip(
+            "The K, arrow and other timing shortcuts work from the Syncer and Preview tabs.")
+        bar.addWidget(self.lyrics_hints)
+        lay.addLayout(bar)
+
+        # The table is the editor's internal line model. The visible lyric area
+        # is a plain text document so lines do not look like separate boxes.
+        self.table = QTableWidget(0, 3, page)
+        self.table.setHorizontalHeaderLabels(["#", "Time", "Lyrics"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.SelectedClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setVisible(False)
+        self.table.setColumnHidden(0, True)
+        self.table.cellChanged.connect(self._table_changed)
+        self.table.itemDoubleClicked.connect(lambda _item: self.table.editItem(_item))
+        self.table.installEventFilter(self)
+        self.table.currentCellChanged.connect(self._table_current_changed)
+        self.table.hide()
+
+        self.lyrics_text = QPlainTextEdit()
+        self.lyrics_text.setObjectName("LyricsText")
+        self.lyrics_text.setPlaceholderText(
+            "Type or paste lyrics here. One lyric per line.\n"
+            "Timestamps such as [00:12.34] are optional.")
+        self.lyrics_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.lyrics_text.setFrameShape(QFrame.Shape.NoFrame)
+        self.lyrics_text.setUndoRedoEnabled(True)
+        self.lyrics_text.textChanged.connect(self._lyrics_text_changed)
+        self.lyrics_text.cursorPositionChanged.connect(self._lyrics_cursor_moved)
+        lay.addWidget(self.lyrics_text, 1)
+        return page
+
+    def _syncer_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        hints = QLabel(
+            "[R] set timestamp and go next      [↑]/[↓] prev/next line   [←]/[→] seek\n"
+            "[T] add blank line                  [E] edit line             [K]/[Space] play/pause\n"
+            "[Y] insert clear line               [Backspace] clear timing  [Delete] delete line")
+        hints.setObjectName("Muted")
+        hints.setWordWrap(True)
+        hints.setFont(QFont("Monospace", 9))
+        lay.addWidget(hints)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(divider)
+        self.sync_list = QListWidget()
+        self.sync_list.setObjectName("SyncerList")
+        self.sync_list.setUniformItemSizes(True)
+        self.sync_list.setAlternatingRowColors(True)
+        self.sync_list.currentRowChanged.connect(self._syncer_row_changed)
+        self.sync_list.itemDoubleClicked.connect(lambda _item: self._edit_selected_line())
+        self.sync_list.installEventFilter(self)
+        lay.addWidget(self.sync_list, 1)
+        return page
+
+    def _preview_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(10)
+        top = QHBoxLayout()
+        top.addStretch()
+        self.shift_all = QCheckBox("Shift timing of every lyric")
+        self.shift_all.setToolTip("Make the nudge keys move every timestamp, not only the selected line")
+        top.addWidget(self.shift_all)
+        lay.addLayout(top)
+        lay.addStretch()
+        self.preview_prev = QLabel("")
+        self.preview_prev.setObjectName("Muted")
+        self.preview_prev.setWordWrap(True)
+        self.preview_prev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_prev.setMinimumHeight(34)
+        lay.addWidget(self.preview_prev)
+        self.preview_current = QLabel("No lyrics loaded.")
+        self.preview_current.setObjectName("Heading")
+        self.preview_current.setWordWrap(True)
+        self.preview_current.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_current.setMinimumHeight(44)
+        self.preview_current.setStyleSheet(f"color: {ACCENT};")
+        lay.addWidget(self.preview_current)
+        self.preview_next = QLabel("")
+        self.preview_next.setObjectName("Muted")
+        self.preview_next.setWordWrap(True)
+        self.preview_next.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_next.setMinimumHeight(34)
+        lay.addWidget(self.preview_next)
+        lay.addStretch()
+        hints = QLabel(
+            "[E] edit line                                      play/pause [K]/[Space]\n"
+            "[T] add blank line                                      seek [←]/[→]\n"
+            "[Y] insert clear line                        prev/next lyric [↑]/[↓]\n"
+            "[U] set timing of next line to current timestamp   nudge timing [-]/[+]\n"
+            "[Backspace] clear timing                     [Delete] delete line")
+        hints.setObjectName("Muted")
+        hints.setFont(QFont("Monospace", 9))
+        hints.setWordWrap(True)
+        lay.addWidget(hints)
+        return page
+
+    def _metadata_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(14, 14, 14, 14)
+        note = QLabel("Select which metadata you'd like to include at the top of your .lrc file.")
+        note.setObjectName("Muted")
+        lay.addWidget(note)
+        grid = QGridLayout()
+        grid.setColumnStretch(2, 1)
+        self.meta_fields = {}
+        for row, (key, label) in enumerate(LRC_METADATA_FIELDS.items()):
+            check = QCheckBox()
+            edit = QLineEdit()
+            edit.setPlaceholderText(label)
+            grid.addWidget(check, row, 0)
+            grid.addWidget(QLabel(f"[{key}] {label}"), row, 1)
+            grid.addWidget(edit, row, 2)
+            self.meta_fields[key] = (check, edit)
+        tool_check, tool_edit = self.meta_fields["tool"]
+        tool_check.setChecked(True)
+        tool_edit.setText(APP_NAME)
+        lay.addLayout(grid)
+        lay.addStretch()
+        return page
+
+    def _save_page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+        heading = QLabel("Save .lrc")
+        heading.setObjectName("Heading")
+        lay.addWidget(heading)
+        note = QLabel("The lyrics are saved beside the audio file. An existing .lrc "
+                      "with the same name is replaced.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self.download_warning = QLabel("")
+        self.download_warning.setWordWrap(True)
+        self.download_warning.setStyleSheet(
+            f"background: {PANEL}; border: 1px solid {AMBER}; padding: 8px;")
+        self.download_warning.hide()
+        lay.addWidget(self.download_warning)
+        self.save_btn = QPushButton("Save .lrc")
+        self.save_btn.setObjectName("Primary")
+        self.save_btn.setToolTip("Save these lyrics beside the audio file")
+        self.save_btn.clicked.connect(self._save_lrc)
+        self.save_btn.setEnabled(False)
+        self.save_lrc_btn = self.save_btn
+        lay.addWidget(self.save_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.download_note = QLabel("Choose a song and add lyrics first.")
+        self.download_note.setObjectName("Muted")
+        self.download_note.setWordWrap(True)
+        lay.addWidget(self.download_note)
+        lay.addStretch()
+        return page
+
+    def _load_initial_track(self):
+        try:
+            current = self.main_player.current_path()
+        except Exception:
+            current = ""
+        if current and os.path.isfile(str(current)):
+            self._load_track(str(current))
+        else:
+            self.song_value.setText("Choose a song from the library or a file.")
+            self.status.setText("Choose a song from the folder tree or a file.")
+            self._refresh_save_button()
+
+    def _choose_song(self):
+        dialog = LyricsSongChooserDialog(self.library, self.config, self._path, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            path = dialog.selected_path()
+            if path:
+                self._load_track(path)
+
+    def _choose_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an audio file", os.path.expanduser("~/Music"),
+            "Audio (*.mp3 *.flac *.ogg *.opus *.m4a *.m4b *.mp4 *.aac *.wav *.wma *.aiff *.ape *.wv);;"
+            "All files (*)", options=FILE_DIALOG_OPTIONS)
+        if path:
+            self._load_track(path)
+
+    def _track_tags(self, path):
+        try:
+            tags = read_tags(path)
+            tags.update(read_extra_tags(path))
+        except Exception:
+            tags = {}
+        try:
+            duration = float(read_specs(path).get("length") or 0)
+        except Exception:
+            duration = 0.0
+        title = str(tags.get("title") or os.path.splitext(os.path.basename(path))[0])
+        return tags, title, duration
+
+    def _load_track(self, path):
+        path = str(path or "")
+        if not os.path.isfile(path):
+            self.status.setText("That audio file is no longer available.")
+            return
+        self._path = path
+        self._lookup_path = ""
+        self._media.stop()
+        self._media.setSource(QUrl.fromLocalFile(path))
+        self.song_value.setText(os.path.basename(path))
+        self.song_value.setToolTip(path)
+        tags, title, duration = self._track_tags(path)
+        artist = str(tags.get("artist") or tags.get("albumartist") or "")
+        self.track_label.setText(" - ".join(part for part in (title, artist) if part))
+        self._duration_ms = int(round(duration * 1000))
+        self.waveform.set_position(0)
+        self._set_duration(self._duration_ms)
+        text = read_lrc_lyrics(path)
+        entries = []
+        metadata = {}
+        if text:
+            parsed = parse_lyrics(text, preserve_empty=True)
+            if parsed["lines"]:
+                entries = list(parsed["lines"])
+            else:
+                entries = [(None, line) for line in parsed["text"].splitlines() if line.strip()]
+            metadata = _lrc_metadata_values(text)
+            # The table already contains the parsed timestamps, so keeping an
+            # old offset header would shift them a second time when reopened.
+            metadata.pop("offset", None)
+            self.status.setText("Opened the existing .lrc beside this track.")
+        else:
+            self.status.setText("No .lrc here yet. Paste lyrics or look them up, then save.")
+        self._fill_table(entries)
+        self._fill_metadata(metadata, tags, duration)
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _fill_metadata(self, values, tags, duration):
+        defaults = {
+            "ti": str(tags.get("title") or ""),
+            "ar": str(tags.get("artist") or ""),
+            "al": str(tags.get("album") or ""),
+            "length": fmt_time(duration) if duration else "",
+            "tool": APP_NAME,
+        }
+        for key, (check, edit) in self.meta_fields.items():
+            value = APP_NAME if key == "tool" else values.get(key, defaults.get(key, ""))
+            check.setChecked(bool(values.get(key)) or key == "tool")
+            edit.setText(str(value or ""))
+
+    def _apply_metadata(self, values):
+        for key, value in (values or {}).items():
+            if key in self.meta_fields and value:
+                check, edit = self.meta_fields[key]
+                check.setChecked(True)
+                edit.setText(APP_NAME if key == "tool" else str(value))
+
+    def _metadata_values(self):
+        values = {}
+        for key, (check, edit) in self.meta_fields.items():
+            if check.isChecked() and edit.text().strip():
+                values[key] = edit.text().strip()
+        return values
+
+    def _split_lyrics_line(self, line):
+        """Split one plain-text lyric line into an optional time and its text."""
+        source = str(line)
+        match = re.match(r"^\s*\[([^\]]+)\]\s?(.*)$", source)
+        if not match:
+            return None, source
+        clock = match.group(1).strip()
+        if not re.match(r"^\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?$", clock):
+            return None, source
+        millis = _parse_lrc_clock(clock)
+        if millis is None:
+            return None, source
+        return millis, match.group(2)
+
+    def _table_plain_text(self):
+        lines = []
+        for row in range(self.table.rowCount()):
+            text_item = self.table.item(row, 2)
+            text = text_item.text() if text_item is not None else ""
+            time_item = self.table.item(row, 1)
+            raw = time_item.text().strip() if time_item is not None else ""
+            millis = _parse_lrc_clock(raw)
+            if millis is not None:
+                stamp = _lrc_timestamp(millis)
+            elif raw:
+                stamp = raw
+            else:
+                stamp = ""
+            if stamp:
+                lines.append((stamp + " " + text).rstrip())
+            else:
+                lines.append(text)
+        return "\n".join(lines)
+
+    def _move_lyrics_cursor(self, row, column=0):
+        if not hasattr(self, "lyrics_text"):
+            return
+        last_block = max(0, self.lyrics_text.blockCount() - 1)
+        row = max(0, min(int(row), last_block))
+        block = self.lyrics_text.document().findBlockByNumber(row)
+        if not block.isValid():
+            return
+        column = max(0, min(int(column), max(0, block.length() - 1)))
+        cursor = QTextCursor(self.lyrics_text.document())
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        for _index in range(row):
+            if not cursor.movePosition(QTextCursor.MoveOperation.Down):
+                break
+        cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        if column:
+            cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                QTextCursor.MoveMode.MoveAnchor, column)
+        self.lyrics_text.setTextCursor(cursor)
+
+    def _select_lyrics_text_row(self, row):
+        if not hasattr(self, "lyrics_text") or row < 0:
+            return
+        if self.lyrics_text.textCursor().blockNumber() == row:
+            return
+        self._syncing_lyrics_text = True
+        try:
+            self._move_lyrics_cursor(row)
+        finally:
+            self._syncing_lyrics_text = False
+
+    def _sync_text_from_table(self):
+        """Render the internal line model into the plain-text lyric area."""
+        if not hasattr(self, "lyrics_text"):
+            return
+        text = self._table_plain_text()
+        if self.lyrics_text.toPlainText() == text:
+            return
+        row = self.table.currentRow()
+        self._syncing_lyrics_text = True
+        try:
+            self.lyrics_text.setPlainText(text)
+            if row >= 0:
+                self._move_lyrics_cursor(row)
+        finally:
+            self._syncing_lyrics_text = False
+
+    def _lyrics_text_changed(self):
+        """Turn edited plain text back into the synchronized line model."""
+        if self._syncing_lyrics_text:
+            return
+        text = self.lyrics_text.toPlainText()
+        lines = text.split("\n") if text else []
+        row = min(self.lyrics_text.textCursor().blockNumber(),
+                  max(0, len(lines) - 1))
+        self._loading = True
+        try:
+            self.table.setRowCount(0)
+            for line in lines:
+                millis, lyric = self._split_lyrics_line(line)
+                at = self.table.rowCount()
+                self.table.insertRow(at)
+                number = QTableWidgetItem(str(at + 1))
+                number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                number.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                        | Qt.AlignmentFlag.AlignVCenter)
+                self.table.setItem(at, 0, number)
+                stamp = QTableWidgetItem(_lrc_timestamp(millis)
+                                         if millis is not None else "")
+                stamp.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(at, 1, stamp)
+                self.table.setItem(at, 2, QTableWidgetItem(lyric))
+            if self.table.rowCount():
+                self.table.setCurrentCell(row, 2)
+        finally:
+            self._loading = False
+        self._refresh_syncer_list()
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _lyrics_cursor_moved(self):
+        if self._syncing_lyrics_text or self._loading:
+            return
+        row = self.lyrics_text.textCursor().blockNumber()
+        if not 0 <= row < self.table.rowCount():
+            return
+        if row != self.table.currentRow():
+            self._syncing_selection = True
+            try:
+                self.table.setCurrentCell(row, 2)
+            finally:
+                self._syncing_selection = False
+            self._refresh_syncer_list()
+            self._update_preview()
+
+    def _fill_table(self, entries):
+        self._loading = True
+        self.table.setRowCount(0)
+        for millis, text in entries:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            number = QTableWidgetItem(str(row + 1))
+            number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            number.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row, 0, number)
+            stamp = QTableWidgetItem(_lrc_timestamp(millis) if millis is not None else "")
+            stamp.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 1, stamp)
+            self.table.setItem(row, 2, QTableWidgetItem(str(text)))
+        self._loading = False
+        if self.table.rowCount():
+            self.table.setCurrentCell(0, 2)
+        self._renumber_rows()
+        self._sync_text_from_table()
+        self._refresh_syncer_list()
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _renumber_rows(self):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setText(str(row + 1))
+
+    def _table_entries(self):
+        entries = []
+        invalid = []
+        for row in range(self.table.rowCount()):
+            text_item = self.table.item(row, 2)
+            text = text_item.text().strip() if text_item is not None else ""
+            time_item = self.table.item(row, 1)
+            raw = time_item.text().strip() if time_item is not None else ""
+            millis = _parse_lrc_clock(raw)
+            if raw and millis is None:
+                invalid.append(row + 1)
+            if not text and millis is None:
+                continue
+            entries.append((millis, text))
+        return entries, invalid
+
+    def _sync_rows(self):
+        rows = []
+        for row in range(self.table.rowCount()):
+            text_item = self.table.item(row, 2)
+            text = text_item.text().strip() if text_item is not None else ""
+            time_item = self.table.item(row, 1)
+            raw = time_item.text().strip() if time_item is not None else ""
+            millis = _parse_lrc_clock(raw)
+            rows.append((row, millis, text))
+        return rows
+
+    def _refresh_syncer_list(self):
+        if not hasattr(self, "sync_list"):
+            return
+        rows = self._sync_rows()
+        current = self.table.currentRow()
+        self._syncing_selection = True
+        self.sync_list.blockSignals(True)
+        self.sync_list.clear()
+        selected = -1
+        for list_row, (table_row, millis, text) in enumerate(rows):
+            clock = _lrc_clock(millis) if millis is not None else "--:--.--"
+            if text:
+                label = text
+            elif millis is not None:
+                label = "- clear previous lyric -"
+            else:
+                label = ""
+            item = QListWidgetItem(f"{clock}   {label}".rstrip())
+            item.setData(Qt.ItemDataRole.UserRole, table_row)
+            self.sync_list.addItem(item)
+            if table_row == current:
+                selected = list_row
+        if selected >= 0:
+            self.sync_list.setCurrentRow(selected)
+            self.sync_list.scrollToItem(self.sync_list.item(selected))
+        self.sync_list.blockSignals(False)
+        self._syncing_selection = False
+
+    def _table_current_changed(self, _row, _column, _old_row, _old_column):
+        if (self._loading or self._syncing_selection
+                or not hasattr(self, "sync_list")):
+            return
+        wanted = self.table.currentRow()
+        for list_row in range(self.sync_list.count()):
+            item = self.sync_list.item(list_row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == wanted:
+                self._syncing_selection = True
+                self.sync_list.blockSignals(True)
+                self.sync_list.setCurrentRow(list_row)
+                self.sync_list.scrollToItem(self.sync_list.item(list_row))
+                self.sync_list.blockSignals(False)
+                self._syncing_selection = False
+                break
+        self._select_lyrics_text_row(wanted)
+
+    def _syncer_row_changed(self, list_row):
+        if self._syncing_selection or list_row < 0:
+            return
+        item = self.sync_list.item(list_row)
+        if item is None:
+            return
+        table_row = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            table_row = int(table_row)
+        except (TypeError, ValueError):
+            return
+        self._syncing_selection = True
+        self.table.setCurrentCell(table_row, 2)
+        self.table.selectRow(table_row)
+        self._syncing_selection = False
+        self._select_lyrics_text_row(table_row)
+        self._update_preview()
+
+    def _table_changed(self, *_args):
+        if self._loading or self._syncing_lyrics_text:
+            return
+        self._sync_text_from_table()
+        self._refresh_syncer_list()
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _refresh_save_button(self):
+        entries, _invalid = self._table_entries() if hasattr(self, "table") else ([], [])
+        self.save_btn.setEnabled(bool(self._path and entries))
+        timed = sorted(millis for millis, _text in entries if millis is not None)
+        close = any(b - a < 500 for a, b in zip(timed, timed[1:]))
+        self.download_warning.setVisible(close)
+        self.download_warning.setText(
+            "Some lyrics are within 0.5 seconds of each other.\n"
+            "This might cause display issues." if close else "")
+        if self._path:
+            target = _lrc_sidecar(self._path) or os.path.splitext(self._path)[0] + ".lrc"
+            self.download_note.setText("Will save to: " + target)
+        else:
+            self.download_note.setText("Choose a song and add lyrics first.")
+
+    def _apply_lyrics_text(self, text):
+        parsed = parse_lyrics(text, preserve_empty=True)
+        if parsed["lines"]:
+            entries = list(parsed["lines"])
+            self.status.setText("Pasted timestamped lyrics.")
+        else:
+            entries = [(None, line) for line in parsed["text"].splitlines() if line.strip()]
+            self.status.setText("Pasted plain lyrics; set times while the track plays.")
+        self._fill_table(entries)
+        values = _lrc_metadata_values(text)
+        values.pop("offset", None)
+        self._apply_metadata(values)
+        self.editor_tabs.setCurrentIndex(0)
+
+    def _lookup_lyrics(self):
+        if not self._path:
+            self.status.setText("Choose a track first.")
+            return
+        if self._lookup_worker is not None and self._lookup_worker.isRunning():
+            return
+        self.lookup_btn.setEnabled(False)
+        self.status.setText("Looking up lyrics on LRCLIB…")
+        path = self._path
+        self._lookup_path = path
+
+        def job(_progress, _log, _cancel):
+            return (lookup_lrclib(path, use_saved=False, clear_saved=False)
+                    or lookup_lyrics_ovh(path))
+
+        worker = Worker(job, self)
+        worker.done.connect(self._lookup_done)
+        worker.failed.connect(self._lookup_failed)
+        worker.finished.connect(lambda w=worker: self._lookup_finished(w))
+        self._lookup_worker = worker
+        worker.start()
+
+    def _lookup_finished(self, worker):
+        if worker is self._lookup_worker:
+            self._lookup_worker = None
+        self.lookup_btn.setEnabled(True)
+
+    def _lookup_failed(self, _error):
+        if self._lookup_path == self._path:
+            self.status.setText("Could not look up lyrics for this track.")
+
+    def _lookup_done(self, result):
+        if self._lookup_path != self._path:
+            return
+        if not result:
+            self.status.setText("No LRCLIB match was found.")
+            return
+        if result.get("choices"):
+            choices = result["choices"]
+            labels = [str(choice.get("label") or "LRCLIB match") for choice in choices]
+            label, ok = QInputDialog.getItem(self, "Choose lyrics", "Match:", labels, 0, False)
+            if not ok:
+                return
+            try:
+                result = choices[labels.index(label)]["result"]
+            except (ValueError, IndexError, KeyError):
+                return
+        text = result.get("text") or ""
+        lines = result.get("lines") or []
+        if lines:
+            self._fill_table([(int(millis), str(line)) for millis, line in lines])
+            self.status.setText("Looked up synchronized lyrics.")
+        elif text:
+            self._fill_table([(None, line) for line in text.splitlines() if line.strip()])
+            self.status.setText("Looked up plain lyrics; set times while the track plays.")
+        else:
+            self.status.setText("The lookup returned no lyrics.")
+
+    def _selected_row(self):
+        row = self.table.currentRow()
+        return row if row >= 0 else (self.table.rowCount() - 1 if self.table.rowCount() else -1)
+
+    def _handle_shortcut_key(self, event):
+        """Shared keyboard handling for the reference editor's timing keys."""
+        if event.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                | Qt.KeyboardModifier.AltModifier):
+            return False
+        key = event.key()
+        if key in (Qt.Key.Key_Space, Qt.Key.Key_K):
+            self._toggle_play()
+        elif key == Qt.Key.Key_Left:
+            self._seek_relative(-5000)
+        elif key == Qt.Key.Key_Right:
+            self._seek_relative(5000)
+        elif key == Qt.Key.Key_Up:
+            self._select_relative(-1)
+        elif key == Qt.Key.Key_Down:
+            self._select_relative(1)
+        elif key == Qt.Key.Key_R:
+            self._set_time_to_current()
+        elif key == Qt.Key.Key_T:
+            self._insert_line()
+        elif key == Qt.Key.Key_Y:
+            self._insert_line(empty=True)
+        elif key == Qt.Key.Key_E:
+            self._edit_selected_line()
+        elif key == Qt.Key.Key_U:
+            self._set_next_time_to_current()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self._nudge_time(10)
+        elif key == Qt.Key.Key_Minus:
+            self._nudge_time(-10)
+        elif key == Qt.Key.Key_Backspace:
+            self._clear_time()
+        elif key == Qt.Key.Key_Delete:
+            self._remove_line()
+        else:
+            return False
+        event.accept()
+        return True
+
+    def keyPressEvent(self, event):
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox)):
+            return super().keyPressEvent(event)
+        if self._handle_shortcut_key(event):
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event):
+        if (watched in (self.table, getattr(self, "sync_list", None))
+                and event.type() == QEvent.Type.KeyPress
+                and not isinstance(QApplication.focusWidget(), QLineEdit)):
+            if self._handle_shortcut_key(event):
+                return True
+        return super().eventFilter(watched, event)
+
+    def _select_relative(self, step):
+        if not self.table.rowCount():
+            return
+        row = self._selected_row()
+        row = 0 if row < 0 else max(0, min(self.table.rowCount() - 1, row + step))
+        self.table.setCurrentCell(row, 2)
+        self.table.selectRow(row)
+        self._update_preview()
+
+    def _edit_selected_line(self):
+        row = self._selected_row()
+        if row < 0:
+            return
+        self._select_lyrics_text_row(row)
+        self.lyrics_text.setFocus()
+        cursor = self.lyrics_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        self.lyrics_text.setTextCursor(cursor)
+
+    def _set_next_time_to_current(self):
+        row = self._selected_row()
+        if row < 0 or row + 1 >= self.table.rowCount():
+            return
+        item = self.table.item(row + 1, 1)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row + 1, 1, item)
+        item.setText(_lrc_timestamp(self._media.position()))
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _seek_relative(self, delta_ms):
+        if not self._path:
+            return
+        position = int(self._media.position() or 0) + int(delta_ms)
+        upper = self._duration_ms or int(self._media.duration() or 0)
+        if upper:
+            position = min(position, upper)
+        self._media.setPosition(max(0, position))
+
+    def _insert_line(self, empty=False):
+        if not self._path:
+            return
+        row = self._selected_row()
+        # Insert in the gap before the current line. After R has confirmed the
+        # previous lyric, the current line is the next lyric, so this puts the
+        # new line immediately after the line that was just confirmed.
+        at = row if row >= 0 else self.table.rowCount()
+        self.table.insertRow(at)
+        number = QTableWidgetItem("")
+        number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.table.setItem(at, 0, number)
+        # T adds an untimed blank line for a new lyric. Y adds a timestamped
+        # empty line, which clears the previous lyric in a player without ever
+        # writing the Syncer's "- clear previous lyric -" reminder to the LRC.
+        stamp = QTableWidgetItem(
+            _lrc_timestamp(self._media.position()) if empty else "")
+        stamp.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.table.setItem(at, 1, stamp)
+        self.table.setItem(at, 2, QTableWidgetItem(""))
+        self._renumber_rows()
+        # Y leaves the following lyric selected so the next R continues timing
+        # it. T selects the new blank line so the user can type the extra lyric.
+        target = at + 1 if empty and row >= 0 else at
+        self.table.setCurrentCell(target, 2)
+        self._sync_text_from_table()
+        self._select_lyrics_text_row(target)
+        if not empty:
+            cursor = self.lyrics_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            self.lyrics_text.setTextCursor(cursor)
+            self.lyrics_text.setFocus()
+        self._refresh_syncer_list()
+        self._update_preview()
+        self._refresh_save_button()
+
+    def _remove_line(self):
+        row = self._selected_row()
+        if row >= 0:
+            self.table.removeRow(row)
+            self._renumber_rows()
+            self._sync_text_from_table()
+            self._refresh_syncer_list()
+            self._update_preview()
+            self._refresh_save_button()
+
+    def _set_time_to_current(self):
+        row = self._selected_row()
+        if row < 0:
+            self._insert_line()
+            row = self._selected_row()
+        if row < 0:
+            return
+        item = self.table.item(row, 1)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 1, item)
+        item.setText(_lrc_timestamp(self._media.position()))
+        self.table.setCurrentCell(row, 2)
+        self._select_lyrics_text_row(row)
+        if QApplication.focusWidget() is self.lyrics_text:
+            cursor = self.lyrics_text.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            self.lyrics_text.setTextCursor(cursor)
+        self._update_preview()
+        self._refresh_save_button()
+        if row + 1 < self.table.rowCount():
+            self._select_relative(1)
+
+    def _nudge_time(self, delta_ms):
+        rows = range(self.table.rowCount()) if self.shift_all.isChecked() else [self._selected_row()]
+        changed = False
+        for row in rows:
+            if row < 0:
+                continue
+            item = self.table.item(row, 1)
+            if item is None:
+                if self.shift_all.isChecked():
+                    continue
+                item = QTableWidgetItem()
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row, 1, item)
+            millis = _parse_lrc_clock(item.text())
+            if millis is None:
+                if self.shift_all.isChecked():
+                    continue
+                millis = int(self._media.position() or 0)
+            item.setText(_lrc_timestamp(max(0, millis + int(delta_ms))))
+            changed = True
+        if changed:
+            self._update_preview()
+            self._refresh_save_button()
+
+    def _clear_time(self):
+        row = self._selected_row()
+        if row >= 0:
+            item = self.table.item(row, 1)
+            if item is not None:
+                item.setText("")
+            self._update_preview()
+            self._refresh_save_button()
+
+    def _toggle_play(self):
+        if not self._path:
+            return
+        if self._media.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._media.pause()
+        else:
+            self._media.play()
+
+    def _seek_preview(self, millis):
+        self._media.setPosition(int(millis))
+
+    def _set_duration(self, millis):
+        self._duration_ms = max(0, int(millis or 0))
+        self.seek.setRange(0, self._duration_ms)
+        self.waveform.set_duration(self._duration_ms)
+        self._update_time_label(self._media.position() if self._media else 0)
+
+    def _update_time_label(self, millis):
+        self.top_time.setText(f"{_editor_clock(millis)} / "
+                              f"{fmt_time(self._duration_ms / 1000.0)}")
+
+    def _media_duration(self, millis):
+        if millis and millis > 0:
+            self._set_duration(millis)
+
+    def _media_position(self, millis):
+        if not self.seek.isSliderDown():
+            self.seek.blockSignals(True)
+            self.seek.setValue(int(millis or 0))
+            self.seek.blockSignals(False)
+        self.waveform.set_position(millis or 0)
+        self._update_time_label(millis or 0)
+        self._update_preview()
+
+    def _media_state(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        icon = (QStyle.StandardPixmap.SP_MediaPause if playing
+                else QStyle.StandardPixmap.SP_MediaPlay)
+        self.play_btn.setIcon(self.style().standardIcon(icon))
+        self.play_btn.setToolTip("Pause the preview" if playing else "Play the preview")
+
+    def _update_preview(self):
+        if not hasattr(self, "preview_current"):
+            return
+        entries, _invalid = self._table_entries()
+        timed = sorted((millis, text) for millis, text in entries if millis is not None)
+        if timed:
+            position = max(0, int(self._media.position() or 0))
+            slots = lyric_display_slots(timed, position)
+            self.preview_prev.setText(
+                lyric_slot_text(slots[0], timed, position, timestamp=True))
+            self.preview_current.setText(
+                lyric_slot_text(slots[1], timed, position, timestamp=True)
+                or "No lyrics loaded.")
+            self.preview_next.setText(
+                lyric_slot_text(slots[2], timed, position, timestamp=True))
+        else:
+            lines = [text for _millis, text in entries]
+            self.preview_prev.setText("")
+            self.preview_current.setText(lines[0] if lines else "No lyrics loaded.")
+            self.preview_next.setText(lines[1] if len(lines) > 1 else "")
+
+    def _save_lrc(self):
+        if not self._path:
+            return
+        entries, invalid = self._table_entries()
+        if invalid:
+            QMessageBox.warning(self, "Lyrics Editor",
+                                "Use mm:ss.xx timestamps. Invalid rows: "
+                                + ", ".join(str(row) for row in invalid))
+            return
+        if not entries:
+            QMessageBox.information(self, "Lyrics Editor", "There are no lyrics to save.")
+            return
+        timed = sorted(((millis, text) for millis, text in entries if millis is not None),
+                       key=lambda row: row[0])
+        plain = [text for millis, text in entries if millis is None]
+        if timed and plain:
+            answer = QMessageBox.question(
+                self, "Lyrics Editor",
+                "Some lines have no timestamp. Save only the timed lines?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if timed:
+            body = [f"{_lrc_timestamp(millis)} {text}".rstrip() for millis, text in timed]
+        else:
+            body = plain
+        metadata = [f"[{key}:{value}]" for key, value in self._metadata_values().items()]
+        content = "\n".join(metadata + body).strip() + "\n"
+        try:
+            target = write_lrc_document(self._path, content)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Lyrics Editor", str(exc))
+            return
+        self.status.setText(f"Saved {os.path.basename(target)}.")
+        self.download_note.setText("Saved to: " + target)
+
+    def closeEvent(self, event):
+        self._media.stop()
+        if self._lookup_worker is not None and self._lookup_worker.isRunning():
+            self._lookup_worker.cancel()
+            self._lookup_worker.wait(1200)
+        super().closeEvent(event)
+
+
 class PlayerBar(QWidget):
     """Strawberry-style bottom bar: cover, transport, format pills, spectrum, seek, volume."""
 
@@ -9739,6 +12896,21 @@ class PlayerBar(QWidget):
     index_changed = Signal(int)
     error = Signal(str)
     buffer_status = Signal(str)     # what the buffers are reading, for the status bar
+    mode_changed = Signal()         # shuffle or repeat changed (for per-playlist modes)
+    lyrics_requested = Signal()     # the lyrics button beside the transport controls
+
+    @property
+    def player(self):
+        """The deck that is playing now (the incoming one during a crossfade)."""
+        return self._players[self._active]
+
+    @property
+    def audio(self):
+        return self._audios[self._active]
+
+    @property
+    def tap(self):
+        return self._taps[self._active]
 
     def __init__(self, config, on_play=None, parent=None):
         super().__init__(parent)
@@ -9752,17 +12924,35 @@ class PlayerBar(QWidget):
         self._shuffle_order = []      # queue indices in the order shuffle plays them
         self._shuffle_pos = -1        # where the playing track sits in that order
         self.stop_after = bool(config.get("stop_after", False))
+        try:
+            self.crossfade_seconds = max(0.0, min(12.0, float(config.get("crossfade_seconds", 0.0))))
+        except (TypeError, ValueError):
+            self.crossfade_seconds = 0.0
+        self.gapless = bool(config.get("gapless", False))
+        self._active = 0
+        self._players = []
+        self._audios = []
+        self._deck_gain = [1.0, 1.0]
+        self._transition = None        # {out, incoming, started, duration} while fading
+        self._preloaded = None         # (queue index, local path) already loaded on the other deck
+        self._crossfade_armed = False
+        self._handoff = None
+        self._fade_timer = QTimer(self, interval=40, timeout=self._fade_tick)
         self._covers = {}
         self._current = ""
+        self._resume_pending = None
         self._stopped = False
         self._buffer_text = ""
         self._buffer_timer = QTimer(self, interval=2000, timeout=self._report_buffers)
         self._buffer_timer.start()
 
-        self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio)
-        self.audio.setVolume(config.get("volume", 70) / 100)
+        for _deck in range(2):
+            media = QMediaPlayer(self)
+            output = QAudioOutput(self)
+            media.setAudioOutput(output)
+            output.setVolume(config.get("volume", 70) / 100)
+            self._players.append(media)
+            self._audios.append(output)
         self.eq_profile = eq_profile_from_config(config)
         self._eq_rendering = False
 
@@ -9828,7 +13018,8 @@ class PlayerBar(QWidget):
         info.addWidget(self.pills)
 
         self.spectrum = SpectrumWidget()
-        self.tap = AudioTap(self.player, self.spectrum)
+        self._taps = [AudioTap(media, self.spectrum) for media in self._players]
+        self._taps[1].set_active(False)
         self.spectrum.set_live(self.tap.enabled, self.tap.mode)
         if self.tap.decoder is not None and self.tap.decoder.error:
             self.spectrum.note = "decoder unavailable: " + self.tap.decoder.error
@@ -9848,12 +13039,14 @@ class PlayerBar(QWidget):
         self.rg_btn.setToolTip("ReplayGain: off")
         self.rg_btn.setPopupMode(QToolButton.InstantPopup)
         self.rg_btn.setMenu(self._build_rg_menu())
-        self.stop_after_btn = QPushButton("stop after track")
-        self.stop_after_btn.setObjectName("StopAfter")
-        self.stop_after_btn.setCheckable(True)
-        self.stop_after_btn.setChecked(self.stop_after)
-        self.stop_after_btn.setToolTip("Stop playback when the current track ends")
-        self.stop_after_btn.toggled.connect(self._set_stop_after)
+        self.lyrics_btn = QPushButton()
+        self.lyrics_btn.setObjectName("PlayerToggle")
+        self.lyrics_btn.setFixedSize(30, 30)
+        self.lyrics_btn.setIconSize(QSize(18, 18))
+        self.lyrics_btn.setCursor(Qt.PointingHandCursor)
+        self.lyrics_btn.setToolTip("Show lyrics")
+        self.lyrics_btn.setIcon(QIcon(lyrics_icon_pixmap(TEXT, 18)))
+        self.lyrics_btn.clicked.connect(self.lyrics_requested)
 
         self.seek = SeekSlider(self)
         self.seek.click_to_seek = bool(config.get("seek_click", True))
@@ -9889,7 +13082,11 @@ class PlayerBar(QWidget):
 
         right = QVBoxLayout()
         right.setSpacing(2)
-        right.addWidget(self.stop_after_btn, 0, Qt.AlignRight)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(4)
+        top_row.addWidget(self.lyrics_btn, 0, Qt.AlignVCenter)
+        top_row.addStretch()
+        right.addLayout(top_row)
         vol_row = QHBoxLayout()
         vol_row.setSpacing(4)
         vol_row.addWidget(self.rg_btn)
@@ -9913,24 +13110,248 @@ class PlayerBar(QWidget):
         self.shuffle_btn.toggled.connect(self._set_shuffle)
         self.repeat_btn.clicked.connect(self._cycle_repeat)
         self.vol.valueChanged.connect(self._set_volume)
-        self.seek.sliderMoved.connect(self.player.setPosition)
-        self.seek.clicked.connect(self.player.setPosition)
-        self.player.durationChanged.connect(lambda d: self.seek.setRange(0, d))
-        self.player.positionChanged.connect(self._on_pos)
-        self.player.positionChanged.connect(self.tap.on_position)
-        self.player.playbackStateChanged.connect(self._on_state)
-        self.player.mediaStatusChanged.connect(self._on_status)
-        try:
-            self.player.errorOccurred.connect(
-                lambda *_: self.error.emit(self.player.errorString() or "Playback failed"))
-        except Exception:
-            pass
+        self.seek.sliderMoved.connect(lambda ms: self.player.setPosition(ms))
+        self.seek.clicked.connect(lambda ms: self.player.setPosition(ms))
+        for _index, _media in enumerate(self._players):
+            _media.durationChanged.connect(
+                lambda d, i=_index: self._on_deck_duration(i, d))
+            _media.positionChanged.connect(
+                lambda p, i=_index: self._on_deck_pos(i, p))
+            _media.positionChanged.connect(
+                lambda p, i=_index: self._taps[i].on_position(p))
+            _media.playbackStateChanged.connect(
+                lambda s, i=_index: self._on_deck_state(i, s))
+            _media.mediaStatusChanged.connect(
+                lambda s, i=_index: self._on_deck_status(i, s))
+            try:
+                _media.errorOccurred.connect(
+                    lambda *_, i=_index: self._on_deck_error(i))
+            except Exception:
+                pass
         self._paint_cover(None)
         self._apply_volume()
         self._buffer_disc_entries = []   # a disc kept ready before anything is queued
         self.queue_changed.connect(self.refresh_buffers)
         self.queue_changed.connect(self._invalidate_shuffle)
+        self.queue_changed.connect(self._schedule_preload)
         self.index_changed.connect(lambda _index: self.refresh_buffers())
+
+    def _fade_tick(self):
+        """Advance a running crossfade; the transition setup lives with playback handoff."""
+        transition = self._transition
+        if not transition:
+            self._fade_timer.stop()
+            return
+        elapsed = time.monotonic() - transition["started"]
+        progress = min(1.0, elapsed / max(0.001, transition["duration"]))
+        outgoing, incoming = transition["out"], transition["incoming"]
+        self._deck_gain[outgoing] = math.cos(progress * math.pi / 2)
+        self._deck_gain[incoming] = math.sin(progress * math.pi / 2)
+        self._apply_volume()
+        if progress >= 1.0:
+            # Pausing from a timer callback is safe where stopping the FFmpeg backend
+            # can block; the deck is stopped or reused when the next track loads.
+            self._players[outgoing].pause()
+            self._deck_gain = [1.0, 1.0]
+            self._transition = None
+            self._fade_timer.stop()
+            self._apply_volume()
+            self._schedule_preload()
+
+    # ---------- crossfade and gapless handoff ----------
+    def set_crossfade(self, seconds, save=True):
+        """Set the overlap length in seconds; 0 turns crossfade off."""
+        try:
+            seconds = max(0.0, min(12.0, float(seconds)))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        self.crossfade_seconds = seconds
+        self.config["crossfade_seconds"] = seconds
+        if save:
+            save_config(self.config)
+        if seconds > 0 or self.gapless:
+            self._schedule_preload()
+        else:
+            self._drop_preload()
+
+    def set_gapless(self, on):
+        """Start the next track on the spare deck before this one ends."""
+        self.gapless = bool(on)
+        self.config["gapless"] = self.gapless
+        save_config(self.config)
+        if self.gapless or self.crossfade_seconds > 0:
+            self._schedule_preload()
+        else:
+            self._drop_preload()
+
+    def set_muted(self, muted):
+        """Mute both decks, including the one still fading out."""
+        for audio in self._audios:
+            audio.setMuted(bool(muted))
+
+    def pause_playback(self):
+        """Pause both decks, so a sleep timer does not leave a fade-out playing."""
+        for media in self._players:
+            media.pause()
+
+    def set_stop_after(self, on):
+        self.stop_after = bool(on)
+        self.config["stop_after"] = self.stop_after
+        save_config(self.config)
+
+    def _activate_deck(self, index):
+        """Make one deck the one the bar and spectrum follow."""
+        self._active = index
+        for i, tap in enumerate(self._taps):
+            tap.set_active(i == index)
+        self.spectrum.set_live(self.tap.enabled, self.tap.mode)
+
+    def _cancel_transition(self):
+        transition = self._transition
+        if transition:
+            self._fade_timer.stop()
+            self._players[transition["out"]].pause()
+            self._transition = None
+        self._deck_gain = [1.0, 1.0]
+        self._apply_volume()
+
+    def _drop_preload(self):
+        if self._transition:
+            return
+        if self._preloaded is not None:
+            self._players[1 - self._active].pause()
+            self._preloaded = None
+
+    def _local_for(self, path):
+        """The local file the player should open for a queue entry."""
+        if is_cd_entry(path):
+            return path
+        local = (DEVICE_BUFFER.cached(path) or path) if is_device_entry(path) else path
+        return self._eq_source(local)
+
+    def _set_deck_source(self, deck, path, local):
+        media = self._players[deck]
+        if is_cd_entry(path):
+            media.setSource(QUrl(cd_stream_url(path)))
+        else:
+            media.setSource(QUrl.fromLocalFile(local))
+
+    def _peek_next_index(self):
+        """The track next would play, without changing the shuffle order."""
+        if not self.queue or self.index < 0 or self.stop_after:
+            return None
+        if self.repeat == "one":
+            return None
+        if self._shuffle_active():
+            if len(self._shuffle_order) != len(self.queue) or not self._shuffle_order:
+                return None
+            pos = self._shuffle_pos + 1
+            if pos >= len(self._shuffle_order):
+                return None
+            target = self._shuffle_order[pos]
+        else:
+            target = self.index + 1
+            if target >= len(self.queue):
+                if self.repeat != "all":
+                    return None
+                target = 0
+        if target == self.index or not 0 <= target < len(self.queue):
+            return None
+        return target
+
+    def _schedule_preload(self, *_args):
+        QTimer.singleShot(0, self._preload_next)
+
+    def _preload_next(self):
+        """Put the next track on the spare deck, paused, ready for the handoff."""
+        if self._handoff or self._transition or self._stopped:
+            return
+        if not (self.crossfade_seconds > 0 or self.gapless):
+            self._drop_preload()
+            return
+        if not (0 <= self.index < len(self.queue)):
+            return
+        current = self.queue[self.index]
+        if is_cd_entry(current):
+            self._drop_preload()
+            return
+        target = self._peek_next_index()
+        if target is None or is_cd_entry(self.queue[target]):
+            self._drop_preload()
+            return
+        path = self.queue[target]
+        if (self._preloaded and self._preloaded[0] == target
+                and self._preloaded[1] == path):
+            return
+        incoming = 1 - self._active
+        local = self._local_for(path)
+        self._set_deck_source(incoming, path, local)
+        self._taps[incoming].load(local)
+        self._preloaded = (target, path, local)
+
+    def _begin_handoff(self, mode):
+        """Advance to the next track on the spare deck; return whether it started."""
+        if self._handoff or self._transition or self.stop_after or self.repeat == "one":
+            return False
+        if not (0 <= self.index < len(self.queue)):
+            return False
+        if is_cd_entry(self.queue[self.index]):
+            return False
+        target = self._peek_next_index()
+        if target is None or is_cd_entry(self.queue[target]):
+            return False
+        self._handoff = mode
+        self._handoff_started = False
+        try:
+            self.next(auto=True)
+        finally:
+            self._handoff = None
+        return self._handoff_started
+
+    def _start_handoff(self, i, mode, path, local):
+        self._handoff_started = True
+        incoming = 1 - self._active
+        outgoing = self._active
+        preloaded = self._preloaded
+        if preloaded and preloaded[0] == i and preloaded[1] == path:
+            local = preloaded[2]
+        else:
+            self._set_deck_source(incoming, path, local)
+            self._taps[incoming].load(local)
+        self._preloaded = None
+        self._activate_deck(incoming)
+        self._load_info(path, local)
+        if mode == "crossfade":
+            self._deck_gain[outgoing] = 1.0
+            self._deck_gain[incoming] = 0.0
+            self._apply_volume()
+            self._players[incoming].play()
+            self._transition = {"out": outgoing, "incoming": incoming,
+                                "started": time.monotonic(),
+                                "duration": max(0.05, self.crossfade_seconds)}
+            self._fade_timer.start()
+        else:
+            self._deck_gain = [1.0, 1.0]
+            self._apply_volume()
+            self._players[incoming].play()
+            self._players[outgoing].pause()
+        self._crossfade_armed = False
+        self._emit_track_started(path)
+        self._schedule_preload()
+
+    def _emit_track_started(self, path):
+        if self._resume_pending:
+            if self._resume_pending[0] == path:
+                QTimer.singleShot(250, self._try_pending_resume)
+            else:
+                self._resume_pending = None
+        if self.on_play and not is_cd_entry(path) and not is_device_entry(path):
+            try:
+                self.on_play(path)
+            except Exception:
+                pass
+        self.track_changed.emit(path)
+        self.index_changed.emit(self.index)
 
     # ---------- ReplayGain ----------
     def _build_rg_menu(self):
@@ -9989,7 +13410,8 @@ class PlayerBar(QWidget):
                                    replaygain_peak(row, self.rg_mode),
                                    self.rg_prevent_clip)
         level = max(0.0, min(1.0, (self.vol.value() / 100.0) * factor))
-        self.audio.setVolume(level)
+        for i, audio in enumerate(self._audios):
+            audio.setVolume(max(0.0, min(1.0, level * self._deck_gain[i])))
         db = replaygain_db(row, self.rg_mode)
         if self.rg_mode == "off" or db is None:
             self.rg_btn.setToolTip("ReplayGain: off" if self.rg_mode == "off"
@@ -10155,6 +13577,8 @@ class PlayerBar(QWidget):
             self.buffer_status.emit(text)
 
     def set_queue(self, paths, start=None, play=False):
+        if self._transition:
+            self._cancel_transition()
         self.queue = [p for p in paths]
         if start is None or int(start) < 0 or not self.queue:
             self.index = -1
@@ -10165,9 +13589,34 @@ class PlayerBar(QWidget):
         if play and self.queue:
             self.play_index(max(self.index, 0))
         elif not self.queue:
-            self.player.stop()
+            self._preloaded = None
+            for media in self._players:
+                media.stop()
+            self._deck_gain = [1.0, 1.0]
+            self._apply_volume()
             self._stopped = True
             self._clear_now_playing()
+
+    def set_resume(self, path, position):
+        """Remember where the last session stopped; applied when that track starts."""
+        try:
+            position = int(position or 0)
+        except (TypeError, ValueError):
+            position = 0
+        self._resume_pending = (path, position) if path and position > 0 else None
+
+    def _try_pending_resume(self, *_args):
+        if not self._resume_pending:
+            return
+        path, position = self._resume_pending
+        if self.current_path() != path:
+            self._resume_pending = None
+            return
+        duration = self.player.duration()
+        if duration <= 0:
+            return
+        self.player.setPosition(min(int(position), max(0, duration - 500)))
+        self._resume_pending = None
 
     def add_paths(self, paths, play_if_idle=True):
         paths = [p for p in paths if p]
@@ -10310,7 +13759,12 @@ class PlayerBar(QWidget):
     def clear_queue(self):
         self.queue = []
         self.index = -1
-        self.player.stop()
+        self._cancel_transition()
+        self._preloaded = None
+        for media in self._players:
+            media.stop()
+        self._deck_gain = [1.0, 1.0]
+        self._apply_volume()
         self._stopped = True
         self._clear_now_playing()
         self._prune_device_entries()
@@ -10334,25 +13788,24 @@ class PlayerBar(QWidget):
             else:
                 self._shuffle_playlist(first=i)
         path = self.queue[i]
-        local = path
+        if (self._preloaded and self._preloaded[0] == i
+                and self._preloaded[1] == path):
+            local = self._preloaded[2]
+        else:
+            local = self._local_for(path)
+        if self._handoff:
+            self._start_handoff(i, self._handoff, path, local)
+            return
+        self._cancel_transition()
+        self._drop_preload()
+        self._crossfade_armed = False
         if is_cd_entry(path):
             self.refresh_cd_buffer()      # the plan names this track before it is streamed
-            self.player.setSource(QUrl(cd_stream_url(path)))
-        else:
-            if is_device_entry(path):
-                # use the buffered copy once it is complete; until then read the device
-                local = DEVICE_BUFFER.cached(path) or path
-            local = self._eq_source(local)
-            self.player.setSource(QUrl.fromLocalFile(local))
+        self._set_deck_source(self._active, path, local)
         self.player.play()
         self._load_info(path, local)
-        if self.on_play and not is_cd_entry(path) and not is_device_entry(path):
-            try:
-                self.on_play(path)
-            except Exception:
-                pass
-        self.track_changed.emit(path)
-        self.index_changed.emit(i)
+        self._emit_track_started(path)
+        self._schedule_preload()
 
     def _eq_source(self, path):
         """Play the equalised copy when the profile changes anything."""
@@ -10404,7 +13857,7 @@ class PlayerBar(QWidget):
         if tags["album"]:
             bits.append(tags["album"])
         self.now_title.setText(title)
-        self.now_sub.setText(" — ".join(bits) if bits else " ")
+        self.now_sub.setText(" - ".join(bits) if bits else " ")
         self._set_pills(spec_parts(specs))
         self._paint_cover(path)
         self._rg_values = read_replaygain(path)
@@ -10418,7 +13871,7 @@ class PlayerBar(QWidget):
         title = row.get("title") or os.path.basename(path)
         bits = [x for x in (row.get("artist"), row.get("album")) if x]
         self.now_title.setText(title)
-        self.now_sub.setText(" — ".join(bits) if bits else " ")
+        self.now_sub.setText(" - ".join(bits) if bits else " ")
         specs = {k: row.get(k) for k in ("sample_rate", "bits_per_sample", "bitrate",
                                          "filetype")}
         self._set_pills(spec_parts(specs))
@@ -10500,7 +13953,7 @@ class PlayerBar(QWidget):
             cover = row.get("cover_path") or ""
             pm = self._cover_bytes(cover) if cover else None
             viewer = CoverViewer(pm, row.get("title") or os.path.basename(path),
-                                 " — ".join(x for x in (row.get("artist"), row.get("album"))
+                                 " - ".join(x for x in (row.get("artist"), row.get("album"))
                                             if x) or " ",
                                  self)
             viewer.exec()
@@ -10508,12 +13961,20 @@ class PlayerBar(QWidget):
         tags = read_tags(path)
         pm = self._cover_bytes(path)
         viewer = CoverViewer(pm, tags["title"] or os.path.basename(path),
-                             " — ".join(x for x in (tags["artist"], tags["album"]) if x) or " ",
+                             " - ".join(x for x in (tags["artist"], tags["album"]) if x) or " ",
                              self.window())
         viewer.exec()
 
     # ---------- transport ----------
     def toggle(self):
+        if self._transition:
+            if self._playing:
+                for media in self._players:
+                    media.pause()
+            else:
+                for media in self._players:
+                    media.play()
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
         elif not self.queue:
@@ -10528,7 +13989,12 @@ class PlayerBar(QWidget):
 
     def stop(self):
         self._stopped = True
-        self.player.stop()
+        self._cancel_transition()
+        self._preloaded = None
+        for media in self._players:
+            media.stop()
+        self._deck_gain = [1.0, 1.0]
+        self._apply_volume()
         self.spectrum.reset()
         self._clear_now_playing()
         # The queue stays, and Play starts the stopped track again; only its
@@ -10566,7 +14032,7 @@ class PlayerBar(QWidget):
                 i = 0
             elif auto and self.stop_after:
                 self.stop()
-                self.stop_after_btn.setChecked(False)
+                self.set_stop_after(False)
                 return
             else:
                 self.stop()
@@ -10575,6 +14041,8 @@ class PlayerBar(QWidget):
         self.play_index(i)
 
     def prev(self):
+        if self._transition:
+            self._cancel_transition()
         if self.player.position() > 3000:
             self.player.setPosition(0)
             return
@@ -10594,15 +14062,30 @@ class PlayerBar(QWidget):
         self.config["volume"] = int(v)
         self._apply_volume()
 
+    def set_modes(self, shuffle=None, repeat=None):
+        """Apply a saved playlist mode without disturbing the global one unnecessarily."""
+        changed = False
+        if shuffle is not None and bool(shuffle) != self.shuffle:
+            self.shuffle = bool(shuffle)
+            self.config["shuffle"] = self.shuffle
+            changed = True
+        if repeat in ("off", "all", "one") and repeat != self.repeat:
+            self.repeat = repeat
+            self.config["repeat"] = self.repeat
+            changed = True
+        if not changed:
+            return
+        self._invalidate_shuffle()
+        self._update_repeat_ui()
+        save_config(self.config)
+        self.mode_changed.emit()
+
     def _set_shuffle(self, on):
         self.shuffle = bool(on)
         self.config["shuffle"] = self.shuffle
         self._invalidate_shuffle()
         self._sync_mode_buttons()
-
-    def _set_stop_after(self, on):
-        self.stop_after = bool(on)
-        self.config["stop_after"] = self.stop_after
+        self.mode_changed.emit()
 
     def _cycle_repeat(self):
         order = ["off", "all", "one"]
@@ -10610,6 +14093,7 @@ class PlayerBar(QWidget):
         self.config["repeat"] = self.repeat
         self._invalidate_shuffle()
         self._update_repeat_ui()
+        self.mode_changed.emit()
 
     # ---------- shuffle order ----------
     def _shuffle_active(self):
@@ -10658,6 +14142,8 @@ class PlayerBar(QWidget):
         self.stop_btn.setIcon(transport_icon("stop", 22))
         self.next_btn.setIcon(transport_icon("next", 22))
         self.play_btn.setIcon(transport_icon("pause" if self._playing else "play", 26))
+        if hasattr(self, "lyrics_btn"):
+            self.lyrics_btn.setIcon(QIcon(lyrics_icon_pixmap(TEXT, 18)))
         self._sync_mode_buttons()
 
     def _update_repeat_ui(self):
@@ -10670,7 +14156,7 @@ class PlayerBar(QWidget):
 
         Repeat one plays the same track, so shuffle has nothing to reorder: the shuffle
         button goes off and stays insensitive while it is on. The setting itself is not
-        thrown away — it comes back as soon as repeat leaves repeat one.
+        thrown away - it comes back as soon as repeat leaves repeat one.
         """
         one = self.repeat == "one"
         for b in (self.shuffle_btn, self.repeat_btn):
@@ -10688,26 +14174,60 @@ class PlayerBar(QWidget):
         self.repeat_btn.setToolTip({"off": "Repeat off", "all": "Repeat all",
                                     "one": "Repeat one"}.get(self.repeat, "Repeat"))
 
-    def _on_pos(self, p):
-        if self._stopped:
+    def _on_deck_duration(self, deck, duration):
+        if deck != self._active:
+            return
+        self.seek.setRange(0, duration)
+        self._try_pending_resume()
+
+    def _on_deck_pos(self, deck, p):
+        if deck != self._active or self._stopped:
             return
         if not self.seek.isSliderDown():
             self.seek.setValue(p)
         self.pos_label.setText(f"{fmt_time(p / 1000)} / {fmt_time(self.player.duration() / 1000)}")
+        if (self.crossfade_seconds > 0 and not self._transition
+                and not self._crossfade_armed and not self.stop_after
+                and self.repeat != "one" and not self.seek.isSliderDown()):
+            duration = self.player.duration()
+            threshold = int(self.crossfade_seconds * 1000)
+            if duration > threshold > 0 and p >= duration - threshold:
+                self._crossfade_armed = True
+                self._begin_handoff("crossfade")
 
-    def _on_state(self, s):
-        playing = s == QMediaPlayer.PlayingState
+    def _on_deck_state(self, deck, state):
+        if deck != self._active:
+            return
+        playing = state == QMediaPlayer.PlayingState
         self._playing = playing
         self.play_btn.setIcon(transport_icon("pause" if playing else "play", 26))
         self.spectrum.set_playing(playing)
 
-    def _on_status(self, s):
-        if s == QMediaPlayer.EndOfMedia:
-            if self.stop_after:
-                self.stop()
-                self.stop_after_btn.setChecked(False)
-            else:
-                self.next(auto=True)
+    def _on_deck_status(self, deck, status):
+        if deck != self._active:
+            return
+        if status != QMediaPlayer.EndOfMedia:
+            return
+        if self._transition:
+            self._cancel_transition()
+        if self.stop_after:
+            self.stop()
+            self.set_stop_after(False)
+            return
+        if self.repeat == "one":
+            self.player.setPosition(0)
+            self.player.play()
+            return
+        if self.gapless and self.crossfade_seconds <= 0:
+            if self._begin_handoff("gapless"):
+                return
+        self.next(auto=True)
+
+    def _on_deck_error(self, deck):
+        if deck == self._active:
+            self.error.emit(self._players[deck].errorString() or "Playback failed")
+        else:
+            self._preloaded = None
 # ======================================================================
 # ui/library_tab.py - icon strip, collection tree, playlists, queue
 # ======================================================================
@@ -10728,6 +14248,7 @@ GROUPINGS = [
     ("album", "Album"),
     ("genre", "Genre"),
     ("year", "Year"),
+    ("added", "Date added"),
     ("folder", "Folder"),
     ("albumartist_album_disc", "Album artist / Album / Disc"),
     ("year_album", "Year / Album"),
@@ -11198,6 +14719,7 @@ GROUP_FIELDS = [
     ("disc", "Disc"),
     ("year", "Year"),
     ("decade", "Decade"),
+    ("added", "Date added"),
     ("genre", "Genre"),
     ("composer", "Composer"),
     ("performer", "Performer"),
@@ -11217,6 +14739,7 @@ GROUPING_LEVELS = {
     "album": ["album"],
     "genre": ["genre", "artist", "album"],
     "year": ["decade", "album"],
+    "added": ["added"],
     "folder": ["folder"],
     "albumartist_album_disc": ["albumartist", "album", "disc"],
     "year_album": ["year", "album"],
@@ -11479,7 +15002,7 @@ class DuplicateDialog(QDialog):
         total = 0
         for group in groups:
             first = group[0]
-            label = f"{first.get('artist') or 'Unknown artist'} — {first.get('title') or '?'}"
+            label = f"{first.get('artist') or 'Unknown artist'} - {first.get('title') or '?'}"
             header = QTreeWidgetItem(self.tree, [f"{label}  ({len(group)} copies)", ""])
             f = header.font(0)
             f.setBold(True)
@@ -11751,7 +15274,7 @@ class OnlineLookupDialog(QDialog):
             extra = " · ".join(x for x in (rel.get("type"), rel.get("date")[:4],
                                            rel.get("country")) if x)
             self.results_list.addItem(
-                "%s — %s  (%s, %d tracks)" % (rel["artist"] or "?", rel["title"],
+                "%s - %s  (%s, %d tracks)" % (rel["artist"] or "?", rel["title"],
                                               extra or "release", rel["tracks"]))
         self.status.setText("%d release(s) found on MusicBrainz." % len(self.results))
         self.results_list.setCurrentRow(0)
@@ -11829,7 +15352,7 @@ class OnlineLookupDialog(QDialog):
             except OSError:
                 continue
         if saved:
-            self.status.setText("Saved %d cover file(s) — e.g. %s"
+            self.status.setText("Saved %d cover file(s) - e.g. %s"
                                 % (len(saved), os.path.basename(saved[0])))
         else:
             self.status.setText("Could not write a cover next to the selected files.")
@@ -13372,6 +16895,7 @@ class LibraryTab(QWidget):
         self.undo_stack = []
         self.redo_stack = []
         self.current_playlist = None
+        self._loading_playlist_mode = False
         self.queue_title_extra = ""
 
         self.setObjectName("Panel")
@@ -13428,6 +16952,16 @@ class LibraryTab(QWidget):
         self._rg_bar = None
         self._folder_timer = QTimer(self, interval=30000, timeout=self._auto_rescan)
         self._folder_timer.start()
+        # Watch the configured folders for new or removed files. Qt's watcher is not
+        # recursive, so the 30-second pass above still covers deep folder changes.
+        self._watcher = QFileSystemWatcher(self)
+        self._watch_timer = QTimer(self, singleShot=True, interval=1500,
+                                   timeout=self._watched_changed)
+        self._watcher.directoryChanged.connect(lambda _p: self._watch_timer.start())
+        self._watcher.fileChanged.connect(lambda _p: self._watch_timer.start())
+        self.folders_changed.connect(self._refresh_watcher)
+        self._refresh_watcher()
+        self.player.mode_changed.connect(self._save_playlist_mode)
 
     # ---------------- chrome ----------------
     def _build_strip(self):
@@ -13549,7 +17083,7 @@ class LibraryTab(QWidget):
             self.grouping.addItem("Custom grouping", "custom")
         self.grouping.setCurrentIndex(
             max(self.grouping.findData(self.config.get("grouping", "artist_album")), 0))
-        self.grouping.setToolTip("Grouping presets — the … button opens the three-level dialog")
+        self.grouping.setToolTip("Grouping presets - the … button opens the three-level dialog")
         self.grouping.currentIndexChanged.connect(self._grouping_changed)
         row.addWidget(self.grouping, 1)
         group_btn = QToolButton()
@@ -13783,7 +17317,7 @@ class LibraryTab(QWidget):
             self.table.setColumnWidth(col, width)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionsClickable(True)
-        header.setToolTip("Click a column to sort the queue — drag rows to reorder")
+        header.setToolTip("Click a column to sort the queue - drag rows to reorder")
         header.sectionClicked.connect(self._sort_queue)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(23)
@@ -13870,7 +17404,7 @@ class LibraryTab(QWidget):
             label = self._album_label(row)
             disc = _num(row["discnumber"])
             if disc > 1:
-                label += f" — Disc {disc}"
+                label += f" - Disc {disc}"
             return (label.lower(), disc), label, "album"
         if level == "disc":
             disc = _num(row["discnumber"]) or 1
@@ -13884,6 +17418,14 @@ class LibraryTab(QWidget):
             if year.isdigit() and len(year) == 4:
                 return int(year[:3]) * 10, f"{year[:3]}0s", "group"
             return 9999, "Unknown year", "group"
+        if level == "added":
+            try:
+                stamp = float(row.get("added") or 0)
+            except (TypeError, ValueError):
+                stamp = 0.0
+            if stamp > 0:
+                return -stamp, time.strftime("%Y-%m-%d", time.localtime(stamp)), "group"
+            return 0, "Unknown date", "group"
         if level in ("genre", "composer", "performer", "grouping"):
             name = (row[level] or "").strip()
             label = name or {"genre": "Unknown genre", "composer": "Unknown composer",
@@ -13962,12 +17504,12 @@ class LibraryTab(QWidget):
             + (f"   (library: {total})" if shown != total else ""))
         if error:
             self.filter_hint.setObjectName("Amber")
-            self.filter_hint.setText(f"Filter error: {error} — showing a plain text search")
+            self.filter_hint.setText(f"Filter error: {error} - showing a plain text search")
         elif text:
             self.filter_hint.setText(f"{shown} match{'es' if shown != 1 else ''} · "
-                                     "field:value filters — artist:… · year:1990-1999 · bitrate:>320")
+                                     "field:value filters - artist:… · year:1990-1999 · bitrate:>320")
         else:
-            self.filter_hint.setText('field:value filters — artist:aphex · album:"…" · '
+            self.filter_hint.setText('field:value filters - artist:aphex · album:"…" · '
                                      'bitrate:>320 · rating:>=4')
         self.filter_hint.style().unpolish(self.filter_hint)
         self.filter_hint.style().polish(self.filter_hint)
@@ -14083,7 +17625,7 @@ class LibraryTab(QWidget):
                                                              info["kind"]))
             item.setData(0, KIND_ROLE, info["kind"])
             label_col = self._label_column()
-            item.setToolTip(0, f"{label} — {len(info['rows'])} track(s)")
+            item.setToolTip(0, f"{label} - {len(info['rows'])} track(s)")
             if depth == 0:
                 font = item.font(label_col)
                 font.setBold(True)
@@ -14164,7 +17706,7 @@ class LibraryTab(QWidget):
         shown_title = self._song_title(row)
         loved = bool(row.get("loved"))
         rating = int(row.get("rating") or 0)
-        tooltip = f"{row['artist'] or 'Unknown artist'} — {row['album'] or 'Unknown album'}"
+        tooltip = f"{row['artist'] or 'Unknown artist'} - {row['album'] or 'Unknown album'}"
         if row["length"]:
             tooltip += f"\n{fmt_time(row['length'])} · {fmt_specs(row)}"
         if rating:
@@ -14355,13 +17897,13 @@ class LibraryTab(QWidget):
             item.setTextAlignment(Qt.AlignHCenter)
             item.setData(Qt.UserRole, [r["path"] for r in group])
             artist = group[0]["albumartist"] or group[0]["artist"] or ""
-            item.setToolTip(f"{label}" + (f" — {artist}" if artist else "") +
+            item.setToolTip(f"{label}" + (f" - {artist}" if artist else "") +
                             f"\nClick to open the album"
                             f"\nDouble-click to queue {len(group)} track(s)")
             self.covers.addItem(item)
 
     def _covers_click(self, item):
-        """A click on a cover opens the album — after the double-click interval, so a
+        """A click on a cover opens the album - after the double-click interval, so a
         double-click (add to queue) never also opens it on the way.
 
         What the click pointed at is copied out now: the grid can be rebuilt (a rescan,
@@ -14441,6 +17983,27 @@ class LibraryTab(QWidget):
             return
         self._enqueue_paths(paths, play=True, mode=mode,
                             label=f"{len(paths)} track(s), {SHUFFLE_LABELS[mode].lower()}")
+
+    def play_random_album(self):
+        """Pick one album at random and play it in disc/track order."""
+        rows = [r for r in self.library.tracks() if (r.get("album") or "").strip()]
+        if not rows:
+            self.window().notify("The library has no albums yet")
+            return
+        albums = {}
+        for row in rows:
+            key = ((row.get("albumartist") or row.get("artist") or "").lower(),
+                   (row.get("album") or "").lower())
+            albums.setdefault(key, []).append(row)
+        chosen = random.choice(list(albums.values()))
+        chosen.sort(key=album_track_key)
+        paths = [r["path"] for r in chosen]
+        self._push_undo("Play random album")
+        self.current_playlist = None
+        self.queue_title_extra = "Random album"
+        self.player.set_queue(paths, 0, play=True)
+        self.rebuild_queue()
+        self.window().notify("Playing random album: " + (chosen[0].get("album") or "Unknown album"))
 
     def preferences_changed(self):
         self.cover_cache.clear()
@@ -14581,7 +18144,7 @@ class LibraryTab(QWidget):
         copy_menu = menu.addMenu("Copy")
         copy_menu.addAction("File path",
                             lambda: QApplication.clipboard().setText("\n".join(paths)))
-        copy_menu.addAction("Artist — Title",
+        copy_menu.addAction("Artist - Title",
                             lambda: QApplication.clipboard().setText(
                                 "\n".join(self._track_label(p) for p in paths)))
         menu.addAction("Show in file browser", lambda: self.show_in_browser(paths[0]))
@@ -14605,7 +18168,7 @@ class LibraryTab(QWidget):
         row = self._rows_cache.get(path, {})
         artist = row.get("artist") or "Unknown artist"
         title = row.get("title") or os.path.basename(path)
-        return f"{artist} — {title}"
+        return f"{artist} - {title}"
 
     def _all_items(self):
         stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
@@ -14760,7 +18323,7 @@ class LibraryTab(QWidget):
             artist = str(row.get("albumartist") or "").strip()
             if album and artist:
                 key = ("tag", artist.lower(), album.lower())
-                label = f"{artist} — {album}"
+                label = f"{artist} - {album}"
             else:
                 folder = os.path.dirname(path)
                 key = ("folder", folder, album.lower())
@@ -14840,7 +18403,7 @@ class LibraryTab(QWidget):
             QMessageBox.information(
                 self, "ReplayGain",
                 "ffmpeg was not found (or could not decode these files).\n\n"
-                "Tracks that already carry REPLAYGAIN_* tags still work — "
+                "Tracks that already carry REPLAYGAIN_* tags still work - "
                 "set the RG button in the player bar to Track or Album gain.")
             return
         albums = int(result.get("albums") or 0)
@@ -15091,9 +18654,9 @@ class LibraryTab(QWidget):
                 (row.get("artist") or "", 0),
                 (row.get("album") or "", 0),
                 (fmt_time(length), length),
-                (f"{rate} Hz" if rate else "—", rate),
-                (f"{depth} Bit" if depth else "—", depth),
-                (f"{round(bitrate / 1000)} kbps" if bitrate else "—", bitrate),
+                (f"{rate} Hz" if rate else "-", rate),
+                (f"{depth} Bit" if depth else "-", depth),
+                (f"{round(bitrate / 1000)} kbps" if bitrate else "-", bitrate),
                 ("CD" if on_disc else (device.get("source") if device else "Local"), 0),
                 ("Audio CD" if on_disc else (row.get("filetype") or filetype(path)), 0),
             ]
@@ -15104,7 +18667,7 @@ class LibraryTab(QWidget):
                     item.setData(Qt.UserRole + 5, sort_val)
                 if c == 1:
                     item.setData(PATH_ROLE, path)
-                    tip = f"{row.get('artist', '')} — {row.get('album', '')}".strip(" —")
+                    tip = f"{row.get('artist', '')} - {row.get('album', '')}".strip(" -")
                     if device:
                         tip = (tip + f"\nFrom {device.get('name') or 'device'} "
                                f"({device.get('source')})").strip()
@@ -15289,6 +18852,15 @@ class LibraryTab(QWidget):
         self.config["queue"] = list(self.player.queue)
         self.config["queue_index"] = self.player.index
 
+    def _save_playlist_mode(self):
+        """Remember shuffle/repeat against the playlist that is open."""
+        if self._loading_playlist_mode or not self.current_playlist:
+            return
+        modes = self.config.setdefault("playlist_modes", {})
+        modes[self.current_playlist] = {"shuffle": bool(self.player.shuffle),
+                                        "repeat": self.player.repeat}
+        save_config(self.config)
+
     # ---------------- playlists ----------------
     def reload_playlists(self):
         names = self.playlists.names()
@@ -15318,6 +18890,12 @@ class LibraryTab(QWidget):
             self.window().notify(f"Playlist '{name}' is empty or its files are gone")
             return
         self._push_undo(f"Open playlist {name}")
+        mode = (self.config.get("playlist_modes") or {}).get(name) or {}
+        self._loading_playlist_mode = True
+        try:
+            self.player.set_modes(mode.get("shuffle"), mode.get("repeat"))
+        finally:
+            self._loading_playlist_mode = False
         self.player.set_queue(paths)
         self.current_playlist = name
         self.queue_title_extra = f"Playlist: {name}"
@@ -15359,6 +18937,7 @@ class LibraryTab(QWidget):
         self.current_playlist = name
         self.queue_title_extra = f"Playlist: {name}"
         self.queue_title.setText(self.queue_title_extra)
+        self._save_playlist_mode()
         self.reload_playlists()
         self.window().notify(f"Saved {len(self.player.queue)} tracks to '{name}'")
 
@@ -15370,6 +18949,10 @@ class LibraryTab(QWidget):
         new, ok = QInputDialog.getText(self, "Rename playlist", "New name:", text=old)
         new = new.strip() if ok else ""
         if new and new != old and self.playlists.rename(old, new):
+            modes = self.config.get("playlist_modes") or {}
+            if old in modes:
+                modes[new] = modes.pop(old)
+                save_config(self.config)
             if self.current_playlist == old:
                 self.current_playlist = new
                 self.queue_title_extra = f"Playlist: {new}"
@@ -15383,6 +18966,10 @@ class LibraryTab(QWidget):
         if QMessageBox.question(self, "Delete playlist", f"Delete '{name}'?") != QMessageBox.Yes:
             return
         self.playlists.remove(name)
+        modes = self.config.get("playlist_modes") or {}
+        if name in modes:
+            modes.pop(name, None)
+            save_config(self.config)
         if self.current_playlist == name:
             self.current_playlist = None
             self.queue_title_extra = ""
@@ -15423,6 +19010,7 @@ class LibraryTab(QWidget):
                                                                           play_if_idle=False)))
             menu.addAction("Replace queue", lambda: self.open_playlist(name))
             menu.addAction("Burn to Disc…", lambda: self.window().burn_paths(self.playlists.read(name), name))
+            menu.addAction("Copy to device…", lambda: self.window().copy_to_device(self.playlists.read(name)))
             menu.addSeparator()
         menu.addAction("New playlist…", self.new_playlist)
         menu.addAction("Import…", self.import_playlist)
@@ -15673,7 +19261,7 @@ class LibraryTab(QWidget):
         self.rebuild_queue()
         self.folders_changed.emit()
         self.rescan()
-        self.window().notify("Removed %s — %d track(s) dropped" %
+        self.window().notify("Removed %s - %d track(s) dropped" %
                              (os.path.basename(folder.rstrip(os.sep)) or folder, gone))
 
     def reset_play_counts(self):
@@ -15682,6 +19270,25 @@ class LibraryTab(QWidget):
             self.refresh()
             self.reload_smart()
             self.rebuild_queue()
+
+    def _refresh_watcher(self):
+        watcher = getattr(self, "_watcher", None)
+        if watcher is None:
+            return
+        wanted = [f for f in self.config.get("library_folders", [])
+                  if isinstance(f, str) and os.path.isdir(f)]
+        current = watcher.directories()
+        drop = [p for p in current if p not in wanted]
+        add = [p for p in wanted if p not in current]
+        if drop:
+            watcher.removePaths(drop)
+        if add:
+            watcher.addPaths(add)
+
+    def _watched_changed(self):
+        """A watched folder changed: rescan quietly, coalescing bursts."""
+        if self.config.get("library_folders"):
+            self.rescan(silent=True)
 
     def _auto_rescan(self):
         if self.config.get("library_folders"):
@@ -15735,9 +19342,14 @@ class LibraryTab(QWidget):
         self.player._covers.clear()
         self.rebuild_queue()
         self.folders_changed.emit()
-        self.window().notify(f"Library updated — {count} tracks")
+        self.window().notify(f"Library updated - {count} tracks")
 
     def shutdown(self):
+        if getattr(self, "_watcher", None) is not None:
+            try:
+                self._watcher.removePaths(self._watcher.directories())
+            except RuntimeError:
+                pass
         self._save_queue_state()
         self.config["split"] = self.split.sizes()
         if getattr(self, "details", False) and self.columns:
@@ -16940,8 +20552,8 @@ def device_label(device):
     return ("MTP · " if getattr(device, "kind", "") == "mtp" else "USB · ") + device.name
 
 
-# A device is remembered by its stable id — the gvfs host for a phone, the mount point
-# for a stick — so it keeps its place in the bar and the sidebar while it is unplugged,
+# A device is remembered by its stable id - the gvfs host for a phone, the mount point
+# for a stick - so it keeps its place in the bar and the sidebar while it is unplugged,
 # and keeps the nickname given to it. The dot says whether it is here right now.
 DEVICE_ID_ROLE = Qt.UserRole + 10
 DEVICE_NAME_ROLE = Qt.UserRole + 11
@@ -17097,7 +20709,7 @@ DEVICE_FILTER_FIELDS = {
 DEVICE_SEARCH_KEYS = ("title", "artist", "albumartist", "album", "rel")
 DEVICE_CATEGORY_LABELS = (("music", "Music"),
                           ("audiobook", "Audiobooks"))
-DEVICE_FILTER_HINT = ('field:value filters — artist:aphex · album:"…" · '
+DEVICE_FILTER_HINT = ('field:value filters - artist:aphex · album:"…" · '
                       'track:>=5 · size:>10m')
 DEVICE_FILTER_HELP = ("Filter the device's music with field:value terms, e.g.\n"
                       "  artist:aphex   album:\"Selected Ambient Works\"\n"
@@ -17258,8 +20870,8 @@ def device_plain_query(text):
 class DeviceFolderDialog(QDialog):
     """Pick a folder on the device: walk into one, then "Use this folder".
 
-    A file manager would be overkill here — the device tab shows music, not a tree of
-    files — so this only lists folders, which is all a sync target ever needs.
+    A file manager would be overkill here - the device tab shows music, not a tree of
+    files - so this only lists folders, which is all a sync target ever needs.
     """
 
     def __init__(self, backend, start="", parent=None):
@@ -17487,9 +21099,9 @@ class CopyToDeviceDialog(QDialog):
                 self, "Copy to device",
                 f"{device.name} is not mounted. Reconnect it and try again.")
             return
-        # A device copied to before opens where it was left. A new one — or a folder
+        # A device copied to before opens where it was left. A new one - or a folder
         # that is not on this device, such as the default "Music" above a phone's
-        # storages — opens at the root, where the storages are listed.
+        # storages - opens at the root, where the storages are listed.
         backend = Backend(device)
         start = self.folder_dir() if self.device_id() in self.remembered else ""
         if start and not os.path.isdir(backend.local(start)):
@@ -17562,7 +21174,7 @@ class DeviceBookReader(QThread):
 class DevicesTab(QWidget):
     """What is on each connected device, shown the way the library shows music.
 
-    The device tabs across the top (or down the side — Preferences > Library) pick the
+    The device tabs across the top (or down the side - Preferences > Library) pick the
     device; the folder picker picks which folder on it to look at; below that the music
     it holds is shown as a list or as album covers. Nothing here edits the device: it is
     a browser for what the sync profiles put there (and what was put there by hand),
@@ -17759,7 +21371,7 @@ class DevicesTab(QWidget):
         self.tree.customContextMenuRequested.connect(self._menu)
         self.tree.itemDoubleClicked.connect(self._tree_double)
         self.tree.setToolTip("Double-click an artist, album or track to play it (or add it "
-                             "to the queue — Preferences > Library chooses which)")
+                             "to the queue - Preferences > Library chooses which)")
 
         self.covers = QListWidget()
         self.covers.setViewMode(QListWidget.IconMode)
@@ -18111,7 +21723,7 @@ class DevicesTab(QWidget):
         self.dir_btn.setEnabled(False)
         self.busy.hide()
         self._set_controls(True)
-        self.info.setText(f"<b>{entry['name']}</b> — {DEVICE_STATUS_OFF}")
+        self.info.setText(f"<b>{entry['name']}</b> - {DEVICE_STATUS_OFF}")
         self.filter_hint.setObjectName("Muted")
         self.filter_hint.setText(DEVICE_FILTER_HINT)
         self.filter_hint.style().unpolish(self.filter_hint)
@@ -18208,9 +21820,9 @@ class DevicesTab(QWidget):
         if self.backend is not None:
             d = self.backend.device
             kind = "MTP" if d.kind == "mtp" else "USB storage"
-            self.info.setText(f"<b>{entry['name']}</b> — {kind} — {d.root}")
+            self.info.setText(f"<b>{entry['name']}</b> - {kind} - {d.root}")
         else:
-            self.info.setText(f"<b>{entry['name']}</b> — {DEVICE_STATUS_OFF}")
+            self.info.setText(f"<b>{entry['name']}</b> - {DEVICE_STATUS_OFF}")
 
     def _clear_device(self):
         """No device is connected: no music, no capacity bar, no folder from last time."""
@@ -18474,7 +22086,7 @@ class DevicesTab(QWidget):
     def _update_hint(self, shown):
         self.filter_hint.setObjectName("Amber" if self._query_error else "Muted")
         if self._query_error:
-            self.filter_hint.setText(f"Filter error: {self._query_error} — showing a "
+            self.filter_hint.setText(f"Filter error: {self._query_error} - showing a "
                                      f"plain text search")
         elif self._query_text:
             self.filter_hint.setText(f"{shown} match{'es' if shown != 1 else ''} · "
@@ -18497,7 +22109,7 @@ class DevicesTab(QWidget):
 
         A synced file is on the device under the name and layout it has on the PC, so the
         path alone already says artist, album and title. The sync manifest is what turns
-        that guess into the real tags — it remembers which PC file each device path came
+        that guess into the real tags - it remembers which PC file each device path came
         from, and the library knows that file's title, track number and cover.
         """
         parts = rel.split("/")
@@ -18601,8 +22213,8 @@ class DevicesTab(QWidget):
         self._show_current_view()
         d = self.backend.device
         shown = configured_device_name(self.config, d.id, d.name)
-        self.info.setText(f"<b>{shown}</b> — {'MTP' if d.kind == 'mtp' else 'USB storage'}"
-                          f" — {d.root}")
+        self.info.setText(f"<b>{shown}</b> - {'MTP' if d.kind == 'mtp' else 'USB storage'}"
+                          f" - {d.root}")
         self.toolbar.show()
         self.dir_label.show()
         self.space.show()
@@ -18791,7 +22403,7 @@ class DevicesTab(QWidget):
                         break
                     if deadline is None:
                         deadline = time.time() + 90
-                        log("Loading device library — waiting for file transfer…")
+                        log("Loading device library - waiting for file transfer…")
                     elif time.time() > deadline:
                         return ("error", "The device is not answering. Set it to "
                                 "'File transfer' and press Refresh.", None, None)
@@ -18840,7 +22452,7 @@ class DevicesTab(QWidget):
         if kind == "gone":
             # The mount went away mid-read: nothing from it may stay on screen, and
             # nothing queued from it may stay waiting to play. The row's dot is what
-            # says whether the device is really gone — the watcher decides that, so no
+            # says whether the device is really gone - the watcher decides that, so no
             # "disconnected" message is painted here (a phone that is merely busy can
             # still be mounted and connected).
             self._set_load_status("")
@@ -19209,7 +22821,7 @@ class DevicesTab(QWidget):
         icon = self._book_icon(key)
         if icon is not None:
             item.setIcon(0, icon)
-        item.setToolTip(0, f"{title}" + (f" — {artist}" if artist else "") +
+        item.setToolTip(0, f"{title}" + (f" - {artist}" if artist else "") +
                         f"\n{chapters} chapter" + ("s" if chapters != 1 else "") +
                         "\nDouble-click to play or queue the book")
         self._fill_book_children(item, group, details)
@@ -19599,7 +23211,7 @@ class DevicesTab(QWidget):
                 item.setSizeHint(QSize(168, 252))
                 item.setData(GROUP_ROLE, [i for i, _e in tracks])
                 item.setData(COVER_ROLE, cover_key)
-                item.setToolTip(f"{label}" + (f" — {artist}" if artist else "") +
+                item.setToolTip(f"{label}" + (f" - {artist}" if artist else "") +
                                 f"\nClick to open the album"
                                 f"\nDouble-click to queue {len(tracks)} track(s)")
                 self.covers.addItem(item)
@@ -19736,7 +23348,7 @@ class DevicesTab(QWidget):
         """Copy device files into the library, names and folders untouched.
 
         The folder the device is showing is dropped, so ``Music/Aphex Twin/…/01 - Xtal``
-        arrives as ``Aphex Twin/…/01 - Xtal`` inside the library folder — a synced copy
+        arrives as ``Aphex Twin/…/01 - Xtal`` inside the library folder - a synced copy
         lands where it came from. A track the library already holds is left alone, and a
         different file already using the name is kept: the copy becomes ``name (2)``.
         """
@@ -19827,7 +23439,7 @@ class DevicesTab(QWidget):
     def _double_indexes(self, item):
         """What a double-click on a list row means: the row's tracks.
 
-        A track stands for its album from that track on — the album's order is the order
+        A track stands for its album from that track on - the album's order is the order
         it plays or queues in, not the whole device at once.
         """
         index = item.data(0, INDEX_ROLE)
@@ -19849,7 +23461,7 @@ class DevicesTab(QWidget):
             self.queue_indexes(indexes)
 
     def _covers_click(self, item):
-        """A click on a cover opens the album — after the double-click interval, so a
+        """A click on a cover opens the album - after the double-click interval, so a
         double-click (queue it) never also opens it on the way."""
         if item is None:
             return
@@ -19903,8 +23515,8 @@ class DevicesTab(QWidget):
     def _menu_indexes(self, item):
         """What a context-menu action applies to: this row, or the whole selection.
 
-        A row means what a double-click on it means — a track carries its album from
-        that track on — so the menu and the double-click never disagree.
+        A row means what a double-click on it means - a track carries its album from
+        that track on - so the menu and the double-click never disagree.
         """
         if item is None:
             return []
@@ -20176,7 +23788,7 @@ class SyncLogDialog(QDialog):
         super().__init__(parent)
         self.profile = profile
         self.keep = keep
-        self.setWindowTitle(f"Sync log — {profile.name}")
+        self.setWindowTitle(f"Sync log - {profile.name}")
         self.resize(780, 580)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -20749,8 +24361,8 @@ class SyncTab(QWidget):
         source_lay.addLayout(source_btns)
         # iTunes calls this "Entire library" vs "Selected playlists, artists, albums…".
         self.selection_mode = QComboBox()
-        self.selection_mode.addItem("Folder(s) — sync these folders", "folders")
-        self.selection_mode.addItem("Selected items — choose what to sync", "selected")
+        self.selection_mode.addItem("Folder(s) - sync these folders", "folders")
+        self.selection_mode.addItem("Selected items - choose what to sync", "selected")
         self.selection_mode.setToolTip("Sync every file below the folders, or only the "
                                        "music and audiobooks you tick. Mirror deletes "
                                        "the copies it wrote for items you untick; "
@@ -20802,6 +24414,12 @@ class SyncTab(QWidget):
         self.include_lrc = QCheckBox("Include LRC files")
         self.include_lrc.setToolTip("Also copy the matching .lrc lyric file beside a "
                                     "selected audio file.")
+        self.verify_after = QCheckBox("Verify copies after sync")
+        self.verify_after.setToolTip("Read every file this run copies back from the device "
+                                     "and compare its SHA-256 with the bytes that were sent. "
+                                     "A mismatch is reported and the bad copy is not trusted "
+                                     "next time. Slower, especially over MTP, but it proves "
+                                     "the transfer itself.")
         self.autosync = QCheckBox("Autosync")
         form = QFormLayout()
         form.addRow("Name", self.name)
@@ -20842,6 +24460,7 @@ class SyncTab(QWidget):
         form.addRow("Compare by", self.method)
         form.addRow("", self.audio_only)
         form.addRow("", self.include_lrc)
+        form.addRow("", self.verify_after)
         form.addRow("", self.autosync)
         box = QGroupBox("Profile")
         box.setLayout(form)
@@ -20853,10 +24472,12 @@ class SyncTab(QWidget):
         self.transcode_bitrate.currentIndexChanged.connect(self._store)
         self.method.currentIndexChanged.connect(self._method_changed)
         self.filesystem.currentIndexChanged.connect(self._filesystem_changed)
-        for w in (self.audio_only, self.include_lrc, self.autosync):
+        for w in (self.audio_only, self.include_lrc, self.verify_after, self.autosync):
             w.toggled.connect(self._store)
 
         self.compare_btn = QPushButton("Compare")
+        self.compare_btn.setToolTip("Preview: build the plan and list every copy, update and "
+                                    "removal without changing the device.")
         self.sync_btn = QPushButton("Sync")
         self.both_btn = QPushButton("Compare+Sync")
         # Verify content belongs to Fast hash only: Bit-by-bit already read both copies.
@@ -20885,14 +24506,15 @@ class SyncTab(QWidget):
         self.progress = QProgressBar()
         self.status = QLabel("")
         self.status.setObjectName("Muted")
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Action", "File", "Size"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Action", "File", "On device", "Size"])
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.verticalHeader().hide()
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setColumnWidth(0, 230)
-        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(2, 240)
+        self.table.setColumnWidth(3, 90)
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setMaximumHeight(140)
         # The running task's lines still come here, but it stays out of the way: what
@@ -21032,6 +24654,7 @@ class SyncTab(QWidget):
         preset.transcode_quality = profile.transcode_quality
         preset.audio_only = profile.audio_only
         preset.include_lrc = profile.include_lrc
+        preset.verify_after = profile.verify_after
 
     def _preset_chosen(self, _index=0):
         preset_id = self.preset.currentData()
@@ -21228,7 +24851,7 @@ class SyncTab(QWidget):
             else:
                 verified = "not verified in full"
                 tip += (" Fast hash trusts the sync manifest. The device files have not been "
-                        "read in full yet — press Verify content for that.")
+                        "read in full yet - press Verify content for that.")
         self.device_status.setTextFormat(Qt.RichText)
         tail = f" · <span style=\"color:{MUTED}\">{verified}</span>" if verified else ""
         self.device_status.setText(f'<span style="color:{color}">●</span> {text} · '
@@ -21309,8 +24932,8 @@ class SyncTab(QWidget):
     def _show_profile(self, row):
         p = self.current()
         for w in (self.name, self.device, self.mode, self.audio_only, self.include_lrc,
-                  self.autosync, self.method, self.filesystem, self.transcode,
-                  self.transcode_bitrate, self.selection_mode):
+                  self.verify_after, self.autosync, self.method, self.filesystem,
+                  self.transcode, self.transcode_bitrate, self.selection_mode):
             w.blockSignals(True)
             w.setEnabled(p is not None)
         self.target_button.setEnabled(p is not None)
@@ -21329,14 +24952,15 @@ class SyncTab(QWidget):
             self._fill_transcode_rates(p.transcode, p.transcode_mode, p.transcode_quality)
             self.audio_only.setChecked(p.audio_only)
             self.include_lrc.setChecked(p.include_lrc)
+            self.verify_after.setChecked(p.verify_after)
             self.autosync.setChecked(p.autosync)
         else:
             self.selection_mode.setCurrentIndex(0)
             self.target_summary.clear()
             self._fill_transcode_rates("")
         for w in (self.name, self.device, self.mode, self.audio_only, self.include_lrc,
-                  self.autosync, self.method, self.filesystem, self.transcode,
-                  self.transcode_bitrate, self.selection_mode):
+                  self.verify_after, self.autosync, self.method, self.filesystem,
+                  self.transcode, self.transcode_bitrate, self.selection_mode):
             w.blockSignals(False)
         for w in (self.sources_list, self.source_add, self.source_remove):
             w.setEnabled(p is not None)
@@ -21358,8 +24982,8 @@ class SyncTab(QWidget):
             return
         before = (p.device_id, tuple(profile_sources(p)), p.selection_mode, p.target,
                   p.music_folder, p.audiobook_folder, p.podcast_folder,
-                  p.mode, p.method, p.audio_only, p.include_lrc, p.filesystem,
-                  p.transcode, p.transcode_mode, p.transcode_quality)
+                  p.mode, p.method, p.audio_only, p.include_lrc, p.verify_after,
+                  p.filesystem, p.transcode, p.transcode_mode, p.transcode_quality)
         was_auto = p.autosync
         dev = self.device.currentData()
         if dev == "__folder__":
@@ -21384,11 +25008,12 @@ class SyncTab(QWidget):
             p.transcode_mode, p.transcode_quality = "", 0
         p.audio_only = self.audio_only.isChecked()
         p.include_lrc = self.include_lrc.isChecked()
+        p.verify_after = self.verify_after.isChecked()
         p.autosync = self.autosync.isChecked()
         if before != (p.device_id, tuple(profile_sources(p)), p.selection_mode, p.target,
                       p.music_folder, p.audiobook_folder, p.podcast_folder,
-                      p.mode, p.method, p.audio_only, p.include_lrc, p.filesystem,
-                      p.transcode, p.transcode_mode, p.transcode_quality):
+                      p.mode, p.method, p.audio_only, p.include_lrc, p.verify_after,
+                      p.filesystem, p.transcode, p.transcode_mode, p.transcode_quality):
             self.plan = None  # the reviewed list no longer matches these settings
         save_profiles(self.profiles)
         item = self.plist.currentItem()
@@ -21420,7 +25045,7 @@ class SyncTab(QWidget):
             return
         self.autosync_queue.insert(0, profile)
         self._autosync_waiting.discard(profile.id)
-        self.log.appendPlainText(f"— Autosync turned on: {profile.name} —")
+        self.log.appendPlainText(f"- Autosync turned on: {profile.name} -")
         self._next_autosync()
 
     def _drop_autosync(self, profile):
@@ -21428,7 +25053,7 @@ class SyncTab(QWidget):
         while profile in self.autosync_queue:
             self.autosync_queue.remove(profile)
         self._autosync_waiting.discard(profile.id)
-        self.log.appendPlainText(f"— Autosync turned off: {profile.name} —")
+        self.log.appendPlainText(f"- Autosync turned off: {profile.name} -")
         self._next_autosync()
         devices = getattr(self.window(), "devices_tab", None)
         if devices is not None:
@@ -21592,7 +25217,7 @@ class SyncTab(QWidget):
             for prof in gone:
                 self.autosync_queue.remove(prof)
                 self._autosync_waiting.discard(prof.id)
-                self.log.appendPlainText(f"— {prof.name}: device went away, autosync skipped —")
+                self.log.appendPlainText(f"- {prof.name}: device went away, autosync skipped -")
         self._next_autosync()
 
     def _device_of(self, profile):
@@ -21677,7 +25302,7 @@ class SyncTab(QWidget):
                     self._autosync_waiting.add(prof.id)
                     name = dev.name if dev else "the device"
                     self.log.appendPlainText(
-                        f"— Waiting for {name}: switch the phone to file transfer —")
+                        f"- Waiting for {name}: switch the phone to file transfer -")
                     self._notify(f"Autosync {prof.name}: waiting for {name}")
                     self.activity.emit(f"Waiting for {name}")
                 break
@@ -21689,7 +25314,7 @@ class SyncTab(QWidget):
                 break
             self.autosync_queue.pop(0)
             self._autosync_waiting.discard(prof.id)
-            self.log.appendPlainText(f"— Autosync: {prof.name} —")
+            self.log.appendPlainText(f"- Autosync: {prof.name} -")
             self._notify(f"Autosyncing {prof.name}…")
             self.run(sync=True, profile=prof, auto=True)
             return
@@ -21768,8 +25393,8 @@ class SyncTab(QWidget):
         if not reuse_plan:
             self._verify_stats = {}
         if p.method == "bytes" and getattr(b.device, "kind", "") == "mtp":
-            self.log.appendPlainText("— Bit-by-bit reads every file on the phone in full; "
-                                     "this can take a while —")
+            self.log.appendPlainText("- Bit-by-bit reads every file on the phone in full; "
+                                     "this can take a while -")
 
         def job(prog, log, cancel):
             # The device has one reader: wait for the library read the Devices tab had
@@ -21786,7 +25411,8 @@ class SyncTab(QWidget):
                 self._verify_stats = stats
             if not sync or cancel():
                 return plan, None
-            return plan, execute(p, b, plan, prog, log, cancel)
+            return plan, execute(p, b, plan, prog, log, cancel,
+                                 verify=bool(getattr(p, "verify_after", False)))
 
         # The device is this task's alone before the worker starts: the Devices tab
         # stops reading it now and stays locked out until this run is done, failed or
@@ -21858,7 +25484,7 @@ class SyncTab(QWidget):
         read = int(stats.get("device_read") or 0)
         unreadable = int(stats.get("device_unreadable") or 0)
         matches = int(stats.get("matches") or 0)
-        self._show_plan(plan, p.method, verify)
+        self._show_plan(plan, p.method, verify, preview=not sync, target=p.target)
         # Say plainly how much the equal results were checked, never more than was done.
         if p.method == "bytes":
             self.status.setText("Bit-by-bit: every matched file was compared byte for byte.")
@@ -21881,6 +25507,19 @@ class SyncTab(QWidget):
             self.status.setText("Fast hash: Compares hashes of manifest and library; "
                                 "not exact.")
         self._record_log(plan, p, sync, verify, errors)
+        if sync:
+            # The log is usually tucked away; on a failure the ERROR lines are the
+            # only place that names the files, so bring them into view.
+            self.log.setVisible(bool(errors))
+        if sync and getattr(p, "verify_after", False):
+            if errors:
+                self.status.setText(
+                    f"Sync finished with {errors} error(s); the copied files were read "
+                    f"back. The failed files are listed below.")
+            else:
+                self.status.setText(
+                    "Sync finished: every copied file was read back from the device and "
+                    "verified.")
         stamp = time.strftime("%Y-%m-%d %H:%M")
         for q in self.profiles:
             if q.id == p.id:
@@ -21910,8 +25549,8 @@ class SyncTab(QWidget):
                 else:
                     detail = (f"read and hashed {files} file(s); "
                               f"{matches} match the library exactly")
-                self.log.appendPlainText(f"— Verify content: {detail}; "
-                                         f"the manifest records what was read —")
+                self.log.appendPlainText(f"- Verify content: {detail}; "
+                                         f"the manifest records what was read -")
         devices = getattr(self.window(), "devices_tab", None)
         self._release_device()
         self._refresh_device_status()
@@ -22023,14 +25662,19 @@ class SyncTab(QWidget):
         }
         log_sync_run(profile, entry, self._log_keep())
 
-    def _show_plan(self, plan, method="bytes", verify=False):
-        """Draw the plan in titled groups, so a big list says what changed at a glance."""
+    def _show_plan(self, plan, method="bytes", verify=False, preview=False, target=""):
+        """Draw the plan in titled groups, so a big list says what changed at a glance.
+
+        preview=True marks a Compare result, which has not touched the device yet.
+        target is the selected device folder; showing it makes the destination path
+        exact instead of relative to that folder.
+        """
         self.table.setRowCount(0)
         self.table.clearSpans()
         groups = (("new", "New files"),
-                  ("restore", "Missing on the device — copied back"),
-                  ("changed", "Changed — updated on the device"),
-                  ("delete", "Only on the device — removed by Mirror"))
+                  ("restore", "Missing on the device - copied back"),
+                  ("changed", "Changed - updated on the device"),
+                  ("delete", "Only on the device - removed by Mirror"))
         shown = 0
         for kind, title in groups:
             rows = sorted((a for a in plan if a.kind == kind), key=lambda a: a.rel.lower())
@@ -22048,31 +25692,41 @@ class SyncTab(QWidget):
             head.setBackground(QBrush(QColor(HOVER)))
             head.setFlags(Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(r, 0, head)
-            self.table.setSpan(r, 0, 1, 3)
+            self.table.setSpan(r, 0, 1, 4)
             self.table.setRowHeight(r, 30)
             for a in rows:
                 r = self.table.rowCount()
                 self.table.insertRow(r)
                 label = {"new": "＋ copy new", "restore": "↺ restore missing",
                          "changed": "✎ update", "delete": "✕ delete"}[a.kind]
-                for c, value in enumerate((label, a.rel, f"{a.size / 1048576:.1f} MB")):
+                dest = "/".join(part for part in (str(target or "").strip("/"),
+                                                  a.dev or a.rel) if part)
+                for c, value in enumerate((label, a.rel, dest,
+                                           f"{a.size / 1048576:.1f} MB")):
                     item = QTableWidgetItem(value)
                     if c == 0:
                         item.setForeground(QBrush(QColor(COLORS[a.kind])))
-                    if c == 2:
+                    if c in (1, 2):
+                        if a.kind == "delete":
+                            item.setToolTip("Device file: " + dest)
+                        else:
+                            item.setToolTip("Library file: " + a.rel + "\nOn the device: "
+                                            + dest)
+                    if c == 3:
                         item.setTextAlignment(Qt.AlignmentFlag.AlignRight
                                               | Qt.AlignmentFlag.AlignVCenter)
                     self.table.setItem(r, c, item)
                 shown += 1
         if not shown:
             self.table.insertRow(0)
-            item = QTableWidgetItem("Nothing to change — the device already matches this "
+            item = QTableWidgetItem("Nothing to change - the device already matches this "
                                     "profile's library.")
             item.setForeground(QBrush(QColor(MUTED)))
             self.table.setItem(0, 0, item)
-            self.table.setSpan(0, 0, 1, 3)
+            self.table.setSpan(0, 0, 1, 4)
             self.table.setRowHeight(0, 34)
-        self.summary.setText(self._plan_summary(plan, method, verify))
+        self.summary.setText(("Preview · " if preview else "")
+                             + self._plan_summary(plan, method, verify))
 # ======================================================================
 # main.py
 # ======================================================================
@@ -22920,10 +26574,11 @@ class AudiobooksTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_SHORT} {VERSION}")
+        self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(ICON_FILE))
         self.config = load_config()
         migrate_collections(self.config)
+        self._sleep_timer = QTimer(self, singleShot=True, timeout=self._sleep_fire)
         apply_theme(QApplication.instance(), self.config)
         w, h = self.config.get("window") or [1360, 860]
         self.resize(int(w), int(h))
@@ -22988,14 +26643,19 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_shortcuts()
         self._build_tray()
+        self.player.track_changed.connect(self._track_notification)
+        self.player.lyrics_requested.connect(self.open_lyrics)
         self.statusBar().showMessage("Ready")
 
         # restore the last queue (without starting playback)
         queue = [p for p in (self.config.get("queue") or []) if os.path.exists(p)]
         if queue:
             restore_device_queue_entries(queue)
-            idx = int(self.config.get("queue_index", -1))
+            last = self.config.get("last_track") or ""
+            idx = queue.index(last) if last in queue else int(self.config.get("queue_index", -1))
             self.player.set_queue(queue, idx if 0 <= idx < len(queue) else None)
+            if last in queue:
+                self.player.set_resume(last, self.config.get("last_position") or 0)
 
         # device watcher: poll every second (cheap: just lists gvfs + /media)
         self._known = {}
@@ -23033,6 +26693,7 @@ class MainWindow(QMainWindow):
             action = as_menu.addAction(label, lambda _c=False, m=key:
                                        self.library_tab.play_selection_as(m))
             action.setStatusTip(hint)
+        music.addAction("Play random album", self.library_tab.play_random_album)
         music.addAction("Clear queue", self.library_tab.clear_queue)
         music.addSeparator()
         music.addAction("Quit", self.close, "Ctrl+Q")
@@ -23057,6 +26718,7 @@ class MainWindow(QMainWindow):
 
         tools = QMenu("&Tools", bar)
         tools.addAction("Tag editor", lambda: self.tabs.setCurrentWidget(self.tagger_tab))
+        tools.addAction("Lyrics editor…", self.open_lyrics_editor)
         tools.addAction("Devices", lambda: self.tabs.setCurrentWidget(self.devices_tab))
         tools.addAction("Syncing", lambda: self.tabs.setCurrentWidget(self.sync_tab))
         tools.addAction("Audio CD", self.show_disc_tab)
@@ -23068,13 +26730,33 @@ class MainWindow(QMainWindow):
         tools.addAction("Rescan library", self.library_tab.rescan)
         self._menu_sets["library"].append(tools)
 
+        playback = QMenu("&Playback", bar)
+        self._playback_after = playback.addAction("Stop after this track")
+        self._playback_after.setCheckable(True)
+        self._playback_after.setChecked(self.player.stop_after)
+        self._playback_after.setToolTip("Stop playback when the current track ends")
+        self._playback_after.toggled.connect(self.player.set_stop_after)
+        self._playback_gapless = playback.addAction("Gapless playback")
+        self._playback_gapless.setCheckable(True)
+        self._playback_gapless.setChecked(self.player.gapless)
+        self._playback_gapless.setToolTip(
+            "Start the next track with no gap; a crossfade overrides this while it is on")
+        self._playback_gapless.toggled.connect(self.player.set_gapless)
+        self._playback_crossfade = playback.addAction("Crossfade…", self.open_crossfade)
+        self._playback_crossfade.setToolTip("Overlap the end of one track with the next")
+        playback.addSeparator()
+        playback.addAction("Sleep timer…", self._set_sleep_timer)
+        playback.addAction("Cancel sleep timer", self._cancel_sleep_timer)
+        playback.aboutToShow.connect(self._sync_playback_menu)
+        self._menu_sets["library"].append(playback)
+
         help_menu = QMenu("&Help", bar)
         help_menu.addAction("Keyboard shortcuts", self._show_shortcuts)
         help_menu.addAction(f"About {APP_SHORT}", self._about)
         self._menu_sets["library"].append(help_menu)
 
         # On the Audiobooks tab this replaces the Music menu, so it sits next to Playlist.
-        self._menu_sets["audiobooks"] = [audiobooks, playlist, tools, help_menu]
+        self._menu_sets["audiobooks"] = [audiobooks, playlist, tools, playback, help_menu]
 
         # ---- mp3tag's tag-editor menu bar (shown while the Tags tab is active)
         file_menu = QMenu("&File", bar)
@@ -23206,6 +26888,46 @@ class MainWindow(QMainWindow):
     def _open_preferences(self):
         PreferencesDialog(self.library_tab, self).exec()
 
+    def _sync_playback_menu(self):
+        """Keep the Playback menu showing what the player is actually set to."""
+        if not hasattr(self, "_playback_after"):
+            return
+        for action, checked in ((self._playback_after, self.player.stop_after),
+                                (self._playback_gapless, self.player.gapless)):
+            action.blockSignals(True)
+            action.setChecked(bool(checked))
+            action.blockSignals(False)
+        seconds = self.player.crossfade_seconds
+        self._playback_crossfade.setText(
+            "Crossfade…" + (f" ({seconds:.1f} s)" if seconds > 0 else ""))
+
+    def open_crossfade(self):
+        dialog = getattr(self, "_crossfade_dialog", None)
+        if dialog is None:
+            dialog = CrossfadeDialog(self.player, self)
+            self._crossfade_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def open_lyrics(self):
+        dialog = getattr(self, "_lyrics_dialog", None)
+        if dialog is None:
+            dialog = LyricsDialog(self.player, self.config, self)
+            self._lyrics_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def open_lyrics_editor(self):
+        dialog = getattr(self, "_lyrics_editor", None)
+        if dialog is None:
+            dialog = LyricsEditorDialog(self.library, self.config, self.player, self)
+            self._lyrics_editor = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _open_playlist_dir(self):
         try:
             subprocess.Popen(["xdg-open", PLAYLIST_DIR])
@@ -23215,11 +26937,11 @@ class MainWindow(QMainWindow):
     def _show_shortcuts(self):
         QMessageBox.information(
             self, "Keyboard shortcuts",
-            "Space — play / pause\nCtrl+← / Ctrl+→ — previous / next track\n"
-            "Ctrl+O — add a music folder / open a folder in the tag editor\n"
-            "Ctrl+F — search the library / filter the tag list\n"
-            "Ctrl+S — save the queue as a playlist / save tags\n"
-            "Ctrl+Z / Ctrl+Y — undo / redo\nCtrl+Q — quit\n\n"
+            "Space - play / pause\nCtrl+← / Ctrl+→ - previous / next track\n"
+            "Ctrl+O - add a music folder / open a folder in the tag editor\n"
+            "Ctrl+F - search the library / filter the tag list\n"
+            "Ctrl+S - save the queue as a playlist / save tags\n"
+            "Ctrl+Z / Ctrl+Y - undo / redo\nCtrl+Q - quit\n\n"
             "Tags tab: Del removes files from the list, Ctrl+C / Ctrl+V copy and paste tags "
             "between files, Alt+1 / Alt+2 convert between filename and tags, Ctrl+M looks "
             "up MusicBrainz, Ctrl+R reverts, F5 reloads them from disk.\n\n"
@@ -23239,6 +26961,7 @@ class MainWindow(QMainWindow):
             "<a href=\"https://www.strawberrymusicplayer.org/#sponsorus\">Strawberry "
             "Music Player</a><br>"
             "<a href=\"https://freefilesync.org/download.php\">FreeFileSync</a><br>"
+            "<a href=\"https://subtitletools.com/premium\">Subtitle Tools</a><br>"
             "____________________________________________________________________________________<br>"
             "Buy me a coffee: Temporarily unavailable.</p>"
             f"<p>Copyright (C) 2026 Roger Barthares.</p>"
@@ -23303,9 +27026,6 @@ class MainWindow(QMainWindow):
         self._tray_prev = menu.addAction("Previous track", self.player.prev)
         self._tray_play = menu.addAction("Play", self.player.toggle)
         self._tray_stop = menu.addAction("Stop", self.player.stop)
-        self._tray_after = menu.addAction("Stop after this track")
-        self._tray_after.setCheckable(True)
-        self._tray_after.toggled.connect(self._tray_stop_after)
         self._tray_next = menu.addAction("Next track", lambda: self.player.next())
         menu.addSeparator()
         self._tray_mute = menu.addAction("Mute")
@@ -23325,17 +27045,39 @@ class MainWindow(QMainWindow):
             return
         playing = self.player.player.playbackState() == QMediaPlayer.PlayingState
         self._tray_play.setText("Pause" if playing else "Play")
-        for action, checked in ((self._tray_after, self.player.stop_after_btn.isChecked()),
-                                (self._tray_mute, self.player.audio.isMuted())):
-            action.blockSignals(True)
-            action.setChecked(checked)
-            action.blockSignals(False)
-
-    def _tray_stop_after(self, checked):
-        self.player.stop_after_btn.setChecked(bool(checked))
+        self._tray_mute.blockSignals(True)
+        self._tray_mute.setChecked(self.player.audio.isMuted())
+        self._tray_mute.blockSignals(False)
 
     def _tray_mute_toggled(self, checked):
-        self.player.audio.setMuted(bool(checked))
+        self.player.set_muted(bool(checked))
+
+    def _track_notification(self, path):
+        """A quiet desktop notification when a new track starts outside the window."""
+        if not path or is_cd_entry(path) or is_device_entry(path) or self.isActiveWindow():
+            return
+        tags = read_tags(path)
+        title = tags.get("title") or os.path.basename(path)
+        artist = tags.get("artist") or tags.get("albumartist")
+        self.notify("Playing: " + (f"{artist} - {title}" if artist else title))
+
+    def _set_sleep_timer(self):
+        minutes, ok = QInputDialog.getInt(
+            self, "Sleep timer", "Pause playback after (minutes):", 30, 1, 600, 5)
+        if not ok:
+            return
+        self._sleep_timer.start(int(minutes) * 60 * 1000)
+        self.notify(f"Sleep timer: {minutes} minute(s)")
+
+    def _cancel_sleep_timer(self):
+        if self._sleep_timer.isActive():
+            self._sleep_timer.stop()
+            self.notify("Sleep timer cancelled")
+
+    def _sleep_fire(self):
+        if self.player.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause_playback()
+        self.notify("Sleep timer: playback paused")
 
     def _show_from_tray(self):
         self.showNormal()
@@ -23668,6 +27410,7 @@ class MainWindow(QMainWindow):
         self.library_tab.library = self.library
         self.devices_tab.library = self.library
         self.library_tab.reset_after_collection_change()
+        self.library_tab._refresh_watcher()
         self.devices_tab.reload()
         self.notify("Collection: %s" % cols[index]["name"])
 
@@ -23700,6 +27443,10 @@ class MainWindow(QMainWindow):
         store_active_collection(self.config)
         self.config["tab"] = self.tabs.currentIndex()
         self.config["window"] = [self.width(), self.height()]
+        path = self.player.current_path()
+        if path and not is_cd_entry(path) and not is_device_entry(path):
+            self.config["last_track"] = path
+            self.config["last_position"] = int(self.player.player.position())
         save_config(self.config)
         super().closeEvent(e)
 

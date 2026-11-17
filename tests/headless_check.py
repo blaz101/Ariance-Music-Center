@@ -380,7 +380,7 @@ check("Nebula logo fills the tab row height",
       (logo_widget.height(), w.tabs.tabBar().sizeHint().height(),
        logo_widget.pixmap().height() if logo_widget.pixmap() else None))
 check("the title bar uses the short name, the About box the full one",
-      w.windowTitle() == f"Nebula {nebula.VERSION}"
+      w.windowTitle() == nebula.APP_NAME
       and nebula.APP_SHORT == "Nebula" and nebula.APP_NAME == "Nebula Music Center",
       f"{w.windowTitle()!r} {nebula.APP_SHORT!r} {nebula.APP_NAME!r}")
 
@@ -390,7 +390,7 @@ def menu_titles():
 
 
 check("library tab uses the player menus",
-      menu_titles() == ["Music", "Playlist", "Tools", "Help"], menu_titles())
+      menu_titles() == ["Music", "Playlist", "Tools", "Playback", "Help"], menu_titles())
 w.tabs.setCurrentWidget(w.tagger_tab)
 app.processEvents()
 check("tags tab swaps to mp3tag's menus",
@@ -450,8 +450,8 @@ check("tag shortcuts live on the mp3tag menu set",
        if a.text() == "Save tag"] == ["Ctrl+S"])
 w.tabs.setCurrentWidget(w.library_tab)
 app.processEvents()
-check("switching back restores Music/Playlist/Tools/Help",
-      menu_titles() == ["Music", "Playlist", "Tools", "Help"], menu_titles())
+check("switching back restores Music/Playlist/Tools/Playback/Help",
+      menu_titles() == ["Music", "Playlist", "Tools", "Playback", "Help"], menu_titles())
 check("Ctrl+S follows the active menu set",
       not any(a.text() == "Save tag" and a.shortcut().toString()
               for a in tag_menus["File"].actions())
@@ -704,7 +704,7 @@ except OSError:
     pass
 
 # Double-clicking means what the library's double-click means, and it means the
-# album from that track on — never the whole device.
+# album from that track on - never the whole device.
 seen = []
 real_play = dev.play_paths
 dev.play_paths = lambda paths, queue=False: seen.append((list(paths), queue))
@@ -1736,7 +1736,7 @@ try:
     check("and deletes the copy buffered from the phone",
           not os.path.exists(mtp_cached), mtp_cached)
     check("the disconnected tab names the device plainly and claims no false disconnect",
-          dev.info.text() == "<b>Nebula Phone</b> — not connected"
+          dev.info.text() == "<b>Nebula Phone</b> - not connected"
           and "disconnected" not in dev.info.text().lower()
           and not [l for l in dev.dev_bar.findChildren(nebula.QLabel)
                    if "No device" in l.text()],
@@ -2180,7 +2180,7 @@ check("Stop clears the spectrum analyser",
 
 pm = QPixmap(300, 300)
 pm.fill(QColor("#328fba"))
-viewer = nebula.CoverViewer(pm, "Gamma", "Boards of Canada — Music Has the Right", w)
+viewer = nebula.CoverViewer(pm, "Gamma", "Boards of Canada - Music Has the Right", w)
 viewer.show()
 check("cover viewer renders", not viewer.grab().isNull())
 viewer.close()
@@ -2573,7 +2573,7 @@ check("FAT32 also drops a control character and trims a trailing space or dot",
       (nebula.device_rel("A/we\x01ird.mp3"), nebula.device_rel("A/track "),
        nebula.device_rel("A/track..")))
 check("FAT32 keeps everything else, a space before the extension included",
-      nebula.device_rel("A/01 - Tráck – em—dash.flac") == "A/01 - Tráck – em—dash.flac"
+      nebula.device_rel("A/01 - Tráck – em-dash.flac") == "A/01 - Tráck – em-dash.flac"
       and nebula.device_rel("A/track .mp3") == "A/track .mp3")
 star_name_rel = "Artist - X/Album 1/01 - VAMPIRE - DECO*27.m4a"
 check("exFAT and MTP keep a reserved character, name for name",
@@ -3010,7 +3010,7 @@ check("the restore brings the PC copy back to the device",
 
 # Verify content indexes the whole device folder, not only the files this profile syncs:
 # a file put on the device by hand gets a record of its own content, and the manifest
-# ends up describing what the device holds — with no timestamp in it at all.
+# ends up describing what the device holds - with no timestamp in it at all.
 hand_rel = "ripped-by-hand.wav"
 hand_dev = os.path.join(hdst, "Music", hand_rel)
 with open(hand_dev, "wb") as f:
@@ -3486,7 +3486,7 @@ check("a bit-by-bit sync adds no last-verified note: that compare was exact",
       (dot(), lp.last_sync_method))
 
 # In Fast hash the manifest is trusted, so the line says when the device contents were
-# last read in full — and says plainly when they never were.
+# last read in full - and says plainly when they never were.
 section("sync tab: last verified")
 hp = nebula.Profile(name="Phone", device_id=f"folder:{hdst}", source=hsrc, target="Music",
                      method="hash", mode="update", last_sync="2026-10-27 09:00",
@@ -4584,11 +4584,11 @@ check("top rated first", order_paths("top_rated") == ["a2", "b2", "a1", "b1"],
       order_paths("top_rated"))
 
 dialog = nebula.PreferencesDialog(tab, w)
-check("preferences has theme, library, audiobooks, devices, playback, sync, backup, CD and identification pages",
-      dialog.sidebar.count() == 9 and dialog.pages.count() == 9
-      and [dialog.sidebar.item(i).text() for i in range(9)]
+check("preferences has theme, library, audiobooks, devices, playback, sync, backup, CD, identification and lyrics pages",
+      dialog.sidebar.count() == 10 and dialog.pages.count() == 10
+      and [dialog.sidebar.item(i).text() for i in range(10)]
       == ["Theme", "Library", "Audiobooks", "Devices", "Playback", "Syncing",
-          "Backup", "Audio CD", "Identification"],
+          "Backup", "Audio CD", "Identification", "Lyrics"],
       [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())])
 combo = dialog.widgets["shuffle_mode"]
 combo.setCurrentIndex(combo.findData("least_played"))
@@ -5256,7 +5256,7 @@ nebula.mb_get = fake_musicbrainz(by_disc_id=True)[0]
 nebula.cdparanoia_rip = fake_cdparanoia_rip
 try:
     # The watcher thread runs between the lines above, so it may have read the real drive
-    # before the fake table of contents went in — and a real read that failed holds that
+    # before the fake table of contents went in - and a real read that failed holds that
     # drive in its retry cooldown, which would swallow this poll. Starting the disc from a
     # clean slate keeps a real drive in the machine from deciding the result.
     w._cd_watcher.pause()
