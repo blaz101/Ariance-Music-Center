@@ -646,6 +646,24 @@ check("the main window is titled Ariance Music Center",
 titles = [w.tabs.tabText(i) for i in range(w.tabs.count())]
 check("the tabs are Music, Audiobooks, Tags, Devices, Syncing",
       titles == ["Music", "Audiobooks", "Tags", "Devices", "Syncing"], titles)
+# A window that insists on being taller than the display gets its bottom cut off:
+# the Syncing form alone used to force 1017 px, more than a 1000 px screen.
+check("the window's minimum fits a 1366x768 laptop",
+      w.minimumSizeHint().height() <= 700, w.minimumSizeHint().height())
+check("the Syncing page scrolls instead of forcing the window taller",
+      w.tabs.widget(4).minimumSizeHint().height() < 200,
+      w.tabs.widget(4).minimumSizeHint().height())
+_screen = ariance.QApplication.primaryScreen().availableGeometry()
+w.config["window"] = [9999, 9999]
+w._restore_window_size()
+check("a saved window larger than the screen is clamped to it",
+      w.width() <= _screen.width() and w.height() <= _screen.height(),
+      (w.width(), w.height(), _screen.width(), _screen.height()))
+w.config["window"] = [1360, 860]
+w._restore_window_size()
+w.resize(1200, 700)
+check("the window can be made 700 px tall", w.height() == 700, w.height())
+w.resize(1360, 860)
 w.library_tab.refresh()
 w.audiobooks_tab.refresh()
 app.processEvents()

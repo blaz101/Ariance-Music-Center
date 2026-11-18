@@ -24672,9 +24672,17 @@ class SyncTab(QWidget):
         split.addWidget(left)
         split.addWidget(right)
         split.setSizes([240, 1000])
+        # The form is taller than a small laptop screen. Let the page scroll rather
+        # than handing that height to the window, which would then refuse to fit a
+        # display shorter than the whole form (the status bar and player bar got
+        # cut off on a 1000 px screen).
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        page.setFrameShape(QFrame.NoFrame)
+        page.setWidget(split)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
-        lay.addWidget(split)
+        lay.addWidget(page)
         self._reload_list()  # selects the first profile, which sets Verify content up
 
     # ---------- profiles ----------
@@ -27679,8 +27687,7 @@ class MainWindow(QMainWindow):
         migrate_collections(self.config)
         self._sleep_timer = QTimer(self, singleShot=True, timeout=self._sleep_fire)
         apply_theme(QApplication.instance(), self.config)
-        w, h = self.config.get("window") or [1360, 860]
-        self.resize(int(w), int(h))
+        self._restore_window_size()
         self.library = Library(active_collection(self.config)["db"])
         self.playlists = PlaylistStore(lambda: self.config["library_folders"])
         self.smart = SmartStore(self.library)
@@ -27769,6 +27776,26 @@ class MainWindow(QMainWindow):
 
         if not self.config["library_folders"]:
             QTimer.singleShot(400, self._first_run)
+
+    def _restore_window_size(self):
+        """Open at the size the window was left, but never larger than this screen.
+
+        The saved size can come from a bigger monitor, and the common laptop is
+        1366x768 with a 1024x600 netbook still around. A window taller than the
+        display puts its status bar and player bar off the bottom of the screen, so
+        the saved size is cut down to the available area first.
+        """
+        try:
+            saved = self.config.get("window") or [1360, 860]
+            w, h = int(saved[0]), int(saved[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            w, h = 1360, 860
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        if avail is not None and avail.width() > 0 and avail.height() > 0:
+            w = min(w, avail.width())
+            h = min(h, avail.height())
+        self.resize(max(w, 320), max(h, 240))
 
     # ---------------- menus ----------------
     def _build_menus(self):
