@@ -1,4 +1,4 @@
-"""Render Nebula UI screenshots offscreen with a generated demo library.
+"""Render Ariance UI screenshots offscreen with a generated demo library.
 
 QT_QPA_PLATFORM=offscreen python3 tests/make_screenshots.py
 Writes artifacts/*.png
@@ -10,7 +10,7 @@ import sys
 import tempfile
 import wave
 
-HOME = tempfile.mkdtemp(prefix="nebula-shots-")
+HOME = tempfile.mkdtemp(prefix="ariance-shots-")
 os.environ["HOME"] = HOME
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +23,7 @@ from mutagen.flac import FLAC, Picture  # noqa: E402
 from mutagen.id3 import APIC, TALB, TCON, TDRC, TIT2, TPE1, TRCK  # noqa: E402
 from mutagen.wave import WAVE  # noqa: E402
 
-import nebula  # noqa: E402
+import ariance  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QLinearGradient, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -34,7 +34,7 @@ MUSIC = os.path.join(HOME, "Music")
 os.makedirs(MUSIC, exist_ok=True)
 
 app = QApplication([])
-nebula.install_app_style(app)
+ariance.install_app_style(app)
 
 # the sandbox has no system fonts; borrow DejaVu from matplotlib so text renders
 _MPL_FONTS = [
@@ -134,14 +134,14 @@ for artist, album, year, genre, titles, pi in ALBUMS:
             write_wav(path, 4, title, artist, album, idx, year, genre, cover)
         demo_paths.append(path)
 
-cfg = nebula.load_config()
+cfg = ariance.load_config()
 cfg["library_folders"] = [MUSIC]
 cfg["volume"] = 64
 cfg["split"] = [760, 640]
 cfg["lib_columns"] = ["title", "artist", "album", "length", "year", "rating"]
-nebula.save_config(cfg)
+ariance.save_config(cfg)
 
-library = nebula.Library()
+library = ariance.Library()
 library.scan([MUSIC])
 
 # ratings, plays and a couple of loved tracks so the columns mean something
@@ -156,7 +156,7 @@ for i, row in enumerate(library.tracks()):
     for _ in range((i * 3) % 7):
         library.play_count(row["path"])
 
-w = nebula.MainWindow()
+w = ariance.MainWindow()
 w.resize(1440, 900)
 tab = w.library_tab
 tab.refresh()
@@ -178,7 +178,7 @@ w.player.play_index(2)
 w.player.spectrum.set_playing(True)
 for _ in range(4):
     w.player.spectrum.push_levels([0.25 + 0.6 * ((i * 7) % 11) / 11
-                                   for i in range(nebula.SPECTRUM_BANDS)])
+                                   for i in range(ariance.SPECTRUM_BANDS)])
 
 w.show()
 app.processEvents()
@@ -222,7 +222,7 @@ tab.config["lib_columns"] = ["title", "artist", "album", "length", "year", "rati
 tab.grouping.setCurrentIndex(tab.grouping.findData("artist_album"))
 tab.refresh()
 
-group_dialog = nebula.GroupByDialog(tab, ["genre", "decade", "album"],
+group_dialog = ariance.GroupByDialog(tab, ["genre", "decade", "album"],
                                      [{"name": "By decade", "levels": ["decade", "album"]},
                                       {"name": "Genre / artist", "levels": ["genre", "artist"]}])
 group_dialog.resize(470, 520)
@@ -237,11 +237,11 @@ shot("smart.png")
 # real MusicBrainz lookup, when the network is available
 tab.set_view("collection")
 online_rows = [r for r in library.tracks() if r["album"] == "Black Sands"][:1]
-online = nebula.OnlineLookupDialog(online_rows, library, w)
+online = ariance.OnlineLookupDialog(online_rows, library, w)
 online.show()
 app.processEvents()
 try:
-    online._show_results(nebula.mb_search_releases("Bonobo", "Black Sands"))
+    online._show_results(ariance.mb_search_releases("Bonobo", "Black Sands"))
     import time as _time
     for _ in range(300):
         app.processEvents()
@@ -263,7 +263,7 @@ except Exception as exc:  # network blocked in this sandbox
 online.close()
 
 tab.set_view("collection")
-dialog = nebula.CoverViewer(w.player._cover_bytes(w.player.current_path()),
+dialog = ariance.CoverViewer(w.player._cover_bytes(w.player.current_path()),
                              "Teardrop", "Massive Attack - Mezzanine", w)
 dialog.resize(760, 760)
 dialog.show()

@@ -1,10 +1,20 @@
 #!/bin/sh
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-# Nebula launcher: uses the PySide6 and libraries bundled next to this script.
+# Ariance launcher: uses the PySide6 and libraries bundled next to this script.
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CACHE_ROOT=${NEBULA_CACHE:-$HOME/.cache/Nebula}
-DATA_ROOT=${NEBULA_DATA:-$HOME/Nebula}
+CACHE_ROOT=${ARIANCE_CACHE:-$HOME/.cache/Ariance}
+DATA_ROOT=${ARIANCE_DATA:-$HOME/Ariance}
+
+# Up to 1.29 the app was called Nebula. Move an existing library to the new name
+# once, so tags and playlists are kept. A failed move leaves the old folder in
+# use, which is why the roots above are only defaults.
+if [ -z "${ARIANCE_DATA:-}" ] && [ ! -e "$DATA_ROOT" ] && [ -d "$HOME/Nebula" ]; then
+    mv "$HOME/Nebula" "$DATA_ROOT" 2>/dev/null || DATA_ROOT=$HOME/Nebula
+fi
+if [ -z "${ARIANCE_CACHE:-}" ] && [ ! -e "$CACHE_ROOT" ] && [ -d "$HOME/.cache/Nebula" ]; then
+    mv "$HOME/.cache/Nebula" "$CACHE_ROOT" 2>/dev/null || CACHE_ROOT=$HOME/.cache/Nebula
+fi
 mkdir -p "$CACHE_ROOT/tmp" "$DATA_ROOT"
 
 # The native GTK file chooser reads GTK_THEME, not Qt's palette. Some desktops
@@ -27,7 +37,7 @@ fi
 
 
 # Keep caches and scratch files made by Qt, fontconfig, Mesa and child tools in
-# the Nebula cache. XDG_CONFIG_HOME and XDG_DATA_HOME are deliberately left at
+# the Ariance cache. XDG_CONFIG_HOME and XDG_DATA_HOME are deliberately left at
 # the desktop's own values: the native GTK chooser reads the system's user
 # folders, bookmarks, recent files and GTK settings from them.
 XDG_CACHE_HOME=$CACHE_ROOT
@@ -39,7 +49,7 @@ export XDG_CACHE_HOME TMPDIR MESA_SHADER_CACHE_DIR
 DIR=$SRC
 
 # An installed package (marked by BUNDLE_VERSION) runs from a copy in the cache
-# folder, so the program, Qt and the libraries all sit in ~/.cache/Nebula. The
+# folder, so the program, Qt and the libraries all sit in ~/.cache/Ariance. The
 # copy is refreshed only when the package version changes.
 if [ -f "$SRC/BUNDLE_VERSION" ]; then
     DIR=$CACHE_ROOT/app
@@ -95,4 +105,4 @@ print("assets  :", "ok" if os.path.isdir(os.path.join(root, "assets", "PySide6",
 PY
 fi
 
-exec "$PYTHON" "$DIR/nebula.py" "$@"
+exec "$PYTHON" "$DIR/ariance.py" "$@"

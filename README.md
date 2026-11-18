@@ -1,37 +1,31 @@
-# Nebula Music Center 1.29
+# Ariance Music Center 1.30
+
+## What's new in 1.30
+
+- **A dedicated audiobook player.** Audiobooks get their own deck instead of
+  borrowing the music player: author and title blocks, the chapter drawer, chapter
+  skipping, and a remembered place in every book - play one, pause, start another,
+  come back, and it carries on where it stopped. Chapters come from the M4B file's
+  own marks or from a folder of chapter files, and both play the same way.
+- **Fixed the settings bug.** A stray defaults write can no longer turn a
+  configured install back into a fresh one.
+- **Full rename.** The app is now Ariance Music Center; the old name was much too
+  crowded. On the first start `~/Nebula` moves to `~/Ariance` and `~/.cache/Nebula`
+  to `~/.cache/Ariance` - nothing is copied or deleted, and if the move fails the
+  old folders keep being used. The package is now `ariance-music-center`, so
+  uninstall the old one before installing this.
 
 ## What's new in 1.29
 
-- **Lyrics support.** Local `.lrc` sidecars and lyrics embedded as ID3 `USLT`,
-  Vorbis `LYRICS` or MP4 `©lyr` are read alongside LRCLIB and lyrics.ovh.
-  Preferences > Lyrics sets the source order and switches each source on or off;
-  LRCLIB can return plain or synchronized lyrics, and a track with more than one
-  match can choose between them.
-- **Full LRC creation and editing.** The player's lyrics button opens a three-line
-  synchronized view with a live countdown through blank timed lines. The Timed
-  Lyrics Editor creates and updates `.lrc` files with Lyrics, Syncer, Preview,
-  Metadata and Save tabs, waveform and transport controls, keyboard timing,
-  per-track and per-line adjustments, and Save/Revert. Its song picker searches the
-  music library and only browses music folders.
-- **Gapless playback.** The next track is loaded on a spare deck before the current
-  one ends, so there is no gap between tracks.
-- **Crossfade.** Playback can overlap the end of one track with the next, with a
-  0-12 second length set from its own dialog. Crossfade takes over gapless while it
-  is on, and the Playback menu shows the current length.
-- **Play random album.** Music > Play random album chooses an album at random and
-  queues it in disc/track order.
-- **Sleep timer.** Playback > Sleep timer pauses after a chosen number of minutes,
-  with Cancel sleep timer.
-- **Automatic library scanning.** Music folders are watched, and a quiet rescan
-  runs when files or folders change; a rescan requested during a running scan is
-  queued instead of dropped.
-- **Verify copies after sync.** A per-profile and per-preset option reads every
-  copied file back from the device and checks its SHA-256, including transcoded
-  copies. A failed check is logged and the copy record is invalidated so the next
-  compare repairs it.
-- **New inspiration credit.** The About window now credits
-  [Subtitle Tools](https://subtitletools.com/premium) alongside Mp3Tag, Strawberry
-  Music Player and FreeFileSync.
+- New Inspiration credit
+- Added lyric support for .lrc, ID3 USLT, Vorbis LYRICS, MP4 ©lyr, LRCLIB, and lyrics.ovh
+- Full LRC creation and editing
+- Gapless playback
+- Crossfade
+- Play albums in random order
+- Sleep timer
+- Auto-scan library folders on change
+- Verify files after sync
 
 ## What's new in 1.28
 
@@ -51,9 +45,9 @@
 
 ## What's new in 1.26
 
-**1.26 is the first official release of Nebula Music Center.**
+**1.26 is the first official release of Ariance Music Center.**
 
-- **GPLv3.** Nebula Music Center is now released under **GPL-3.0-only**. The
+- **GPLv3.** Ariance Music Center is now released under **GPL-3.0-only**. The
   copyright holder is Roger Barthares; the full license is in `LICENSE`.
 - **The source offer is documented.** `SOURCE_OFFER.md` identifies the
   Corresponding Source and the exact upstream source for the bundled libraries.
@@ -68,7 +62,7 @@
 
 Copyright (C) 2026 Roger Barthares.
 
-Nebula Music Center is free software: you can redistribute it and/or modify it
+Ariance Music Center is free software: you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the Free Software
 Foundation, version 3 only.
 
@@ -76,13 +70,13 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
-The full license is in [LICENSE](LICENSE). The Nebula name and logo are covered by
+The full license is in [LICENSE](LICENSE). The Ariance name and logo are covered by
 the separate [TRADEMARK.md](TRADEMARK.md) policy; the GPL does not grant trademark
 rights. Corresponding Source for this release is available from
 [SOURCE_OFFER.md](SOURCE_OFFER.md) and:
 
 ```text
-https://github.com/blaz101/Nebula-Music-Center
+https://github.com/blaz101/Ariance-Music-Center
 ```
 
 ## Run it from the source archive
@@ -90,8 +84,8 @@ https://github.com/blaz101/Nebula-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf nebula-music-center_1.29.orig.tar.xz
-cd nebula-music-center-1.29
+tar -xf ariance-music-center_1.30.orig.tar.xz
+cd ariance-music-center-1.30
 ./run.sh
 ```
 
@@ -108,34 +102,35 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./nebula-music-center_1.29_amd64.deb
-nebula-music-center              # or pick it from the menu
+sudo apt install ./ariance-music-center_1.30_amd64.deb
+ariance-music-center              # or pick it from the menu
 ```
 
-It installs to `/opt/nebula-music-center` with its own Qt, adds
-`/usr/bin/nebula-music-center` and a menu entry, and reads the same
-`~/Nebula` and `~/.cache/Nebula` folders as the source archive - so both ways of
-running it share one library. `apt remove nebula-music-center` takes the
+It installs to `/opt/ariance-music-center` with its own Qt, adds
+`/usr/bin/ariance-music-center` and a menu entry, and reads the same
+`~/Ariance` and `~/.cache/Ariance` folders as the source archive - so both ways of
+running it share one library. `apt remove ariance-music-center` takes the
 program away and leaves your music and settings alone (add `--purge` plus a delete of
-`~/Nebula` and `~/.cache/Nebula` if you want those gone too).
+`~/Ariance` and `~/.cache/Ariance` if you want those gone too).
 
 ## Where everything is kept
 
 ```
-~/Nebula/                                    settings and data
-  settings/   config.json, profiles.json, smart_playlists.json, queue-meta.json
+~/Ariance/                                    settings and data
+  settings/   config.json, audiobooks.json, profiles.json, smart_playlists.json,
+              queue-meta.json
   library/    library.db, collections/, playlists/
   sync/       hashdb/, manifests/
 
-~/.cache/Nebula/                             rebuildable
+~/.cache/Ariance/                             rebuildable
   covers/     artwork cache
   tmp/        cd-buffer/, device-buffer/, cd/, devplay/, rip and burn staging
 ```
 
-The whole of `~/.cache/Nebula` carries a `CACHEDIR.TAG`, so a backup pointed at
-`~/Nebula` is all you need and never walks a buffer. Your music folders stay where
+The whole of `~/.cache/Ariance` carries a `CACHEDIR.TAG`, so a backup pointed at
+`~/Ariance` is all you need and never walks a buffer. Your music folders stay where
 they are; the app only reads them, and only the files above are ever written.
-`NEBULA_DATA=/some/folder` and `NEBULA_CACHE=/some/cache` move the two roots (a
+`ARIANCE_DATA=/some/folder` and `ARIANCE_CACHE=/some/cache` move the two roots (a
 portable install on a stick, or a Flatpak's own directories). Anything in `tmp/`
 untouched for a day is deleted at start-up.
 
@@ -147,7 +142,7 @@ Without the bundle (system PySide6, Qt 6.5+):
 
 ```bash
 pip install -r requirements.txt
-python3 nebula.py
+python3 ariance.py
 ```
 
 Phones (MTP) need `gvfs-backends` (Debian/Ubuntu) or `gvfs-mtp` (Fedora/Arch).
@@ -229,7 +224,7 @@ Search for this, Edit tags, Organize files…, Rescan, Copy path / "Artist -
 Title", Show in file browser, Copy to device, **Look up metadata & cover…**,
 **Analyse ReplayGain**, and **Delete** →
 *Remove from library (keep file)*, *Move file to Trash* or
-*Delete file permanently…*. Trash moves files to `~/Nebula/trash`.
+*Delete file permanently…*. Trash moves files to `~/Ariance/trash`.
 
 **Options menu** (the wrench): music folders, rescan, reset play counts,
 collections, details on/off, column chooser, group by…, saved groupings, locate
@@ -295,8 +290,8 @@ Archive front cover preview. From there:
   artist, year, genre, and - when the file count matches the release - track
   titles, numbers and disc numbers. The library index is refreshed immediately.
 
-No API key is needed. The user agent identifies Nebula Music Center, covers are cached in
-`~/.cache/Nebula/covers`, and network errors are reported in the dialog rather
+No API key is needed. The user agent identifies Ariance Music Center, covers are cached in
+`~/.cache/Ariance/covers`, and network errors are reported in the dialog rather
 than breaking the library. Requests are paced to MusicBrainz's one-per-second
 policy and 429/5xx answers are retried with a short backoff, so a burst of
 searches no longer dies with "HTTP 503 Service Temporarily Unavailable". If the
@@ -338,7 +333,7 @@ by folder when there is no albumartist; a single track gets track tags only. If
   shuffle, repeat off/all/one, stop after track, volume, seek, spectrum.
 - **Spectrum**: on Qt 6.8+ it uses the player's real audio buffers. On older Qt
   it decodes the playing file with `QAudioDecoder` in the background and keeps
-  one spectral frame per 80 ms (cached in `~/.cache/Nebula/tmp/spectrum`). Only if
+  one spectral frame per 80 ms (cached in `~/.cache/Ariance/tmp/spectrum`). Only if
   the Qt build has neither does it show an animated placeholder, labelled as
   such in the tooltip. **Stop** clears the analyser and stops its timer instead
   of leaving the last bars frozen.
@@ -386,9 +381,9 @@ by folder when there is no albumartist; a single track gets track tags only. If
     comparing the device listing with the source tree.
   - *Fast hash (SHA-256, cached)* uses a content digest per PC file plus a per-device
     manifest of what was actually written to that device. Each PC file's digest is
-    cached in `~/Nebula/sync/hashdb/` and reused while its size and mtime are
+    cached in `~/Ariance/sync/hashdb/` and reused while its size and mtime are
     unchanged (so a same-size tag edit is noticed when the timestamp moves); the
-    manifest in `~/Nebula/sync/manifests/` is keyed by the device's identity and
+    manifest in `~/Ariance/sync/manifests/` is keyed by the device's identity and
     the device path, and records the size, digest and device timestamp of each
     successful transfer. Later compares read no device file when the manifest record
     matches the PC digest and a fresh directory listing still shows the same size and
@@ -458,19 +453,22 @@ by folder when there is no albumartist; a single track gets track tags only. If
 
 ## Where your data lives
 
-- Config: `~/Nebula/settings/config.json` (queue, volume, view, grouping, columns,
+- Config: `~/Ariance/settings/config.json` (queue, volume, view, grouping, columns,
   collections, ReplayGain mode, window state)
-- Smart playlists: `~/Nebula/settings/smart_playlists.json`
-- Sync profiles: `~/Nebula/settings/profiles.json`; PC hash cache:
-  `~/Nebula/sync/hashdb/`; per-device sync manifests:
-  `~/Nebula/sync/manifests/` (both are only hints - see *Syncing*)
-- Library index: `~/Nebula/library/library.db` (SQLite; v2 databases are migrated
-  in place). Extra collections: `~/Nebula/library/collections/*.db`
-- Playlists: `~/Nebula/library/playlists/*.m3u8`
-- Online covers: `~/.cache/Nebula/covers`; decoded spectra:
-  `~/.cache/Nebula/tmp/spectrum`; device track buffer:
-  `~/.cache/Nebula/tmp/device-buffer` (cleared on start, on disconnect and on quit);
-  buffered CD tracks: `~/.cache/Nebula/tmp/cd-buffer` (cleared on start)
+- Audiobook bookmarks: `~/Ariance/settings/audiobooks.json` (the chapter and
+  timestamp of every book, and the one to reopen at start); the same file is
+  rewritten as you listen, so a position saved mid-chapter never touches the config
+- Smart playlists: `~/Ariance/settings/smart_playlists.json`
+- Sync profiles: `~/Ariance/settings/profiles.json`; PC hash cache:
+  `~/Ariance/sync/hashdb/`; per-device sync manifests:
+  `~/Ariance/sync/manifests/` (both are only hints - see *Syncing*)
+- Library index: `~/Ariance/library/library.db` (SQLite; v2 databases are migrated
+  in place). Extra collections: `~/Ariance/library/collections/*.db`
+- Playlists: `~/Ariance/library/playlists/*.m3u8`
+- Online covers: `~/.cache/Ariance/covers`; decoded spectra:
+  `~/.cache/Ariance/tmp/spectrum`; device track buffer:
+  `~/.cache/Ariance/tmp/device-buffer` (cleared on start, on disconnect and on quit);
+  buffered CD tracks: `~/.cache/Ariance/tmp/cd-buffer` (cleared on start)
 
 ## Verification
 

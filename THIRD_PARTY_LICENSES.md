@@ -1,7 +1,7 @@
-# Third-party licence audit for Nebula Music Center
+# Third-party licence audit for Ariance Music Center
 
 Audited: 2026-11-12  
-Target: Nebula Music Center 1.29, released under **GPL-3.0-only**.
+Target: Ariance Music Center 1.30, released under **GPL-3.0-only**.
 
 This is a distribution audit, not legal advice. It covers the files actually shipped
 in the source tree and in the `.deb`, plus the external programs the app invokes.
@@ -29,8 +29,8 @@ Qt VirtualKeyboard and Qt PDF are not bundled because the app does not use them.
 | libgraphite2 | `assets/lib/libgraphite2.so.3` | LGPL-2.1-or-later, MPL-2.0, or GPL-2.0-or-later | **Compatible** under LGPLv2.1+ (which permits GPLv2-or-later relicensing). |
 | ICU | `assets/PySide6/Qt/lib/libicu*.so.73` | Unicode-3.0 | **Compatible.** Preserve the Unicode notice. |
 | Qt image/FFmpeg plugins | `assets/PySide6/Qt/plugins` | Qt module licences plus IJG/BSD/Zlib/Apache-2.0/MPL-2.0 components | **Compatible.** Ship Qt's third-party notices; the common texts are in `LICENSES/`. |
-| Nebula code, UI text, `nebula.png`, docs | project root | Copyright (C) 2026 Roger Barthares; GPL-3.0-only | **Licensed.** `LICENSE`, source headers and source offer are present. |
-| Lucide icons: repeat, repeat-one, shuffle and file-clock | vector paths in `nebula.py`; `sync-log.png` | ISC, with Feather-derived portions under MIT | **Compatible.** Ship the full `LICENSES/Lucide.txt` and keep the icon notice. |
+| Ariance code, UI text, `ariance.png`, docs | project root | Copyright (C) 2026 Roger Barthares; GPL-3.0-only | **Licensed.** `LICENSE`, source headers and source offer are present. |
+| Lucide icons: repeat, repeat-one, shuffle and file-clock | vector paths in `ariance.py`; `sync-log.png` | ISC, with Feather-derived portions under MIT | **Compatible.** Ship the full `LICENSES/Lucide.txt` and keep the icon notice. |
 
 ## Not shipped since 1.28
 
@@ -61,7 +61,7 @@ GPLv3-only Qt VirtualKeyboard condition and the Qt PDF licensing choice.
 
 ## External programs (not bundled in the `.deb`)
 
-The app invokes these as separate processes. They are **not linked** into Nebula, but
+The app invokes these as separate processes. They are **not linked** into Ariance, but
 they are still part of the user's installed system and may be listed as Recommends:
 
 | Program | Typical licence | Note |
@@ -84,7 +84,7 @@ configuration: ... --enable-gpl ... --enable-libx264 --enable-libx265 ...
 That is acceptable for a separate-process dependency. It is not acceptable to copy
 those GPL libraries into a differently licensed bundle.
 
-## Release requirements met in 1.29
+## Release requirements met in 1.30
 
 1. The full **GPL-3.0** licence text is in `LICENSE`, with copyright and SPDX headers
    in the application, launcher, build script and tests.
@@ -98,7 +98,7 @@ those GPL libraries into a differently licensed bundle.
 4. The GPLv3-only Qt VirtualKeyboard and the Qt PDF/PDFium modules were removed. The
    app no longer carries a conditional Qt module.
 5. The external CD/FFmpeg tools remain separate executables. Their libraries are not
-   copied into the Nebula package.
+   copied into the Ariance package.
 6. MusicBrainz/Cover Art Archive attribution and service terms remain separate from
    the GPL; the app does not relicense their data or artwork.
 7. The Debian `Maintainer` and `Homepage` are filled in, and the release folder
@@ -113,5 +113,5 @@ those GPL libraries into a differently licensed bundle.
   PDF were removed in 1.28.
 - The GPL FAQ / licence-compatibility guidance for LGPL-2.1+ and GPLv2+ combinations.
 - A source-tree search confirming no `rcrack`, `.aax`, activation-byte or
-  rainbow-table code or settings remain in 1.29.
-- A package audit confirming no VirtualKeyboard/PDF files are present in 1.29.
+  rainbow-table code or settings remain in 1.30.
+- A package audit confirming no VirtualKeyboard/PDF files are present in 1.30.

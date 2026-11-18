@@ -18,8 +18,8 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import sync_hash_check as base  # sets the throw-away HOME and NEBULA_* roots
-import nebula  # noqa: E402
+import sync_hash_check as base  # sets the throw-away HOME and ARIANCE_* roots
+import ariance  # noqa: E402
 
 
 def run_seed(seed):
@@ -83,7 +83,7 @@ def run_seed(seed):
         manifest = s.manifest()
         manifest.record(s.prefix + dev, s.route_key(rel),
                         os.path.getsize(s.files[rel]),
-                        nebula.file_hash256(s.files[rel]), 0, s.p.id)
+                        ariance.file_hash256(s.files[rel]), 0, s.p.id)
         manifest.save()
         ghosts[rel] = dev
 
@@ -128,7 +128,7 @@ def run_seed(seed):
     verify = rng.random() < 0.35
     s.p.mode = mode
     plan = s.compare(verify=verify)
-    errors = nebula.execute(s.p, s.backend(), plan)
+    errors = ariance.execute(s.p, s.backend(), plan)
     require(errors == 0, f"sync errors: {errors}")
     by_rel = {}
     for action in plan:

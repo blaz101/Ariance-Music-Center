@@ -1,8 +1,8 @@
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-"""Nebula Music Center - library/player, batch tagger, devices (MTP) and sync for Linux.
+"""Ariance Music Center - library/player, batch tagger, devices (MTP) and sync for Linux.
 
-Run:  python3 nebula.py      Keep the 'assets' folder next to this file - it contains everything needed.
+Run:  python3 ariance.py      Keep the 'assets' folder next to this file - it contains everything needed.
 """
 # ---- use the libraries bundled in ./assets (no pip install needed) ----
 import os
@@ -17,8 +17,8 @@ try:
     import mutagen  # noqa: F401
 except ImportError as _e:
     sys.stderr.write(
-        "\nNebula Music Center could not start: " + str(_e) + "\n\n"
-        "Make sure the 'assets' folder sits next to nebula.py (64-bit Linux, Python 3.9+).\n"
+        "\nAriance Music Center could not start: " + str(_e) + "\n\n"
+        "Make sure the 'assets' folder sits next to ariance.py (64-bit Linux, Python 3.9+).\n"
         "If a system library is missing, install it, e.g. on Ubuntu/Debian:\n"
         "    sudo apt install libxcb-cursor0 libegl1 libxkbcommon-x11-0\n"
         "Phones (MTP) also need: gvfs-backends (Debian/Ubuntu) or gvfs-mtp (Fedora/Arch).\n\n")
@@ -29,6 +29,7 @@ import concurrent.futures
 import fcntl
 import getpass
 import hashlib
+import copy
 import json
 import math
 import mutagen
@@ -142,10 +143,10 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 # core/config.py
 # ======================================================================
-APP_NAME = "Nebula Music Center"      # the full title, used in About and the desktop entry
-APP_SHORT = "Nebula"                 # short name used in menus and messages
-VERSION = "1.29"
-SOURCE_URL = "https://github.com/blaz101/Nebula-Music-Center"
+APP_NAME = "Ariance Music Center"      # the full title, used in About and the desktop entry
+APP_SHORT = "Ariance"                 # short name used in menus and messages
+VERSION = "1.30"
+SOURCE_URL = "https://github.com/blaz101/Ariance-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
 # the system light/dark setting, unlike Qt's in-app fallback, which only follows the
@@ -153,7 +154,7 @@ CONTACT_EMAIL = "roger.barthares@gmail.com"
 FILE_DIALOG_OPTIONS = QFileDialog.Options()
 DIRECTORY_DIALOG_OPTIONS = QFileDialog.Option.ShowDirsOnly
 # the app icon, also shown as the logo at the left of the tab bar
-ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nebula.png")
+ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ariance.png")
 # the sync log's clock-and-page glyph, tinted to the theme when it is shown
 LOG_ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync-log.png")
 
@@ -161,25 +162,48 @@ LOG_ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync-l
 # Everything the app writes lives in one of two folders: the data one, which is
 # worth backing up, and the cache one, which can be deleted at any time.
 #
-#   ~/Nebula/                     settings and data
+#   ~/Ariance/                     settings and data
 #     settings/  what the app remembers: config, profiles, smart playlists, queue rows
 #     library/   the databases and the exported playlists
 #     sync/      what each sync profile knows each device holds (manifests, hashes)
 #
-#   ~/.cache/Nebula/              everything that can be rebuilt or thrown away
+#   ~/.cache/Ariance/              everything that can be rebuilt or thrown away
 #     covers/    artwork cache, downloaded again when it is missing
 #     tmp/       buffers (CD, device, rip and burn staging)
 #
 # Two roots rather than one because a sandboxed install keeps them apart: inside
 # a Flatpak these are the app's private data and cache directories
-# ($XDG_DATA_HOME/Nebula and $XDG_CACHE_HOME/Nebula), and a backup of the first
-# never has to walk a 2 GB buffer again.  NEBULA_DATA and NEBULA_CACHE point them
+# ($XDG_DATA_HOME/Ariance and $XDG_CACHE_HOME/Ariance), and a backup of the first
+# never has to walk a 2 GB buffer again.  ARIANCE_DATA and ARIANCE_CACHE point them
 # anywhere (a portable install, or a test run), which is also how the test suite
 # keeps itself away from real data.
-DATA_ROOT = os.path.abspath(os.path.expanduser(
-    os.environ.get("NEBULA_DATA") or os.path.join("~", "Nebula")))
-CACHE_ROOT = os.path.abspath(os.path.expanduser(
-    os.environ.get("NEBULA_CACHE") or os.path.join("~", ".cache", "Nebula")))
+#
+# Up to 1.29 these folders were called Nebula. 1.30 moves them to the new name
+# once, rather than starting with an empty library. The move is a rename, so
+# nothing is copied or deleted, and if it cannot be done (a read-only home, a
+# folder owned by someone else) the old folder keeps being used exactly as before.
+def migrate_legacy_root(env_var, new_default, old_default):
+    """The root to use, moving it from the pre-1.30 name on first launch."""
+    chosen = os.environ.get(env_var)
+    if chosen:
+        return os.path.abspath(os.path.expanduser(chosen))
+    new = os.path.abspath(os.path.expanduser(new_default))
+    old = os.path.abspath(os.path.expanduser(old_default))
+    if os.path.lexists(new) or not os.path.isdir(old):
+        return new
+    try:
+        os.makedirs(os.path.dirname(new), exist_ok=True)
+        os.rename(old, new)          # same home, so this is a move, not a copy
+    except OSError:
+        return old
+    return new
+
+
+DATA_ROOT = migrate_legacy_root("ARIANCE_DATA", os.path.join("~", "Ariance"),
+                                os.path.join("~", "Nebula"))
+CACHE_ROOT = migrate_legacy_root("ARIANCE_CACHE",
+                                 os.path.join("~", ".cache", "Ariance"),
+                                 os.path.join("~", ".cache", "Nebula"))
 SETTINGS_DIR = os.path.join(DATA_ROOT, "settings")
 LIBRARY_DIR = os.path.join(DATA_ROOT, "library")
 SYNC_DIR = os.path.join(DATA_ROOT, "sync")
@@ -237,6 +261,8 @@ PROFILES_FILE = os.path.join(SETTINGS_DIR, "profiles.json")
 PRESETS_FILE = os.path.join(SETTINGS_DIR, "device_presets.json")
 SYNC_LOG_FILE = os.path.join(SETTINGS_DIR, "sync_log.json")
 SMART_FILE = os.path.join(SETTINGS_DIR, "smart_playlists.json")
+# where the user is in every audiobook: one small file for the whole library
+AUDIOBOOK_STATE_FILE = os.path.join(SETTINGS_DIR, "audiobooks.json")
 
 DEFAULT_CONFIG = {
     "library_folders": [],
@@ -259,6 +285,7 @@ DEFAULT_CONFIG = {
     # where playback was when the window closed; applied on the next Play
     "last_track": "",
     "last_position": 0,
+    # audiobook positions are not here: settings/audiobooks.json has them
     # shuffle/repeat remembered per playlist, keyed by playlist name
     "playlist_modes": {},
     "tab": 0,
@@ -301,7 +328,7 @@ DEFAULT_CONFIG = {
     "grouping_levels": ["artist", "album"],
     "saved_groupings": [],
     "lib_track_prefix": True,
-    "ui_revision": 42,
+    "ui_revision": 43,
     # multiple collections (each one is a separate database + folder list)
     "collections": [],
     "active_collection": 0,
@@ -366,9 +393,15 @@ def load_config():
         if isinstance(tab, int) and tab >= 1:
             cfg["tab"] = tab + 1
         cfg["ui_revision"] = 42
+    if revision < 43:
+        # 1.30: audiobook bookmarks move out of the config into settings/audiobooks.json.
+        migrate_audiobook_bookmarks(cfg)
+        cfg["ui_revision"] = 43
     for key, val in DEFAULT_CONFIG.items():
         if key not in cfg or not isinstance(cfg[key], type(val)):
-            cfg[key] = val
+            # Never hand out a mutable default: a tab changing its own settings
+            # must not mutate DEFAULT_CONFIG and leak into the next config.
+            cfg[key] = copy.deepcopy(val)
     folders = [f for f in cfg["library_folders"] if isinstance(f, str)]
     cfg["library_folders"] = folders
     migrate_collections(cfg)
@@ -452,14 +485,37 @@ def store_active_collection(cfg):
     return cols
 
 
+def _pristine_config(cfg):
+    """True when cfg is a defaults object, not a loaded user configuration."""
+    if not isinstance(cfg, dict) or not cfg:
+        return True
+    if any(key not in DEFAULT_CONFIG for key in cfg):
+        return False
+    return all(cfg[key] == DEFAULT_CONFIG[key] for key in cfg)
+
+
 def save_config(cfg):
-    """Write the config, first keeping the file it replaces as config.json.bak."""
+    """Write the config, first keeping the file it replaces as config.json.bak.
+
+    A defaults object is never allowed to replace a config that already carries
+    user state. This is the guard against the 1.09-style stray defaults write:
+    opening a widget must not be able to turn an existing install back into a
+    first-run configuration. The real first-run save (no file yet), and every
+    normal full-config save, still go through.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    existing = load_json(CONFIG_FILE, None)
+    if (isinstance(existing, dict) and existing
+            and not _pristine_config(existing) and _pristine_config(cfg)):
+        return False
     try:
         if os.path.exists(CONFIG_FILE):
             shutil.copyfile(CONFIG_FILE, CONFIG_FILE + ".bak")
     except OSError:
         pass
     save_json(CONFIG_FILE, cfg)
+    return True
 
 
 # ======================================================================
@@ -4169,10 +4225,12 @@ def save_presets(presets):
 
 
 # ---------------------------------------------------------------- settings backup
-# One small JSON file holds the parts of Nebula a user may want to carry to another
+# One small JSON file holds the parts of Ariance a user may want to carry to another
 # install. Credentials are deliberately left out; they are not settings a backup
 # should copy around. The queue, window geometry and transient view state are also
 # left out, so importing a backup does not restore a stale session.
+# The key is the file's format tag, not the app name: it stays "nebula_settings"
+# so a backup exported by 1.29 still imports.
 SETTINGS_BUNDLE_VERSION = 1
 SETTINGS_BUNDLE_GROUPS = ("preferences", "sync_profiles", "device_presets",
                           "smart_playlists")
@@ -4229,7 +4287,7 @@ def read_settings_bundle(path):
     """Read and identify a settings backup, raising ValueError for other JSON."""
     data = load_json(path, None)
     if not isinstance(data, dict) or data.get("nebula_settings") != SETTINGS_BUNDLE_VERSION:
-        raise ValueError("This is not a Nebula settings backup.")
+        raise ValueError("This is not a Ariance settings backup.")
     return data
 
 
@@ -4242,7 +4300,7 @@ def apply_settings_bundle(bundle, cfg, groups=None):
     overwritten by a backup, even one that contains them by hand.
     """
     if not isinstance(bundle, dict):
-        raise ValueError("This is not a Nebula settings backup.")
+        raise ValueError("This is not a Ariance settings backup.")
     selected = settings_groups(groups)
     if not selected:
         raise ValueError("Choose at least one kind of setting to import.")
@@ -5556,7 +5614,7 @@ def execute(profile, backend, plan, progress=None, log=None, cancel=lambda: Fals
     work = [a for a in plan if a.kind != "equal"]
     copies = []
     errors = 0
-    tmp = tempfile.mkdtemp(prefix="nebula-transcode-", dir=TMP_DIR) if profile.transcode else None
+    tmp = tempfile.mkdtemp(prefix="ariance-transcode-", dir=TMP_DIR) if profile.transcode else None
     transcode_mode, transcode_quality = (profile.transcode_choice()
                                          if profile.transcode else (None, None))
     try:
@@ -6185,7 +6243,7 @@ CDDB_SERVERS = (
 CDDB_TIMEOUT = 6                 # seconds per server, so a black-holed host can't stall a lookup
 CDDB_DEAD_SECONDS = 300          # how long a server that didn't answer is skipped
 CDDB_STATE = {"url": "", "dead": {}}   # the server that last answered, and those that didn't
-CDDB_HELLO = f"nebula spectra-player.github.io {APP_SHORT} {VERSION}"
+CDDB_HELLO = f"ariance spectra-player.github.io {APP_SHORT} {VERSION}"
 
 
 def cddb_digit_sum(value):
@@ -8587,8 +8645,9 @@ def strip_icon(kind):
 def player_icon(kind, color, size=22):
     """One transport or mode glyph, drawn in `color` so every theme can recolour it.
 
-    kind: prev, next, play, pause, stop, shuffle, shuffle_off, repeat, repeat_off or
-    repeat_one. Only the glyph is drawn: the rings around the transport buttons are their
+    kind: prev, next, chapter_prev, chapter_next, rewind, forward, play, pause, stop,
+    shuffle, shuffle_off, repeat, repeat_off or repeat_one. Only the glyph is drawn:
+    the rings around the transport buttons are their
     own borders, which keeps them crisp at any size and lets the stylesheet colour them.
     Shuffle is two paths that swap places, repeat is a loop with an arrowhead at the top
     right and at the bottom left, and repeat_one is that loop with a 1 in it. The two
@@ -8631,6 +8690,44 @@ def player_icon(kind, color, size=22):
         else:
             tri([(0.45, 0.18), (0.45, 0.82), (0.74, 0.50)])
             tri([(0.14, 0.18), (0.14, 0.82), (0.43, 0.50)])
+    elif kind in ("chapter_prev", "chapter_next"):
+        # A chapter step is one triangle beside a bar: |< and >|. The music bar's
+        # prev/next carry two triangles, so a chapter skip is not mistaken for
+        # "start of track".
+        if kind == "chapter_prev":
+            p.drawRoundedRect(QRectF(0.16 * s, 0.23 * s, 0.09 * s, 0.54 * s),
+                              0.02 * s, 0.02 * s)
+            tri([(0.86, 0.17), (0.86, 0.83), (0.33, 0.50)])
+        else:
+            p.drawRoundedRect(QRectF(0.75 * s, 0.23 * s, 0.09 * s, 0.54 * s),
+                              0.02 * s, 0.02 * s)
+            tri([(0.14, 0.17), (0.14, 0.83), (0.67, 0.50)])
+    elif kind in ("rewind", "forward"):
+        # A 30-second jump: almost a full circle with an open top and an arrowhead
+        # at the end the arrow travels towards, so the two read as opposite turns.
+        stroke(0.105)
+        rect = QRectF(0.15 * s, 0.15 * s, 0.70 * s, 0.70 * s)
+        start, sweep = (60, 270) if kind == "rewind" else (120, -270)
+        path = QPainterPath()
+        path.arcMoveTo(rect, start)
+        path.arcTo(rect, start, sweep)
+        p.drawPath(path)
+        cx, cy = rect.center().x(), rect.center().y()
+        rx, ry = rect.width() / 2.0, rect.height() / 2.0
+
+        def point(angle):
+            rad = math.radians(angle)
+            return QPointF(cx + rx * math.cos(rad), cy - ry * math.sin(rad))
+
+        end = start + sweep
+        tip, before = point(end), point(end - math.copysign(6, sweep))
+        dx, dy = tip.x() - before.x(), tip.y() - before.y()
+        length = math.hypot(dx, dy) or 1.0
+        heading = math.atan2(dy / length, dx / length)
+        for turn in (-1, 1):
+            angle = heading + turn * math.radians(38)
+            p.drawLine(tip, QPointF(tip.x() - 0.22 * s * math.cos(angle),
+                                    tip.y() - 0.22 * s * math.sin(angle)))
     elif kind == "play":
         tri([(0.30, 0.16), (0.30, 0.84), (0.82, 0.50)])
     elif kind == "pause":
@@ -9154,7 +9251,7 @@ class PreferencesDialog(QDialog):
         heading.setObjectName("Heading")
         lay.addWidget(heading)
         note = QLabel("Export selected settings to one JSON file, or import a file "
-                      "made by Nebula. Preferences are merged; sync profiles, presets "
+                      "made by Ariance. Preferences are merged; sync profiles, presets "
                       "and smart playlists replace the selected current ones. Account "
                       "sign-ins are never exported.")
         note.setObjectName("Muted")
@@ -9193,8 +9290,8 @@ class PreferencesDialog(QDialog):
             return
         path, _selected = QFileDialog.getSaveFileName(
             self, "Export settings",
-            os.path.join(os.path.expanduser("~"), "nebula-settings.json"),
-            "Nebula settings (*.json)", options=FILE_DIALOG_OPTIONS)
+            os.path.join(os.path.expanduser("~"), "ariance-settings.json"),
+            "Ariance settings (*.json)", options=FILE_DIALOG_OPTIONS)
         if not path:
             return
         if not path.lower().endswith(".json"):
@@ -9215,7 +9312,7 @@ class PreferencesDialog(QDialog):
             return
         path, _selected = QFileDialog.getOpenFileName(
             self, "Import settings", os.path.expanduser("~"),
-            "Nebula settings (*.json)", options=FILE_DIALOG_OPTIONS)
+            "Ariance settings (*.json)", options=FILE_DIALOG_OPTIONS)
         if not path:
             return
         try:
@@ -9655,7 +9752,7 @@ class DecodedSpectrum(QObject):
 
     QAudioDecoder decodes the file in the background; we keep one spectral frame
     per 80 ms in a time-indexed map, then show the frame under the play position.
-    Results are cached in ~/.cache/nebula/spectrum so a replay is instant.
+    Results are cached in ~/.cache/Ariance/tmp/spectrum so a replay is instant.
     """
 
     STEP_MS = 80
@@ -10152,7 +10249,7 @@ _APO_GRAPHIC = re.compile(r"^\s*GraphicEQ\s*:\s*(.+)$", re.I)
 
 
 def parse_eq_profile(text, suffix=""):
-    """Read an Equalizer APO text profile or a Nebula JSON profile."""
+    """Read an Equalizer APO text profile or a Ariance JSON profile."""
     text = text or ""
     if suffix.lower() == ".json" or text.lstrip().startswith("{"):
         try:
@@ -10274,6 +10371,28 @@ def lyrics_icon_pixmap(color, px=18):
                                     QPointF(17.5 * scale, 1.5 * scale),
                                     QPointF(17.5 * scale, 17.0 * scale)]))
     painter.drawEllipse(QPointF(13.5 * scale, 17.0 * scale), 4.0 * scale, 4.0 * scale)
+    painter.end()
+    return pixmap
+
+
+def chapters_icon_pixmap(color, px=20):
+    """The chapter-list glyph from assets/icons/chapters.svg, painted at any size."""
+    pixmap = QPixmap(px, px)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.0, px * 2.0 / 24.0))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    scale = px / 24.0
+    box = QRectF(3.0 * scale, 3.0 * scale, 18.0 * scale, 18.0 * scale)
+    painter.drawRoundedRect(box, 2.0 * scale, 2.0 * scale)
+    for y in (7.5, 12.0, 16.5):
+        painter.drawLine(QPointF(6.0 * scale, y * scale),
+                         QPointF(18.0 * scale, y * scale))
     painter.end()
     return pixmap
 
@@ -10503,10 +10622,10 @@ class EQDialog(QDialog):
         flat.setToolTip("Zero every band and clear the parametric list")
         flat.clicked.connect(self._flat)
         imp = QPushButton("Import…")
-        imp.setToolTip("Read an Equalizer APO (.txt) or Nebula (.json) profile")
+        imp.setToolTip("Read an Equalizer APO (.txt) or Ariance (.json) profile")
         imp.clicked.connect(self._import)
         exp = QPushButton("Export…")
-        exp.setToolTip("Write this curve as an Equalizer APO or Nebula profile")
+        exp.setToolTip("Write this curve as an Equalizer APO or Ariance profile")
         exp.clicked.connect(self._export)
         close = QPushButton("Close")
         close.clicked.connect(self.close)
@@ -10629,8 +10748,8 @@ class EQDialog(QDialog):
 
     def _export(self):
         path, chosen = QFileDialog.getSaveFileName(
-            self, "Export EQ profile", "nebula-eq.txt",
-            "Equalizer APO (*.txt);;Nebula EQ (*.json)", options=FILE_DIALOG_OPTIONS)
+            self, "Export EQ profile", "ariance-eq.txt",
+            "Equalizer APO (*.txt);;Ariance EQ (*.json)", options=FILE_DIALOG_OPTIONS)
         if not path:
             return
         if not os.path.splitext(path)[1]:
@@ -10878,7 +10997,7 @@ class LyricsDialog(QDialog):
         self._line_indices = []
         self._visible_labels = []
 
-        self.setWindowTitle("Lyrics - Nebula Music Center")
+        self.setWindowTitle("Lyrics - Ariance Music Center")
         self.setObjectName("Panel")
         self.setModal(False)
         self.setMinimumSize(620, 340)
@@ -23692,7 +23811,7 @@ class DevicesTab(QWidget):
                 # wait for the storage instead of failing with a permission error.
                 target = wait_for_mtp_target(b, dest, cancel, _log, label)
                 _log(f"Copying files to {label}\u2026")
-            tmp = tempfile.mkdtemp(prefix="nebula-transcode-", dir=TMP_DIR) if codec else None
+            tmp = tempfile.mkdtemp(prefix="ariance-transcode-", dir=TMP_DIR) if codec else None
             # one unit per percent of each file, so a single large track still moves
             units = max(len(local_paths) * 100, 1)
             try:
@@ -25789,47 +25908,143 @@ def _mp4_box(f, start, end, wanted):
     return None
 
 
-def _chpl_payload_count(payload):
-    """Count the entries in a chpl atom body.
+def _chpl_payload_marks(payload):
+    """The titles and start times in a chpl atom body.
 
     The spec puts a reserved 4-byte field before the count, but files written by
-    older tools leave it out, so both layouts are tried.
+    older tools leave it out, so both layouts are tried. Each entry is an 8-byte
+    start in 100 ns units, a 1-byte title length and that many UTF-8 bytes.
     """
     for start in (9, 5):
         if len(payload) < start:
             continue
         count = payload[start - 1]
         pos = start
+        marks = []
         for _ in range(count):
             if pos + 9 > len(payload):
                 pos = -1
                 break
-            pos += 9 + payload[pos + 8]
+            ticks = int.from_bytes(payload[pos:pos + 8], "big")
+            title_len = payload[pos + 8]
+            pos += 9
+            if pos + title_len > len(payload):
+                pos = -1
+                break
+            title = payload[pos:pos + title_len].decode("utf-8", "replace").strip()
+            pos += title_len
+            marks.append((title, ticks / 10_000_000.0))
         if pos == len(payload):
-            return count
-    return 0
+            return marks
+    return []
 
 
-def m4b_chapter_count(path):
-    """Chapter count from an .m4b/.m4a chapter atom, or 0 when it has none."""
+def m4b_chapters(path, total=None):
+    """Chapter names, start times and lengths from an .m4b/.m4a chapter atom.
+
+    Returns a list of {"name", "start", "duration"} in file order, or [] when the
+    file has no chpl atom. `total` is the file length in seconds when the caller
+    already has it; otherwise it is read from the tags so the last chapter can be
+    closed off.
+    """
     if os.path.splitext(path)[1].lower() not in (".m4b", ".m4a", ".mp4"):
-        return 0
+        return []
+    marks = []
     try:
         with open(path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
             moov = _mp4_box(f, 0, size, {b"moov"})
             if moov is None:
-                return 0
+                return []
             udta = _mp4_box(f, moov[0], moov[1], {b"udta"})
             if udta is None:
-                return 0
+                return []
             chpl = _mp4_box(f, udta[0], udta[1], {b"chpl"})
             if chpl is None:
-                return 0
+                return []
             f.seek(chpl[0])
-            return _chpl_payload_count(f.read(max(0, chpl[1] - chpl[0])))
+            marks = _chpl_payload_marks(f.read(max(0, chpl[1] - chpl[0])))
     except OSError:
-        return 0
+        return []
+    if not marks:
+        return []
+    if total is None:
+        total = float(read_tags(path).get("length") or 0)
+    rows = []
+    for index, (title, start) in enumerate(marks):
+        end = marks[index + 1][1] if index + 1 < len(marks) else float(total or 0)
+        rows.append({"name": title or f"Chapter {index + 1}",
+                     "start": max(0.0, float(start)),
+                     "duration": max(0.0, float(end) - float(start))})
+    return rows
+
+
+def m4b_chapter_count(path):
+    """Chapter count from an .m4b/.m4a chapter atom, or 0 when it has none."""
+    return len(m4b_chapters(path))
+
+
+def audiobook_book_key(paths):
+    """A stable key for remembering where one book stopped.
+
+    A folder of chapter files is keyed by the folder; a loose audiobook file is
+    keyed by its own path.
+    """
+    if not paths:
+        return ""
+    if len(paths) > 1:
+        return os.path.normpath(os.path.dirname(paths[0]))
+    return os.path.normpath(paths[0])
+
+
+def _audiobook_info(path, cache=None):
+    """One file's cached tag details, read only when its stamp changed."""
+    stamp = None
+    try:
+        st = os.stat(path)
+        stamp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        pass
+    key = os.path.abspath(path)
+    if cache is not None and stamp is not None:
+        hit = cache.get(key)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    tags = read_tags(path)
+    info = {"artist": tags.get("albumartist") or tags.get("artist") or "",
+            "title": tags.get("title") or os.path.splitext(os.path.basename(path))[0],
+            "length": float(tags.get("length") or 0)}
+    if cache is not None and stamp is not None:
+        cache[key] = (stamp, info)
+    return info
+
+
+def audiobook_chapters(paths, lengths=None, cache=None):
+    """The chapters the player shows for a book.
+
+    A single .m4b is split into its embedded chapters, all pointing at the same
+    file and carrying a start offset. A folder of chapter files gets one row per
+    file, with start 0. Both forms return the same shape:
+    {"name", "path", "start", "duration"}.
+    """
+    paths = list(paths or [])
+    if not paths:
+        return []
+    lengths = list(lengths or [])
+    rows = []
+    for index, path in enumerate(paths):
+        info = _audiobook_info(path, cache)
+        length = float(lengths[index] if index < len(lengths)
+                       else info.get("length") or 0)
+        embedded = m4b_chapters(path, length)
+        if embedded:
+            rows.extend({"name": row["name"], "path": path,
+                         "start": row["start"], "duration": row["duration"]}
+                        for row in embedded)
+        else:
+            rows.append({"name": info.get("title") or os.path.basename(path),
+                         "path": path, "start": 0.0, "duration": length})
+    return rows
 
 
 def audiobook_details(paths, cache=None):
@@ -25865,21 +26080,22 @@ def audiobook_details(paths, cache=None):
             cover = read_cover(path)
         if info is None:
             tags = read_tags(path)
+            length = float(tags.get("length") or 0)
             info = {"artist": tags.get("albumartist") or tags.get("artist") or "",
-                    "length": float(tags.get("length") or 0),
-                    "chapters": m4b_chapter_count(path) if len(paths) == 1 else 0}
+                    "title": tags.get("title") or os.path.splitext(os.path.basename(path))[0],
+                    "length": length,
+                    "chapters": len(m4b_chapters(path, length))}
             if cache is not None and stamp is not None:
                 cache[key] = (stamp, info)
         if not artist:
             artist = info.get("artist") or ""
         lengths.append(float(info.get("length") or 0))
-        if len(paths) == 1:
-            chapters = int(info.get("chapters") or 0)
+        chapters += int(info.get("chapters") or 0) or 1
     return artist, chapters or len(paths), sum(lengths), lengths, cover
 
 
 def audiobook_default_folder():
-    return os.path.join(os.path.expanduser("~"), "Music", "Nebula - Audiobooks")
+    return os.path.join(os.path.expanduser("~"), "Music", "Ariance - Audiobooks")
 
 
 def unique_path(path):
@@ -26022,12 +26238,723 @@ def bind_grid_layout(tree, config, key, remember_widths=True):
     header.sectionResized.connect(schedule)
 
 
+BOOK_ROLE = Qt.UserRole + 10
+CHAPTER_ROLE = Qt.UserRole + 11
+
+
+class ElidedLabel(QLabel):
+    """A one-line label that shortens itself instead of clipping mid-word."""
+
+    def __init__(self, text="", parent=None):
+        self._full_text = ""
+        super().__init__(parent)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = str(text or "")
+        self.setToolTip(self._full_text)
+        self._apply_elide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self):
+        width = max(0, self.contentsRect().width())
+        text = self.fontMetrics().elidedText(self._full_text, Qt.ElideRight, width)
+        super().setText(text)
+
+
+def _bookmark_state(state):
+    """(chapter, seconds) from one stored bookmark, or None when it is unusable."""
+    if not isinstance(state, dict):
+        return None
+    try:
+        chapter = max(0, int(state.get("chapter", 0)))
+        position = max(0.0, float(state.get("position", 0.0)))
+    except (TypeError, ValueError):
+        return None
+    return chapter, position
+
+
+class AudiobookBookmarks:
+    """Where the user is in every audiobook, in one file of its own.
+
+    Audiobooks are not a queue: each book is resumed on its own chapter and
+    timestamp, and opening another book must leave the first one exactly where it
+    was. settings/audiobooks.json holds them all, so a place saved every few seconds
+    while a book plays never rewrites config.json (and cannot be lost with it).
+    """
+
+    def __init__(self, config=None, path=None):
+        self.path = path or AUDIOBOOK_STATE_FILE
+        self.books = {}
+        self.last = ""
+        self._read()
+        if not self.books:
+            self._adopt(config)
+
+    def _read(self):
+        raw = load_json(self.path, None)
+        if not isinstance(raw, dict):
+            return
+        books = raw.get("books")
+        if isinstance(books, dict):
+            for key, state in books.items():
+                parsed = _bookmark_state(state)
+                if not parsed or not str(key):
+                    continue
+                chapter, position = parsed
+                entry = {"chapter": chapter, "position": round(position, 2)}
+                for field in ("title", "author", "chapter_name"):
+                    text = str(state.get(field) or "").strip()
+                    if text:
+                        entry[field] = text
+                self.books[str(key)] = entry
+        last = str(raw.get("last") or "")
+        if last in self.books:
+            self.last = last
+
+    def _adopt(self, config):
+        """Take over bookmarks an older version kept inside config.json."""
+        if not isinstance(config, dict):
+            return
+        positions = config.get("audiobook_positions")
+        self.adopt(positions if isinstance(positions, dict) else {},
+                   str(config.get("audiobook_last") or ""))
+
+    def adopt(self, positions, last=""):
+        """Add an older store's bookmarks; a book already here keeps its place."""
+        added = False
+        for key, state in (positions or {}).items():
+            key = str(key or "")
+            parsed = _bookmark_state(state)
+            if not key or not parsed or key in self.books:
+                continue
+            chapter, position = parsed
+            self.books[key] = {"chapter": chapter, "position": round(position, 2)}
+            added = True
+        if last:
+            self.last = str(last)
+        if added or last:
+            self.save()
+
+    def state(self, key):
+        """(chapter, seconds) that this book was last left at."""
+        parsed = _bookmark_state(self.books.get(str(key or "")))
+        return parsed if parsed else (0, 0.0)
+
+    def remember(self, key, chapter, position, title="", author="", chapter_name=""):
+        """Store one book's place, and make it the book start-up resumes."""
+        key = str(key or "")
+        try:
+            chapter = max(0, int(chapter))
+            position = round(max(0.0, float(position)), 2)
+        except (TypeError, ValueError):
+            return False
+        if not key:
+            return False
+        entry = {"chapter": chapter, "position": position}
+        for field, text in (("title", title), ("author", author),
+                            ("chapter_name", chapter_name)):
+            text = str(text or "").strip()
+            if text:
+                entry[field] = text
+        changed = self.books.get(key) != entry
+        if changed:
+            self.books[key] = entry
+        if not changed and self.last == key:
+            return False
+        self.last = key
+        return self.save()
+
+    def save(self):
+        payload = {"version": 1,
+                   "last": self.last,
+                   "books": {key: dict(value)
+                             for key, value in sorted(self.books.items())}}
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            save_json(self.path, payload)
+        except OSError:
+            return False
+        return True
+
+
+def migrate_audiobook_bookmarks(cfg, path=None):
+    """Move the bookmarks older versions kept in config.json into their own file.
+
+    Runs once, when the config revision reaches 43: both keys are then left out of
+    config.json. The audiobooks file wins when it already knows a book, because it
+    is the copy that has been kept up to date.
+    """
+    if not isinstance(cfg, dict):
+        return
+    positions = cfg.pop("audiobook_positions", None)
+    last = str(cfg.pop("audiobook_last", "") or "")
+    if not isinstance(positions, dict) and not last:
+        return
+    store = AudiobookBookmarks(path=path)
+    store.adopt(positions if isinstance(positions, dict) else {}, last)
+
+
+class AudiobookBar(QWidget):
+    """The audiobook player: author, chapter, play and a chapter-relative seek bar.
+
+    This player is deliberately separate from the music PlayerBar. Audiobooks do
+    not enter the music queue, and switching to the Audiobooks tab stops music. A
+    single M4B keeps its embedded chapters in one file; a folder of chapter files
+    uses one file per chapter. Both are represented by the same chapter dictionaries
+    (name, path, start, duration), so the bar and the chapter list behave the same.
+    """
+
+    chapters_toggled = Signal(bool)
+    error = Signal(str)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setObjectName("PlayerBar")
+        self.config = config
+        self.bookmarks = AudiobookBookmarks(config)
+        self.book = {}
+        self.chapters = []
+        self.chapter = 0
+        self._chapter_pos = 0.0
+        self._pending_seek = None
+        self._pending_play = False
+        self._seek_tries = 0
+        self._seek_settle = 0
+        self._media_status = QMediaPlayer.NoMedia
+        # Created on the first actual play. Hidden Audiobooks tabs (and their tests)
+        # should not open an audio backend just to show a book list.
+        self.media = None
+        self.audio = None
+        self._save_timer = QTimer(self, interval=15000, timeout=self.save_state)
+        self._save_timer.start()
+
+        self.author_label = ElidedLabel("")
+        self.author_label.setObjectName("NowTitle")
+        self.author_label.setMinimumWidth(240)
+        self.author_label.setMaximumWidth(300)
+        self.chapters_btn = QPushButton()
+        self.chapters_btn.setObjectName("PlayerToggle")
+        self.chapters_btn.setCheckable(True)
+        self.chapters_btn.setFixedSize(30, 30)
+        self.chapters_btn.setIconSize(QSize(20, 20))
+        self.chapters_btn.setCursor(Qt.PointingHandCursor)
+        self.chapters_btn.setToolTip("Show chapters")
+        self.chapters_btn.setIcon(QIcon(chapters_icon_pixmap(TEXT, 20)))
+        self.chapters_btn.toggled.connect(lambda on: self.chapters_toggled.emit(bool(on)))
+        self.chapter_label = ElidedLabel("Choose an audiobook")
+        self.chapter_label.setObjectName("Heading")
+        self.chapter_label.setMinimumWidth(100)
+        self.chapter_label.setMaximumWidth(320)
+        self.book_title = QLabel("")
+        self.book_title.setObjectName("NowTitle")
+        self.book_title.setWordWrap(True)
+        self.book_title.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.book_title.setMinimumWidth(220)
+        self.book_title.setMaximumWidth(300)
+        book_block = QWidget()
+        book_block.setMinimumWidth(220)
+        book_block.setMaximumWidth(300)
+        book_lay = QVBoxLayout(book_block)
+        book_lay.setContentsMargins(0, 0, 0, 0)
+        book_lay.setSpacing(0)
+        book_lay.addWidget(self.book_title)
+
+        self.rewind_btn = QPushButton()
+        self.rewind_btn.setObjectName("PlayerToggle")
+        self.rewind_btn.setFixedSize(30, 30)
+        self.rewind_btn.setIconSize(QSize(22, 22))
+        self.rewind_btn.setIcon(transport_icon("rewind", 22))
+        self.rewind_btn.setToolTip("Back 30 seconds")
+        # The chapter skips are the music bar's own previous/next glyphs, so both
+        # players read as one family: a ring with a drawn |< or >| inside it.
+        self.prev_btn = QPushButton()
+        self.prev_btn.setObjectName("PlayerButton")
+        self.prev_btn.setFixedSize(34, 34)
+        self.prev_btn.setIconSize(QSize(22, 22))
+        self.prev_btn.setIcon(transport_icon("chapter_prev", 22))
+        self.prev_btn.setToolTip("Previous chapter")
+        self.play_btn = QPushButton()
+        self.play_btn.setObjectName("PlayerBig")
+        self.play_btn.setFixedSize(44, 44)
+        self.play_btn.setIconSize(QSize(26, 26))
+        self.play_btn.setToolTip("Play")
+        self.next_btn = QPushButton()
+        self.next_btn.setObjectName("PlayerButton")
+        self.next_btn.setFixedSize(34, 34)
+        self.next_btn.setIconSize(QSize(22, 22))
+        self.next_btn.setIcon(transport_icon("chapter_next", 22))
+        self.next_btn.setToolTip("Next chapter")
+        self.ff_btn = QPushButton()
+        self.ff_btn.setObjectName("PlayerToggle")
+        self.ff_btn.setFixedSize(30, 30)
+        self.ff_btn.setIconSize(QSize(22, 22))
+        self.ff_btn.setIcon(transport_icon("forward", 22))
+        self.ff_btn.setToolTip("Forward 30 seconds")
+        for button in (self.rewind_btn, self.prev_btn, self.play_btn,
+                       self.next_btn, self.ff_btn):
+            button.setCursor(Qt.PointingHandCursor)
+        self._refresh_play_icon()
+
+        transport = QHBoxLayout()
+        transport.setSpacing(4)
+        transport.addStretch(1)
+        for button in (self.rewind_btn, self.prev_btn, self.play_btn,
+                       self.next_btn, self.ff_btn):
+            transport.addWidget(button, 0, Qt.AlignVCenter)
+        transport.addStretch(1)
+
+        chapter_row = QHBoxLayout()
+        chapter_row.setContentsMargins(0, 0, 0, 0)
+        chapter_row.setSpacing(10)
+        chapter_row.addStretch(1)
+        chapter_row.addWidget(self.chapters_btn, 0, Qt.AlignVCenter)
+        chapter_row.addWidget(self.chapter_label, 0, Qt.AlignVCenter)
+        chapter_row.addStretch(1)
+        center = QWidget()
+        center_lay = QVBoxLayout(center)
+        center_lay.setContentsMargins(0, 0, 0, 0)
+        center_lay.setSpacing(4)
+        center_lay.addLayout(chapter_row)
+        center_lay.addLayout(transport)
+
+        top = QGridLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setHorizontalSpacing(12)
+        top.addWidget(self.author_label, 0, 0, 2, 1, Qt.AlignLeft | Qt.AlignTop)
+        top.addWidget(center, 0, 1, 2, 1, Qt.AlignCenter)
+        top.addWidget(book_block, 0, 2, 2, 1, Qt.AlignRight | Qt.AlignTop)
+        top.setColumnStretch(0, 1)
+        top.setColumnStretch(2, 1)
+
+        self.seek = SeekSlider(self)
+        self.seek.setToolTip("Jump within this chapter")
+        self.seek.setRange(0, 0)
+        self.pos_label = QLabel("0:00")
+        self.pos_label.setObjectName("Muted")
+        self.remaining_label = QLabel("-0:00")
+        self.remaining_label.setObjectName("Muted")
+        for widget in (center, book_block, self.author_label, self.chapter_label,
+                       self.book_title, self.pos_label, self.remaining_label):
+            widget.setStyleSheet("background: transparent;")
+        seek_row = QHBoxLayout()
+        seek_row.setSpacing(6)
+        seek_row.addWidget(self.pos_label)
+        seek_row.addWidget(self.seek, 1)
+        seek_row.addWidget(self.remaining_label)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 12, 24, 12)
+        lay.setSpacing(10)
+        lay.addLayout(top)
+        lay.addLayout(seek_row)
+        self.setMinimumHeight(146)
+
+        self.play_btn.clicked.connect(self.toggle)
+        self.prev_btn.clicked.connect(self.previous_chapter)
+        self.next_btn.clicked.connect(self.next_chapter)
+        self.rewind_btn.clicked.connect(lambda: self._skip(-30))
+        self.ff_btn.clicked.connect(lambda: self._skip(30))
+        self.seek.clicked.connect(self.seek_to)
+        self.seek.sliderMoved.connect(self.seek_to)
+        self._set_enabled(False)
+
+    @property
+    def book_key(self):
+        return str(self.book.get("key") or "")
+
+    @property
+    def playing(self):
+        return (self.media is not None
+                and self.media.playbackState() == QMediaPlayer.PlayingState)
+
+    def _ensure_media(self):
+        if self.media is not None:
+            return
+        self.media = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.media.setAudioOutput(self.audio)
+        try:
+            volume = int(self.config.get("volume", 70))
+        except (TypeError, ValueError):
+            volume = 70
+        self.audio.setVolume(max(0, min(100, volume)) / 100)
+        self.media.positionChanged.connect(self._position_changed)
+        self.media.durationChanged.connect(self._duration_changed)
+        self.media.playbackStateChanged.connect(self._state_changed)
+        self.media.mediaStatusChanged.connect(self._status_changed)
+        self.media.errorOccurred.connect(
+            lambda *_args: self.error.emit(self.media.errorString() or "Playback failed"))
+
+    def _refresh_play_icon(self):
+        kind = "pause" if self.playing else "play"
+        self.play_btn.setIcon(transport_icon(kind, 26))
+        self.play_btn.setToolTip("Pause" if self.playing else "Play")
+
+    def refresh_theme(self):
+        """Redraw the glyphs the theme colours, after the theme changed."""
+        self.chapters_btn.setIcon(QIcon(chapters_icon_pixmap(TEXT, 20)))
+        self.prev_btn.setIcon(transport_icon("chapter_prev", 22))
+        self.next_btn.setIcon(transport_icon("chapter_next", 22))
+        self.rewind_btn.setIcon(transport_icon("rewind", 22))
+        self.ff_btn.setIcon(transport_icon("forward", 22))
+        self._refresh_play_icon()
+
+    def _set_enabled(self, on):
+        for widget in (self.rewind_btn, self.prev_btn, self.play_btn, self.next_btn,
+                       self.ff_btn, self.seek, self.chapters_btn):
+            widget.setEnabled(bool(on))
+
+    def _embedded(self):
+        """True when the current file carries more than one chapter row."""
+        if len(self.chapters) < 2:
+            return False
+        chapter = self._chapter()
+        if chapter is None:
+            return False
+        path = os.path.normpath(chapter.get("path") or "")
+        return sum(1 for row in self.chapters
+                   if os.path.normpath(row.get("path") or "") == path) > 1
+
+    def _chapter(self):
+        if not self.chapters:
+            return None
+        self.chapter = max(0, min(int(self.chapter), len(self.chapters) - 1))
+        return self.chapters[self.chapter]
+
+    def saved_state(self, key):
+        """(chapter, seconds) that this book was last left at."""
+        return self.bookmarks.state(key)
+
+    def load_book(self, book, chapters, chapter=0, position=0.0, autoplay=False):
+        """Show a book without touching the music queue; optionally start playing.
+
+        Save the book being replaced first: opening another book must not lose the
+        last few seconds of the one that was playing.
+        """
+        if self.book_key and self.chapters:
+            self.save_state()
+        self.book = dict(book or {})
+        self.chapters = [dict(row) for row in (chapters or [])]
+        if not self.chapters:
+            self.chapter = 0
+            self._chapter_pos = 0.0
+            self.chapter_label.setText("Choose an audiobook")
+            self.book_title.setText("")
+            self.author_label.setText("")
+            self._set_enabled(False)
+            return
+        try:
+            chapter = int(chapter)
+        except (TypeError, ValueError):
+            chapter = 0
+        self.chapter = max(0, min(chapter, len(self.chapters) - 1))
+        self._set_chapter_meta(position)
+        self._set_enabled(True)
+        # Make this book the one startup should restore, even when its saved
+        # position is unchanged.
+        self.save_state()
+        if autoplay:
+            self._open_chapter(self._chapter_pos, autoplay=True)
+        else:
+            self._pending_seek = None
+            self._pending_play = False
+
+    def _set_chapter_meta(self, position=0.0):
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        title = str(self.book.get("title") or "").strip()
+        name = str(chapter.get("name") or f"Chapter {self.chapter + 1}")
+        prefixes = [title]
+        if ":" in title:
+            prefixes.append(title.split(":", 1)[0].strip())
+        for prefix in prefixes:
+            if prefix and name.lower().startswith(prefix.lower()):
+                short = name[len(prefix):].lstrip(" :-–—")
+                if short:
+                    name = short
+                break
+        self.chapter_label.setText(name)
+        self.chapter_label.setToolTip(str(chapter.get("name") or name))
+        self.book_title.setText(title)
+        self.book_title.setToolTip(title)
+        self.author_label.setText(self.book.get("author") or "")
+        try:
+            duration = max(0.0, float(chapter.get("duration") or 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+        try:
+            position = max(0.0, min(float(position or 0.0), duration))
+        except (TypeError, ValueError):
+            position = 0.0
+        self._chapter_pos = position
+        self.seek.setRange(0, int(duration * 1000))
+        self.seek.setValue(int(position * 1000))
+        self._update_time_labels()
+
+    def _update_time_labels(self):
+        chapter = self._chapter()
+        try:
+            duration = max(0.0, float(chapter.get("duration") or 0.0)) if chapter else 0.0
+        except (TypeError, ValueError):
+            duration = 0.0
+        self.pos_label.setText(fmt_time(self._chapter_pos))
+        self.remaining_label.setText("-" + fmt_time(max(0.0, duration - self._chapter_pos)))
+
+    def _apply_pending_seek(self):
+        """Ask the player for the remembered spot; the position report confirms it.
+
+        The FFmpeg backend reports a file as loaded while the player is still
+        stopped, and a seek issued then is thrown away as playback starts: the
+        chapter would begin at 0:00 instead of where the book was left. Opening
+        another book is the same trap, because the backend keeps answering for the
+        file it has just closed. So the seek is only *offered* here, and
+        _position_changed asks again until the position it reports is the one the
+        book was left at; no signal is trusted to say the book has arrived.
+        """
+        if self.media is None:
+            return
+        if self._pending_play:
+            self._pending_play = False
+            self.media.play()
+        if self._pending_seek is None:
+            return
+        target = max(0.0, float(self._pending_seek))
+        if target <= 0.05:
+            # The chapter starts where the file does: nothing to seek to, and a
+            # seek at the very moment playback starts can stall it.
+            self._pending_seek = None
+            self._seek_tries = 0
+            self._seek_settle = 0
+            return
+        if (not self.media.isSeekable()
+                or self.media.playbackState() == QMediaPlayer.StoppedState):
+            return
+        if self._seek_tries >= 8:
+            # A file that never takes the seek must not be scrubbed forever.
+            return
+        self._seek_tries += 1
+        self.media.setPosition(int(target * 1000))
+
+    def _open_chapter(self, position=0.0, autoplay=True):
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        path = chapter.get("path") or ""
+        if not path:
+            return
+        self._ensure_media()
+        start = max(0.0, float(chapter.get("start") or 0.0))
+        self._chapter_pos = max(0.0, float(position or 0.0))
+        target = start + self._chapter_pos
+        url = QUrl.fromLocalFile(path)
+        if self.media.source() != url:
+            self._pending_seek = target
+            self._pending_play = bool(autoplay)
+            self._seek_tries = 0
+            self._seek_settle = 0
+            self.media.setSource(url)
+            if autoplay:
+                self.media.play()
+        else:
+            self.media.setPosition(int(target * 1000))
+            if autoplay:
+                self.media.play()
+        self._update_time_labels()
+
+    def _position_changed(self, ms):
+        if not self.chapters:
+            return
+        seconds = max(0.0, float(ms) / 1000.0)
+        if self._pending_seek is not None:
+            if (self._pending_play or self._media_status in (QMediaPlayer.NoMedia,
+                                                            QMediaPlayer.LoadingMedia)):
+                # The file is still being opened: this position is the top of it,
+                # not the place the book was left at.
+                return
+            target = max(0.0, float(self._pending_seek))
+            if target > 0.05:
+                if seconds < target - 1.5 and self._seek_tries < 8:
+                    # The position being reported is still the top of the file (or
+                    # the old book's), not the spot this book was left at: the seek
+                    # has not taken yet, so ask again and keep the bookmark off the
+                    # screen.
+                    self._apply_pending_seek()
+                    return
+                if seconds < target + 2.0 and self._seek_settle < 5:
+                    # The seek landed, but the backend can still reload the file
+                    # and restart it at the top. Only playback that has moved past
+                    # the bookmark proves the book is really there.
+                    self._seek_settle += 1
+                    return
+            # Either the book is where it was left, or its file refuses to be
+            # seeked: stop holding the position back all the same.
+            self._pending_seek = None
+            self._seek_tries = 0
+            self._seek_settle = 0
+        if self._embedded():
+            current = self._chapter()
+            path = os.path.normpath(current.get("path") or "") if current else ""
+            index = self.chapter
+            for i, chapter in enumerate(self.chapters):
+                if (os.path.normpath(chapter.get("path") or "") == path
+                        and seconds + 0.05 >= float(chapter.get("start") or 0.0)):
+                    index = i
+            if index != self.chapter:
+                self.chapter = index
+                self._set_chapter_meta(0.0)
+                self.save_state()
+            chapter = self._chapter()
+            start = max(0.0, float(chapter.get("start") or 0.0)) if chapter else 0.0
+            position = max(0.0, seconds - start)
+        else:
+            position = seconds
+        try:
+            duration = max(0.0, float(self._chapter().get("duration") or 0.0))
+        except (AttributeError, TypeError, ValueError):
+            duration = 0.0
+        self._chapter_pos = min(position, duration) if duration else position
+        if not self.seek.isSliderDown():
+            self.seek.setValue(int(self._chapter_pos * 1000))
+        self._update_time_labels()
+
+    def _duration_changed(self, ms):
+        seconds = max(0.0, float(ms) / 1000.0)
+        if not self.chapters:
+            return
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        if not self._embedded() and not float(chapter.get("duration") or 0.0):
+            chapter["duration"] = seconds
+            self.seek.setRange(0, int(seconds * 1000))
+            self._update_time_labels()
+        if self._pending_seek is not None:
+            self._apply_pending_seek()
+
+    def _state_changed(self, _state):
+        self._refresh_play_icon()
+
+    def _status_changed(self, status):
+        self._media_status = status
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            self._apply_pending_seek()
+        elif status == QMediaPlayer.EndOfMedia:
+            self._pending_seek = None
+            self._seek_tries = 0
+            self._seek_settle = 0
+            if self.chapter + 1 < len(self.chapters):
+                self.chapter += 1
+                self._set_chapter_meta(0.0)
+                self._open_chapter(0.0, autoplay=True)
+            else:
+                self._save_timer.stop()
+                self.save_state()
+                self._refresh_play_icon()
+
+    def toggle(self):
+        if not self.chapters:
+            return
+        if self.playing:
+            self.media.pause()
+            self.save_state()
+            return
+        if self.media is None or self.media.source().isEmpty():
+            self._open_chapter(self._chapter_pos, autoplay=True)
+        else:
+            self.media.play()
+
+    def pause(self):
+        if self.playing:
+            self.media.pause()
+        self.save_state()
+
+    def stop(self):
+        self.save_state()
+        if self.media is not None:
+            self.media.stop()
+        self._refresh_play_icon()
+
+    def previous_chapter(self):
+        if not self.chapters:
+            return
+        if self.chapter > 0:
+            self.chapter -= 1
+        self._set_chapter_meta(0.0)
+        self._open_chapter(0.0, autoplay=True)
+
+    def next_chapter(self):
+        if not self.chapters:
+            return
+        if self.chapter + 1 < len(self.chapters):
+            self.chapter += 1
+            self._set_chapter_meta(0.0)
+            self._open_chapter(0.0, autoplay=True)
+
+    def _skip(self, seconds):
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        duration = max(0.0, float(chapter.get("duration") or 0.0))
+        position = max(0.0, min(duration, self._chapter_pos + seconds)) if duration else 0.0
+        self._seek_relative(position)
+
+    def seek_to(self, milliseconds):
+        try:
+            position = max(0.0, float(milliseconds) / 1000.0)
+        except (TypeError, ValueError):
+            return
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        duration = max(0.0, float(chapter.get("duration") or 0.0))
+        self._seek_relative(min(position, duration) if duration else position)
+
+    def _seek_relative(self, position):
+        chapter = self._chapter()
+        if chapter is None:
+            return
+        # A click or drag on the bar wins over a resume that has not landed yet.
+        self._pending_seek = None
+        self._seek_tries = 0
+        self._seek_settle = 0
+        self._chapter_pos = max(0.0, float(position))
+        if self.media is not None:
+            self.media.setPosition(int((float(chapter.get("start") or 0.0)
+                                        + self._chapter_pos) * 1000))
+        self.seek.setValue(int(self._chapter_pos * 1000))
+        self._update_time_labels()
+
+    def save_state(self):
+        key = self.book_key
+        if not key or not self.chapters:
+            return
+        chapter = self._chapter()
+        self.bookmarks.remember(
+            key, self.chapter, self._chapter_pos,
+            title=self.book.get("title") or "",
+            author=self.book.get("author") or "",
+            chapter_name=(chapter.get("name") if chapter else "") or "")
+
+    def shutdown(self):
+        self._save_timer.stop()
+        self.save_state()
+        if self.media is not None:
+            self.media.stop()
+            self.media.setSource(QUrl())
+
+
 class AudiobooksTab(QWidget):
     """Audiobooks, kept apart from the music library.
 
     Each folder that holds audio is one title, with its chapters in natural order; a
     file dropped straight into an audiobook folder is a title of its own. Double-click
-    a title or a chapter to play. Import moves files in from anywhere.
+    a title to play it, and a single click on a chapter in the drawer plays that
+    chapter. Import moves files in from anywhere.
     """
 
     def __init__(self, player, config, parent=None):
@@ -26035,6 +26962,11 @@ class AudiobooksTab(QWidget):
         self.player = player
         self.config = config
         self._book_paths = {}
+        self._book_chapters = {}
+        self._book_items = {}
+        self._current_book_key = ""
+        self._chapter_panel_key = ""
+        self._restored_last_book = False
         self.setObjectName("Panel")
 
         lay = QVBoxLayout(self)
@@ -26083,11 +27015,14 @@ class AudiobooksTab(QWidget):
         self.tree.setColumnWidth(4, 110)
         self.tree.setIconSize(QSize(52, 52))
         self.tree.setAlternatingRowColors(True)
+        # Double-click starts a book; it must not unfold every chapter below it.
+        self.tree.setExpandsOnDoubleClick(False)
         self.tree.itemDoubleClicked.connect(self._play_item)
+        self.tree.itemSelectionChanged.connect(self._selection_changed)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._tree_menu)
         self.tree.setToolTip("Click a column heading to sort by it; double-click a title "
-                             "or chapter to play; right-click to play or add to queue")
+                             "or chapter to play; use the chapters button to show them")
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search titles, authors or chapters")
         self.search.setClearButtonEnabled(True)
@@ -26107,7 +27042,39 @@ class AudiobooksTab(QWidget):
         search_row = QHBoxLayout()
         search_row.addWidget(self.search)
         lay.addLayout(search_row)
-        lay.addWidget(self.tree, 1)
+
+        # The chapter list is a drawer beside the books. It starts closed; the
+        # chapters button in the audiobook player opens it.
+        self.chapter_panel = QWidget()
+        self.chapter_panel.setObjectName("Panel")
+        side = QVBoxLayout(self.chapter_panel)
+        side.setContentsMargins(0, 0, 10, 0)
+        side.setSpacing(6)
+        self.chapter_title = QLabel("Chapters")
+        self.chapter_title.setObjectName("Heading")
+        side.addWidget(self.chapter_title)
+        self.chapter_list = QTreeWidget()
+        self.chapter_list.setHeaderLabels(["Chapter", "Length"])
+        self.chapter_list.setRootIsDecorated(False)
+        self.chapter_list.setAlternatingRowColors(True)
+        self.chapter_list.setColumnWidth(0, 220)
+        self.chapter_list.setColumnWidth(1, 70)
+        self.chapter_list.itemClicked.connect(self._chapter_clicked)
+        self.chapter_list.itemDoubleClicked.connect(self._chapter_double)
+        side.addWidget(self.chapter_list, 1)
+        self.chapter_panel.hide()
+
+        self.split = QSplitter(Qt.Horizontal)
+        self.split.addWidget(self.chapter_panel)
+        self.split.addWidget(self.tree)
+        self.split.setStretchFactor(0, 0)
+        self.split.setStretchFactor(1, 1)
+        lay.addWidget(self.split, 1)
+
+        self.ab_player = AudiobookBar(config, self)
+        self.ab_player.chapters_toggled.connect(self._show_chapters)
+        self.ab_player.error.connect(self._player_error)
+        lay.addWidget(self.ab_player)
         self.refresh()
 
     @staticmethod
@@ -26197,13 +27164,15 @@ class AudiobooksTab(QWidget):
         for name, paths in books:
             artist, chapters, total, lengths, cover = audiobook_details(
                 paths, self._detail_cache)
-            self._books.append((name, paths, artist, chapters, total, lengths, cover))
+            chapter_rows = audiobook_chapters(paths, lengths, self._detail_cache)
+            self._books.append((name, paths, artist, chapters, total, lengths, cover,
+                                chapter_rows))
         self._render_books()
         self._books_signature = signature
 
     @staticmethod
     def _book_sort_key(book, column):
-        name, _paths, artist, chapters, total, _lengths, _cover = book
+        name, _paths, artist, chapters, total, _lengths, _cover, _rows = book
         if column == 2:
             return natural_sort_key(artist or "")
         if column == 3:
@@ -26229,27 +27198,38 @@ class AudiobooksTab(QWidget):
     def _render_books(self):
         self.tree.clear()
         self._book_paths = {}
+        self._book_chapters = {}
+        self._book_items = {}
         books = list(self._books)
         if self._sort_column is not None:
             books.sort(key=lambda book: self._book_sort_key(book, self._sort_column),
                        reverse=self._sort_desc)
         query = self.search.text().strip().casefold()
         shown = 0
-        for number, (name, paths, artist, chapters, total, lengths, cover) in enumerate(books):
-            haystack = " ".join([name, artist] + [os.path.basename(path) for path in paths])
+        for number, (name, paths, artist, chapters, total, lengths, cover,
+                     chapter_rows) in enumerate(books):
+            haystack = " ".join([name, artist] + [os.path.basename(path) for path in paths]
+                                + [row.get("name", "") for row in chapter_rows])
             if query and query not in haystack.casefold():
                 continue
-            item = QTreeWidgetItem(self.tree, ["", name, artist, str(chapters),
+            book_key = audiobook_book_key(paths)
+            item = QTreeWidgetItem(self.tree, ["", name, artist, str(len(chapter_rows)),
                                                fmt_time(total)])
             item.setData(0, Qt.UserRole, number)
+            item.setData(0, BOOK_ROLE, book_key)
             item.setSizeHint(0, QSize(64, 60))
             pixmap = self._cover_pixmap(paths, cover)
             if pixmap is not None:
                 item.setIcon(0, QIcon(pixmap))
             self._book_paths[number] = paths
-            for path, length in zip(paths, lengths):
-                QTreeWidgetItem(item, ["", os.path.basename(path), "", "",
-                                       fmt_time(length)])
+            self._book_chapters[book_key] = chapter_rows
+            self._book_items[book_key] = item
+            for index, row in enumerate(chapter_rows):
+                child = QTreeWidgetItem(item, ["", row.get("name") or f"Chapter {index + 1}",
+                                               "", "", fmt_time(row.get("duration") or 0)])
+                child.setData(0, CHAPTER_ROLE, index)
+                child.setData(0, BOOK_ROLE, book_key)
+                child.setToolTip(0, row.get("path") or "")
             shown += 1
         count = len(self._books)
         if query:
@@ -26257,6 +27237,8 @@ class AudiobooksTab(QWidget):
                 f"{shown} of {count} title{'s' if count != 1 else ''}")
         else:
             self.count_label.setText(f"{count} title{'s' if count != 1 else ''}")
+        self._update_chapter_panel()
+        self._restore_last_book()
 
     def _sort_by(self, column):
         """Sort the titles by the clicked heading, the way the library grid does."""
@@ -26486,7 +27468,9 @@ class AudiobooksTab(QWidget):
             for index, (name, paths) in enumerate(books):
                 if cancel():
                     return None
-                details.append((name, paths, audiobook_details(paths, cache)))
+                info = audiobook_details(paths, cache)
+                rows = audiobook_chapters(paths, info[3], cache)
+                details.append((name, paths, tuple(info) + (rows,)))
                 progress(index + 1, total, name)
             return {"books": books, "signature": signature,
                     "details": details, "cache": cache}
@@ -26506,8 +27490,9 @@ class AudiobooksTab(QWidget):
         self._detail_cache.update(result.get("cache") or {})
         self._books = []
         for name, paths, details in result.get("details") or []:
-            artist, chapters, total, lengths, cover = details
-            self._books.append((name, paths, artist, chapters, total, lengths, cover))
+            artist, chapters, total, lengths, cover, chapter_rows = details
+            self._books.append((name, paths, artist, chapters, total, lengths, cover,
+                                chapter_rows))
         self._books_signature = result.get("signature")
         self._cover_pix_cache = {}
         self._render_books()
@@ -26525,41 +27510,154 @@ class AudiobooksTab(QWidget):
             self.refresh_async(force=True)
 
     def shutdown(self):
-        """Stop background reads before the window and its QThreads go away."""
+        """Stop background reads and save the audiobook position before shutdown."""
         self._shutting_down = True
+        self.ab_player.shutdown()
         for worker in (self._import_worker, self._refresh_worker):
             if worker is None or not worker.isRunning():
                 continue
             worker.cancel()
             worker.wait(15000)
 
-    def _play_item(self, item, _column=0):
-        """A book plays from its first track; a track plays its book from that track on."""
-        book = item.parent() or item
-        start = book.indexOfChild(item) if item.parent() else 0
-        paths = self._book_paths.get(book.data(0, Qt.UserRole))
-        if paths:
-            self.player.set_queue(paths, start=start, play=True)
+    def hideEvent(self, event):
+        """Audiobook playback belongs to this tab; leaving pauses it."""
+        self.ab_player.pause()
+        super().hideEvent(event)
 
-    def _queue_item(self, item):
-        """Queue a whole book, or the chapter that was right-clicked."""
+    def _book_key_for_item(self, item):
         if item is None:
-            return
+            return "", None
         book = item.parent() or item
-        paths = self._book_paths.get(book.data(0, Qt.UserRole))
-        if not paths:
+        return book.data(0, BOOK_ROLE) or "", book
+
+    def _play_item(self, item, _column=0):
+        """Double-click a book to resume it, or a chapter to play that chapter."""
+        key, book = self._book_key_for_item(item)
+        rows = self._book_chapters.get(key) or []
+        if not rows:
             return
         if item.parent() is None:
-            chosen = list(paths)
+            chapter, position = self.ab_player.saved_state(key)
+            if chapter >= len(rows):
+                chapter, position = 0, 0.0
         else:
-            index = book.indexOfChild(item)
-            chosen = [paths[index]] if 0 <= index < len(paths) else []
-        if not chosen:
+            chapter = int(item.data(0, CHAPTER_ROLE) or 0)
+            saved_chapter, saved_position = self.ab_player.saved_state(key)
+            position = saved_position if saved_chapter == chapter else 0.0
+        self._current_book_key = key
+        self.ab_player.load_book(
+            {"key": key, "title": book.text(1), "author": book.text(2)},
+            rows, chapter, position, autoplay=True)
+        # Rebuilding the drawer is only needed when it shows another book; doing it
+        # inside a drawer click would delete the item whose signal is still running.
+        if key != self._chapter_panel_key:
+            self._update_chapter_panel(key)
+
+    def _chapter_clicked(self, item, _column=0):
+        """One click on a chapter in the drawer plays it, like a file elsewhere.
+
+        Clicking the chapter that is already in the bar does not start it over: it
+        just makes sure it is playing, so a second click of a double-click is harmless.
+        """
+        if item is None:
             return
-        self.player.add_paths(chosen, play_if_idle=False)
+        key = item.data(0, BOOK_ROLE)
+        book = self._book_items.get(key)
+        index = item.data(0, CHAPTER_ROLE)
+        if book is None or index is None or not (0 <= int(index) < book.childCount()):
+            return
+        if (key == self.ab_player.book_key and int(index) == self.ab_player.chapter
+                and self.ab_player.chapters):
+            if not self.ab_player.playing:
+                self.ab_player.toggle()
+            return
+        self._play_item(book.child(int(index)))
+
+    def _chapter_double(self, item, _column=0):
+        self._chapter_clicked(item, _column)
+
+    def _restore_last_book(self):
+        """Put the last book and its saved chapter back in the bar, without playing."""
+        if self._restored_last_book:
+            return
+        key = str(self.ab_player.bookmarks.last or "")
+        if not key:
+            self._restored_last_book = True
+            return
+        item = self._book_items.get(key)
+        rows = self._book_chapters.get(key) or []
+        if item is None or not rows:
+            return
+        chapter, position = self.ab_player.saved_state(key)
+        if chapter >= len(rows):
+            chapter, position = 0, 0.0
+        self._current_book_key = key
+        self.ab_player.load_book(
+            {"key": key, "title": item.text(1), "author": item.text(2)},
+            rows, chapter, position, autoplay=False)
+        self.tree.setCurrentItem(item)
+        self._update_chapter_panel(key)
+        self._restored_last_book = True
+
+    def _selected_book_item(self):
+        selected = self.tree.selectedItems()
+        if not selected:
+            return None
+        return selected[0].parent() or selected[0]
+
+    def _selection_changed(self):
+        if self.chapter_panel.isVisible():
+            book = self._selected_book_item() or self._book_items.get(self._current_book_key)
+            self._update_chapter_panel(book.data(0, BOOK_ROLE) if book is not None else "")
+
+    def _update_chapter_panel(self, key=None):
+        key = key if key is not None else self._current_book_key
+        book = self._book_items.get(key)
+        if book is None:
+            self.chapter_title.setText("Chapters")
+            self.chapter_list.clear()
+            self._chapter_panel_key = ""
+            return
+        rows = self._book_chapters.get(key) or []
+        self.chapter_title.setText(book.text(1))
+        self._chapter_panel_key = key
+        self.chapter_list.clear()
+        for index, row in enumerate(rows):
+            item = QTreeWidgetItem(self.chapter_list, [
+                row.get("name") or f"Chapter {index + 1}",
+                fmt_time(row.get("duration") or 0)])
+            item.setData(0, BOOK_ROLE, key)
+            item.setData(0, CHAPTER_ROLE, index)
+            item.setToolTip(0, row.get("path") or "")
+
+    def _show_chapters(self, show):
+        if show:
+            book = self._book_items.get(self._current_book_key) or self._selected_book_item()
+            if book is None and self.tree.topLevelItemCount():
+                book = self.tree.topLevelItem(0)
+            if book is None:
+                button = self.ab_player.chapters_btn
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+                return
+            self._update_chapter_panel(book.data(0, BOOK_ROLE) or "")
+            self.chapter_panel.show()
+        else:
+            self.chapter_panel.hide()
+        button = self.ab_player.chapters_btn
+        button.blockSignals(True)
+        button.setChecked(bool(show))
+        button.setToolTip("Hide chapters" if show else "Show chapters")
+        button.blockSignals(False)
+
+    def _toggle_chapters(self):
+        self._show_chapters(not self.chapter_panel.isVisible())
+
+    def _player_error(self, message):
         notice = getattr(self.window(), "notify", None)
-        if notice:
-            notice(f"Added {len(chosen)} chapter{'s' if len(chosen) != 1 else ''} to the queue")
+        if notice and message:
+            notice(message)
 
     def _tree_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -26567,7 +27665,8 @@ class AudiobooksTab(QWidget):
             return
         menu = QMenu(self)
         menu.addAction("Play", lambda: self._play_item(item))
-        menu.addAction("Add to queue", lambda: self._queue_item(item))
+        menu.addAction("Hide chapters" if self.chapter_panel.isVisible() else "Show chapters",
+                       self._toggle_chapters)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
 
@@ -26630,6 +27729,7 @@ class MainWindow(QMainWindow):
         self.tabs.setCornerWidget(logo, Qt.Corner.TopLeftCorner)
         self.sync_tab.activity.connect(self.sync_activity.set_text)
         self.devices_tab.activity.connect(self.sync_activity.set_text)
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.tabs.setCurrentIndex(min(max(int(self.config.get("tab", 0)), 0), 4))
 
         central = QWidget()
@@ -27355,6 +28455,7 @@ class MainWindow(QMainWindow):
         """Repaint the whole window with the theme in the config."""
         apply_theme(QApplication.instance(), self.config)
         self.player.refresh_theme()
+        self.audiobooks_tab.ab_player.refresh_theme()
         self.library_tab.refresh_theme()
         self.devices_tab.refresh_theme()
         self.sync_tab.refresh_log_icon()
@@ -27414,6 +28515,21 @@ class MainWindow(QMainWindow):
         self.devices_tab.reload()
         self.notify("Collection: %s" % cols[index]["name"])
 
+    def _tab_changed(self, index):
+        """Music and audiobooks each get their own player and layout."""
+        is_audiobooks = self.tabs.widget(index) is self.audiobooks_tab
+        if is_audiobooks:
+            # Entering this tab is a mode switch: music must not keep playing
+            # underneath the audiobook layout. Pause it rather than clearing the
+            # current track, so returning to Music can carry on where it was.
+            self.player.pause_playback()
+            self.player.hide()
+            self.audiobooks_tab.refresh()
+        else:
+            self.audiobooks_tab.ab_player.pause()
+            self.player.show()
+        self.config["tab"] = index
+
     def _show_buffer_status(self, text):
         """Show what the buffers are reading, without stepping on another status message."""
         if text:
@@ -27457,11 +28573,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
-    app.setOrganizationName("Nebula")
+    app.setOrganizationName("Ariance")
     # The taskbar matches a window to its launcher by this name: it must be the desktop
-    # entry the package installs (nebula-music-center.desktop), or the taskbar shows a
+    # entry the package installs (ariance-music-center.desktop), or the taskbar shows a
     # generic icon and no name for the running app.
-    app.setDesktopFileName("nebula-music-center")
+    app.setDesktopFileName("ariance-music-center")
     app.setWindowIcon(QIcon(ICON_FILE))
     install_app_style(app)
     w = MainWindow()

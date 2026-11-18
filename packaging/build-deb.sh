@@ -1,13 +1,13 @@
 #!/bin/bash
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-# Build nebula-music-center_1.29_amd64.deb from the source tree.
+# Build ariance-music-center_1.30_amd64.deb from the source tree.
 # The bundle is the same one the zip and the AppImage ship: PySide6, mutagen and
 # the X11/font/audio helper libraries, so the package needs no distro Qt.
 set -euo pipefail
 
-V=1.29
-PKG=nebula-music-center
+V=1.30
+PKG=ariance-music-center
 ARCH=amd64
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RELEASE_DIR=${NMC_RELEASE_DIR:-$SRC/release-$V}
@@ -17,7 +17,7 @@ STAGE=$(mktemp -d /tmp/deb$V-XXXXXX)
 trap 'rm -rf "$STAGE"' EXIT
 APPDIR=$STAGE/opt/$PKG
 
-test -f "$SRC/nebula.py"
+test -f "$SRC/ariance.py"
 test -d "$SRC/assets/PySide6"
 
 mkdir -p "$APPDIR" "$STAGE/DEBIAN" \
@@ -29,30 +29,30 @@ mkdir -p "$APPDIR" "$STAGE/DEBIAN" \
 # only what the app runs on: the script, the launcher, the icon, the docs and
 # the bundled runtime.  The test suite and the screenshot folder stay in the
 # source tree; they are development material, not part of an installed app.
-cp -a "$SRC/run.sh" "$SRC/nebula.py" "$SRC/nebula.png" "$SRC/sync-log.png" \
+cp -a "$SRC/run.sh" "$SRC/ariance.py" "$SRC/ariance.png" "$SRC/sync-log.png" \
       "$SRC/README.md" \
       "$SRC/THIRD_PARTY_LICENSES.md" "$SRC/requirements.txt" "$SRC/assets" "$APPDIR/"
 find "$APPDIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$APPDIR" -name '*.pyc' -delete
-# marks an installed bundle: run.sh copies it into ~/.cache/Nebula and runs it there
+# marks an installed bundle: run.sh copies it into ~/.cache/Ariance and runs it there
 printf '%s\n' "$V" > "$APPDIR/BUNDLE_VERSION"
 
 # launcher on $PATH: hands off to the bundle's own run.sh
-# Prefers the package copy in /opt, which refreshes ~/.cache/Nebula/app on upgrade.
-# If /opt has been removed, runs the copy already in ~/.cache/Nebula/app.
+# Prefers the package copy in /opt, which refreshes ~/.cache/Ariance/app on upgrade.
+# If /opt has been removed, runs the copy already in ~/.cache/Ariance/app.
 cat > "$STAGE/usr/bin/$PKG" <<'LAUNCH'
 #!/bin/sh
-if [ -f /opt/nebula-music-center/run.sh ]; then
-    exec /opt/nebula-music-center/run.sh "$@"
+if [ -f /opt/ariance-music-center/run.sh ]; then
+    exec /opt/ariance-music-center/run.sh "$@"
 fi
-exec "${NEBULA_CACHE:-$HOME/.cache/Nebula}/app/run.sh" "$@"
+exec "${ARIANCE_CACHE:-$HOME/.cache/Ariance}/app/run.sh" "$@"
 LAUNCH
 chmod 0755 "$STAGE/usr/bin/$PKG" "$APPDIR/run.sh"
 
 cat > "$STAGE/usr/share/applications/$PKG.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
-Name=Nebula Music Center
+Name=Ariance Music Center
 GenericName=Music Player
 Comment=Music library, player and tagger
 Exec=/usr/bin/$PKG %U
@@ -64,7 +64,7 @@ Keywords=music;audio;player;library;cd;sync;mp3;flac;
 StartupNotify=true
 DESKTOP
 
-install -m 0644 "$SRC/nebula.png" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PKG.png"
+install -m 0644 "$SRC/ariance.png" "$STAGE/usr/share/icons/hicolor/256x256/apps/$PKG.png"
 install -m 0644 "$SRC/README.md" "$STAGE/usr/share/doc/$PKG/README.md"
 install -m 0644 "$SRC/THIRD_PARTY_LICENSES.md" "$STAGE/usr/share/doc/$PKG/THIRD_PARTY_LICENSES.md"
 install -m 0644 "$SRC/LICENSE" "$STAGE/usr/share/doc/$PKG/LICENSE"
@@ -76,8 +76,8 @@ cp -a "$SRC/LICENSES/." "$STAGE/usr/share/doc/$PKG/LICENSES/"
 
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<'COPY'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: nebula-music-center
-Source: https://github.com/blaz101/Nebula-Music-Center
+Upstream-Name: ariance-music-center
+Source: https://github.com/blaz101/Ariance-Music-Center
 
 Files: *
 Copyright: 2026 Roger Barthares
@@ -92,7 +92,7 @@ License: GPL-3.0-only
  .
  On Debian systems the complete GPLv3 text is in
  /usr/share/common-licenses/GPL-3. The complete text is also installed as
- /usr/share/doc/nebula-music-center/LICENSE.
+ /usr/share/doc/ariance-music-center/LICENSE.
 
 Files: assets/PySide6/* assets/shiboken6/*
 Copyright: Qt Company and contributors
@@ -125,7 +125,7 @@ Copyright: Lucide Icons and contributors
 License: ISC
  See LICENSES/Lucide.txt.
 
-Files: nebula.png branding/nebula-logo.png
+Files: ariance.png branding/ariance-logo.png
 Copyright: 2026 Roger Barthares
 License: GPL-3.0-only
  The name and logo are subject to the trademark policy in TRADEMARK.md.
@@ -140,14 +140,14 @@ Maintainer: Roger Barthares <roger.barthares@gmail.com>
 Installed-Size: $SIZE
 Section: sound
 Priority: optional
-Homepage: https://github.com/blaz101/Nebula-Music-Center
+Homepage: https://github.com/blaz101/Ariance-Music-Center
 Description: Music library, player, tagger and device sync
- Nebula Music Center plays and tags a local music library, rips and burns
+ Ariance Music Center plays and tags a local music library, rips and burns
  audio CDs with buffering so the drive is not read during playback, and
  syncs to USB players, iPods and MTP phones.
  .
- It keeps your settings and library in ~/Nebula and its caches in
- ~/.cache/Nebula. It brings its own Qt, so no distribution Qt is needed.
+ It keeps your settings and library in ~/Ariance and its caches in
+ ~/.cache/Ariance. It brings its own Qt, so no distribution Qt is needed.
 Recommends: gvfs-backends, ffmpeg, cdparanoia, eject, genisoimage, wodim | cdrdao, libssl3 | libssl3t64
 CONTROL
 

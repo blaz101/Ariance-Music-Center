@@ -1,10 +1,10 @@
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-"""Deep verification for nebula.py.
+"""Deep verification for ariance.py.
 
 Run:  QT_QPA_PLATFORM=offscreen python3 tests/deep_check.py
 
-Every run builds a throw-away home and points NEBULA_DATA/NEBULA_CACHE into it, so a
+Every run builds a throw-away home and points ARIANCE_DATA/ARIANCE_CACHE into it, so a
 real library, config or device list on this machine can never be touched. The suite
 covers the places a regression has actually hurt before: settings surviving a save and
 a restart, the config backup, remembered devices and shared presets, the two grids, the
@@ -26,12 +26,12 @@ import wave
 
 import mutagen
 
-HOME = tempfile.mkdtemp(prefix="nebula-deep-")
+HOME = tempfile.mkdtemp(prefix="ariance-deep-")
 os.environ["HOME"] = HOME
-DATA = os.path.join(HOME, "Nebula")
-CACHE = os.path.join(HOME, ".cache", "Nebula")
-os.environ["NEBULA_DATA"] = DATA
-os.environ["NEBULA_CACHE"] = CACHE
+DATA = os.path.join(HOME, "Ariance")
+CACHE = os.path.join(HOME, ".cache", "Ariance")
+os.environ["ARIANCE_DATA"] = DATA
+os.environ["ARIANCE_CACHE"] = CACHE
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 atexit.register(shutil.rmtree, HOME, True)
 
@@ -48,7 +48,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,  # noqa: E402
                                QLabel, QMessageBox, QPushButton, QToolButton)
 
-import nebula  # noqa: E402
+import ariance  # noqa: E402
 
 RESULTS = []
 SECTION = [""]
@@ -141,13 +141,13 @@ ffmpeg("-i", os.path.join(HOME, "silence.m4a"), "-c", "copy", "-metadata",
        "title=The Hobbit", "-metadata", "artist=J. R. R. Tolkien", AB_LOOSE)
 
 app = QApplication([])
-nebula.install_app_style(app)
-nebula.detect_devices = lambda: []
-nebula.cd_drive_states = lambda: {}
+ariance.install_app_style(app)
+ariance.detect_devices = lambda: []
+ariance.cd_drive_states = lambda: {}
 
 
 def fresh_config(**values):
-    cfg = json.loads(json.dumps(nebula.DEFAULT_CONFIG))
+    cfg = json.loads(json.dumps(ariance.DEFAULT_CONFIG))
     cfg.update(values)
     return cfg
 
@@ -155,15 +155,15 @@ def fresh_config(**values):
 # ---------------------------------------------------------------- isolation
 section("isolation and version")
 check("the suite writes only inside its throw-away home",
-      nebula.CONFIG_FILE.startswith(HOME + os.sep) and nebula.DB_FILE.startswith(HOME + os.sep),
-      (nebula.CONFIG_FILE, nebula.DB_FILE))
+      ariance.CONFIG_FILE.startswith(HOME + os.sep) and ariance.DB_FILE.startswith(HOME + os.sep),
+      (ariance.CONFIG_FILE, ariance.DB_FILE))
 check("the real settings file was not opened",
-      not nebula.CONFIG_FILE.startswith("/home/rba/Nebula"), nebula.CONFIG_FILE)
+      not ariance.CONFIG_FILE.startswith("/home/rba/Ariance"), ariance.CONFIG_FILE)
 check("file dialogs use the system's native chooser",
-      not (nebula.FILE_DIALOG_OPTIONS & QFileDialog.Option.DontUseNativeDialog)
-      and nebula.DIRECTORY_DIALOG_OPTIONS == QFileDialog.Option.ShowDirsOnly,
-      (nebula.FILE_DIALOG_OPTIONS, nebula.DIRECTORY_DIALOG_OPTIONS))
-dialog_source = open(os.path.join(ROOT, "nebula.py"), encoding="utf-8").read()
+      not (ariance.FILE_DIALOG_OPTIONS & QFileDialog.Option.DontUseNativeDialog)
+      and ariance.DIRECTORY_DIALOG_OPTIONS == QFileDialog.Option.ShowDirsOnly,
+      (ariance.FILE_DIALOG_OPTIONS, ariance.DIRECTORY_DIALOG_OPTIONS))
+dialog_source = open(os.path.join(ROOT, "ariance.py"), encoding="utf-8").read()
 dialog_calls = [
     node for node in ast.walk(ast.parse(dialog_source))
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -185,20 +185,58 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.29", nebula.VERSION == "1.29", nebula.VERSION)
+check("version is 1.30", ariance.VERSION == "1.30", ariance.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Nebula Music Center 1.29\n"), readme[:40])
-check("README has a 1.29 section", "## What's new in 1.29" in readme)
+      readme.startswith("# Ariance Music Center 1.30\n"), readme[:40])
+check("README has a 1.30 section", "## What's new in 1.30" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.29", "\nV=1.29\n" in build, build[:200])
+check("the package script builds 1.30", "\nV=1.30\n" in build, build[:200])
+check("the package is named after the app", "PKG=ariance-music-center" in build, build[:200])
+
+# ------------------------------------------------------- the move from 1.29
+section("the 1.29 folders move to the new name")
+legacy = tempfile.mkdtemp(dir=HOME, prefix="legacy-")
+old_root = os.path.join(legacy, "Nebula")
+os.makedirs(os.path.join(old_root, "settings"))
+with open(os.path.join(old_root, "settings", "config.json"), "w", encoding="utf-8") as fh:
+    fh.write("{}")
+new_root = os.path.join(legacy, "Ariance")
+check("the old library is moved, not copied",
+      ariance.migrate_legacy_root("ARIANCE_TEST_ROOT", new_root, old_root) == new_root
+      and os.path.isfile(os.path.join(new_root, "settings", "config.json"))
+      and not os.path.exists(old_root),
+      os.listdir(legacy))
+os.makedirs(old_root)
+open(os.path.join(old_root, "stale.txt"), "w", encoding="utf-8").close()
+check("a folder already at the new name wins",
+      ariance.migrate_legacy_root("ARIANCE_TEST_ROOT", new_root, old_root) == new_root
+      and os.path.isdir(old_root), os.listdir(legacy))
+blocked = os.path.join(legacy, "blocked")
+open(blocked, "w", encoding="utf-8").close()      # a file where the parent must be
+old_root2 = os.path.join(legacy, "Nebula2")
+os.makedirs(old_root2)
+check("a failed move keeps using the old folder",
+      ariance.migrate_legacy_root("ARIANCE_TEST_ROOT",
+                                  os.path.join(blocked, "Ariance"), old_root2) == old_root2,
+      ariance.migrate_legacy_root("ARIANCE_TEST_ROOT",
+                                  os.path.join(blocked, "Ariance"), old_root2))
+os.environ["ARIANCE_TEST_ROOT"] = new_root
+check("an explicit ARIANCE_DATA-style root is used as given",
+      ariance.migrate_legacy_root("ARIANCE_TEST_ROOT",
+                                  os.path.join(legacy, "other"), old_root2) == new_root)
+del os.environ["ARIANCE_TEST_ROOT"]
+launcher_text = open(os.path.join(ROOT, "run.sh"), encoding="utf-8").read()
+check("the launcher moves the old folder before it creates the new one",
+      launcher_text.index("mv \"$HOME/Nebula\"") < launcher_text.index("mkdir -p \"$CACHE_ROOT/tmp\""),
+      launcher_text[:600])
 
 # ---------------------------------------------------------------- config
 section("config: defaults, types, backup and recovery")
-cfg = nebula.load_config()
+cfg = ariance.load_config()
 check("every default key is present",
-      all(k in cfg for k in nebula.DEFAULT_CONFIG), sorted(set(nebula.DEFAULT_CONFIG) - set(cfg)))
-check("defaults keep the current UI revision", cfg["ui_revision"] == 42, cfg["ui_revision"])
+      all(k in cfg for k in ariance.DEFAULT_CONFIG), sorted(set(ariance.DEFAULT_CONFIG) - set(cfg)))
+check("defaults keep the current UI revision", cfg["ui_revision"] == 43, cfg["ui_revision"])
 
 cfg["library_folders"] = [MUSIC]
 cfg["audiobook_folders"] = [AB]
@@ -208,10 +246,10 @@ cfg["window"] = [1111, 777]
 cfg["device_registry"] = [{"id": "mass:/stick", "name": "Stick", "kind": "mass",
                            "root": "/stick", "uri": ""}]
 cfg["device_names"] = {"mass:/stick": "My Stick"}
-cfg["collections"] = [{"name": "Music", "folders": [MUSIC], "db": nebula.DB_FILE}]
+cfg["collections"] = [{"name": "Music", "folders": [MUSIC], "db": ariance.DB_FILE}]
 cfg["active_collection"] = 0
-nebula.save_config(cfg)
-loaded = nebula.load_config()
+ariance.save_config(cfg)
+loaded = ariance.load_config()
 check("library folders survive a save and load", loaded["library_folders"] == [MUSIC],
       loaded["library_folders"])
 check("collections keep their folder list",
@@ -226,17 +264,17 @@ check("window, tab and volume survive",
 
 # a second save keeps the file it replaced
 loaded["volume"] = 22
-nebula.save_config(loaded)
-backup = json.load(open(nebula.CONFIG_FILE + ".bak", encoding="utf-8"))
+ariance.save_config(loaded)
+backup = json.load(open(ariance.CONFIG_FILE + ".bak", encoding="utf-8"))
 check("a save keeps the previous config as config.json.bak", backup["volume"] == 11,
       backup.get("volume"))
 check("the backup holds the folders too", backup["library_folders"] == [MUSIC],
       backup.get("library_folders"))
 
 # a truncated write is recovered from the backup instead of starting over
-with open(nebula.CONFIG_FILE, "w", encoding="utf-8") as f:
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     f.write('{"library_folders": [')
-recovered = nebula.load_config()
+recovered = ariance.load_config()
 check("a truncated config is read from the backup",
       recovered["library_folders"] == [MUSIC] and recovered["volume"] == 11,
       (recovered.get("library_folders"), recovered.get("volume")))
@@ -244,18 +282,18 @@ check("the recovery brings the devices back too",
       recovered["device_registry"][0]["id"] == "mass:/stick", recovered.get("device_registry"))
 
 # an unreadable config with no backup keeps working with defaults
-os.remove(nebula.CONFIG_FILE)
-os.remove(nebula.CONFIG_FILE + ".bak")
+os.remove(ariance.CONFIG_FILE)
+os.remove(ariance.CONFIG_FILE + ".bak")
 check("no config at all still starts with defaults",
-      nebula.load_config()["library_folders"] == [])
+      ariance.load_config()["library_folders"] == [])
 check("saving with no previous file does not fail",
-      (nebula.save_config(fresh_config()), os.path.exists(nebula.CONFIG_FILE))[1])
+      (ariance.save_config(fresh_config()), os.path.exists(ariance.CONFIG_FILE))[1])
 
 # wrong types are repaired rather than crashing a tab
-with open(nebula.CONFIG_FILE, "w", encoding="utf-8") as f:
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     json.dump({"library_folders": "Music", "volume": "loud", "window": 12,
                "collections": "nope", "custom_key": {"kept": True}}, f)
-repaired = nebula.load_config()
+repaired = ariance.load_config()
 check("a string in place of the folder list is repaired",
       repaired["library_folders"] == [], repaired["library_folders"])
 check("a bad number becomes the default", repaired["volume"] == 70, repaired["volume"])
@@ -264,65 +302,74 @@ check("the repaired config has a usable collection",
       repaired["collections"][0]["name"] == "Music", repaired["collections"])
 
 # the 1.07 tab-index migration must not run again, but must still work on old configs
-with open(nebula.CONFIG_FILE, "w", encoding="utf-8") as f:
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     json.dump({"ui_revision": 0, "tab": 2}, f)
-migrated = nebula.load_config()
+migrated = ariance.load_config()
 check("a pre-1.07 tab index moves past the new Audiobooks tab",
-      migrated["tab"] == 3 and migrated["ui_revision"] == 42,
+      migrated["tab"] == 3 and migrated["ui_revision"] == 43,
       (migrated["tab"], migrated["ui_revision"]))
 
+# defaults filled into an old config must be copies, not shared module state
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump({"library_folders": [MUSIC]}, f)
+missing_defaults = ariance.load_config()
+missing_defaults["grid_layouts"]["leak"] = {"order": [0, 1], "widths": [10, 20]}
+check("a default added to an old config is a private copy",
+      "leak" not in ariance.DEFAULT_CONFIG["grid_layouts"],
+      ariance.DEFAULT_CONFIG["grid_layouts"])
+
 section("collections")
-cols = nebula.migrate_collections(fresh_config())
+cols = ariance.migrate_collections(fresh_config())
 check("one default collection is created", len(cols) == 1 and cols[0]["name"] == "Music", cols)
 cfg = fresh_config()
 cfg["collections"] = [{"name": "Music", "folders": [], "db": "a.db"},
                       {"name": "Music", "folders": [], "db": "b.db"},
                       {"name": "", "folders": [], "db": "c.db"},
                       "junk"]
-cols = nebula.migrate_collections(cfg)
+cols = ariance.migrate_collections(cfg)
 check("duplicate collection names are made unique",
       [c["name"] for c in cols] == ["Music", "Music 2"], [c["name"] for c in cols])
 check("a nameless collection is dropped", len(cols) == 2, cols)
 cfg["active_collection"] = 99
 check("an out-of-range collection index is clamped",
-      nebula.migrate_collections(cfg) and cfg["active_collection"] == 1,
+      ariance.migrate_collections(cfg) and cfg["active_collection"] == 1,
       cfg["active_collection"])
 cfg["library_folders"] = [MUSIC]
-nebula.store_active_collection(cfg)
+ariance.store_active_collection(cfg)
 check("the active collection's folder list follows the live one",
       cfg["collections"][1]["folders"] == [MUSIC], cfg["collections"])
 check("a new collection database lives under library/collections",
-      nebula.new_collection_db("Deep Test").startswith(
-          os.path.join(nebula.LIBRARY_DIR, "collections") + os.sep))
+      ariance.new_collection_db("Deep Test").startswith(
+          os.path.join(ariance.LIBRARY_DIR, "collections") + os.sep))
 
 # ---------------------------------------------------------------- library
 section("tags, scanning and the library database")
-tags = nebula.read_tags(WAV1)
+tags = ariance.read_tags(WAV1)
 check("WAV tags are read", tags["title"] == "Alpha" and tags["artist"] == "Aphex Twin",
       tags)
-specs = nebula.read_specs(WAV1)
+specs = ariance.read_specs(WAV1)
 check("WAV specs are read",
       (specs["bits_per_sample"], specs["sample_rate"], specs["channels"]) == (16, 44100, 2),
       specs)
-check("FLAC tags are read", nebula.read_tags(FLAC1)["artist"] == "Boards of Canada",
-      nebula.read_tags(FLAC1))
-check("MP3 tags are read", nebula.read_tags(MP3A)["title"] == "Delta")
+check("FLAC tags are read", ariance.read_tags(FLAC1)["artist"] == "Boards of Canada",
+      ariance.read_tags(FLAC1))
+check("MP3 tags are read", ariance.read_tags(MP3A)["title"] == "Delta")
 
 section("lyrics: sidecars, embedded tags and source order")
-parsed = nebula.parse_lyrics("[ar:Test]\n[offset:100]\n"
+parsed = ariance.parse_lyrics("[ar:Test]\n[offset:100]\n"
                              "[00:01.50][00:03.00]Hello\n[00:02.00]World\n")
 check("LRC timestamps, repeats and the offset tag parse",
       parsed["synced"] and parsed["lines"] == [(1600, "Hello"), (2100, "World"),
                                                 (3100, "Hello")], parsed)
-plain = nebula.parse_lyrics("Plain one\n\nPlain two")
+plain = ariance.parse_lyrics("Plain one\n\nPlain two")
 check("plain lyrics keep their paragraphs",
       not plain["synced"] and plain["text"] == "Plain one\n\nPlain two", plain)
 sidecar_audio = os.path.join(HOME, "lyrics-sidecar.mp3")
 with open(os.path.join(HOME, "lyrics-sidecar.lrc"), "w", encoding="utf-8") as handle:
     handle.write("[00:00.00]Sidecar line one\n[00:02.00]Sidecar line two\n")
 check("a case-insensitive LRC sidecar is found",
-      nebula.parse_lyrics(nebula.read_lrc_lyrics(sidecar_audio))["text"]
-      == "Sidecar line one\nSidecar line two", nebula.read_lrc_lyrics(sidecar_audio))
+      ariance.parse_lyrics(ariance.read_lrc_lyrics(sidecar_audio))["text"]
+      == "Sidecar line one\nSidecar line two", ariance.read_lrc_lyrics(sidecar_audio))
 lyrics_mp3 = os.path.join(HOME, "lyrics-tag.mp3")
 shutil.copyfile(MP3A, lyrics_mp3)
 audio = mutagen.File(lyrics_mp3)
@@ -330,8 +377,8 @@ audio.tags.add(USLT(encoding=3, lang="eng", desc="",
                     text="Embedded line one\nEmbedded line two"))
 audio.save()
 check("USLT lyrics are read from an MP3",
-      nebula.read_embedded_lyrics(lyrics_mp3) == "Embedded line one\nEmbedded line two",
-      nebula.read_embedded_lyrics(lyrics_mp3))
+      ariance.read_embedded_lyrics(lyrics_mp3) == "Embedded line one\nEmbedded line two",
+      ariance.read_embedded_lyrics(lyrics_mp3))
 lyrics_wav = os.path.join(HOME, "lyrics-tag.wav")
 shutil.copyfile(WAV1, lyrics_wav)
 audio = mutagen.File(lyrics_wav)
@@ -340,17 +387,17 @@ if audio.tags is None:
 audio.tags.add(USLT(encoding=3, lang="eng", desc="", text="WAV line"))
 audio.save()
 check("USLT lyrics are read from a WAV",
-      nebula.read_embedded_lyrics(lyrics_wav) == "WAV line",
-      nebula.read_embedded_lyrics(lyrics_wav))
+      ariance.read_embedded_lyrics(lyrics_wav) == "WAV line",
+      ariance.read_embedded_lyrics(lyrics_wav))
 blank_lyrics_audio = os.path.join(HOME, "lyrics-blank.mp3")
 shutil.copyfile(MP3A, blank_lyrics_audio)
-blank_sidecar = nebula.write_lrc_lyrics(
+blank_sidecar = ariance.write_lrc_lyrics(
     blank_lyrics_audio, lines=[(1000, ""), (2000, "Line")])
-blank_saved = nebula.read_lrc_lyrics(blank_sidecar)
+blank_saved = ariance.read_lrc_lyrics(blank_sidecar)
 check("timed empty lines save as clear cues without the editor label",
       blank_saved == "[00:01.00]\n[00:02.00]Line",
       blank_saved)
-blank_result = nebula._lyrics_result(blank_saved, "lrc")
+blank_result = ariance._lyrics_result(blank_saved, "lrc")
 check("timed empty lines survive loading a sidecar",
       blank_result is not None
       and blank_result["lines"] == [(1000, ""), (2000, "Line")],
@@ -361,39 +408,39 @@ audio = mutagen.File(lyrics_flac)
 audio["LYRICS"] = "Vorbis line one\nVorbis line two"
 audio.save()
 check("LYRICS is read from a Vorbis comment",
-      nebula.read_embedded_lyrics(lyrics_flac) == "Vorbis line one\nVorbis line two",
-      nebula.read_embedded_lyrics(lyrics_flac))
+      ariance.read_embedded_lyrics(lyrics_flac) == "Vorbis line one\nVorbis line two",
+      ariance.read_embedded_lyrics(lyrics_flac))
 lyrics_m4a = os.path.join(HOME, "lyrics-tag.m4a")
 shutil.copyfile(AB_CH1, lyrics_m4a)
 audio = mutagen.File(lyrics_m4a)
 audio["\xa9lyr"] = "M4A line"
 audio.save()
 check("©lyr lyrics are read from an M4A",
-      nebula.read_embedded_lyrics(lyrics_m4a) == "M4A line",
-      nebula.read_embedded_lyrics(lyrics_m4a))
+      ariance.read_embedded_lyrics(lyrics_m4a) == "M4A line",
+      ariance.read_embedded_lyrics(lyrics_m4a))
 check("the default lyric order puts local sources first",
-      nebula.lyric_order(fresh_config()) == ["lrc", "tags", "lrclib", "lyrics_ovh"],
-      nebula.lyric_order(fresh_config()))
+      ariance.lyric_order(fresh_config()) == ["lrc", "tags", "lrclib", "lyrics_ovh"],
+      ariance.lyric_order(fresh_config()))
 local_only = fresh_config(lyric_order=[["lrc", True], ["tags", True],
                                        ["lrclib", False], ["lyrics_ovh", False]])
 check("lyrics resolve from a sidecar first",
-      nebula.resolve_lyrics(sidecar_audio, local_only)["source"] == "lrc",
-      nebula.resolve_lyrics(sidecar_audio, local_only))
+      ariance.resolve_lyrics(sidecar_audio, local_only)["source"] == "lrc",
+      ariance.resolve_lyrics(sidecar_audio, local_only))
 check("lyrics fall through to the embedded tag",
-      nebula.resolve_lyrics(lyrics_mp3, local_only)["source"] == "tags",
-      nebula.resolve_lyrics(lyrics_mp3, local_only))
+      ariance.resolve_lyrics(lyrics_mp3, local_only)["source"] == "tags",
+      ariance.resolve_lyrics(lyrics_mp3, local_only))
 calls = []
 def fake_lyrics_get(url, timeout=8):
     calls.append(url)
     return json.dumps({"instrumental": False,
                        "syncedLyrics": "[00:01.00]Online line\n[00:03.00]Online two",
                        "plainLyrics": "Online line\nOnline two"}).encode("utf-8")
-real_lyrics_get = nebula._lyrics_http_get
-nebula._lyrics_http_get = fake_lyrics_get
+real_lyrics_get = ariance._lyrics_http_get
+ariance._lyrics_http_get = fake_lyrics_get
 try:
-    remote = nebula.lookup_lrclib(lyrics_mp3)
+    remote = ariance.lookup_lrclib(lyrics_mp3)
 finally:
-    nebula._lyrics_http_get = real_lyrics_get
+    ariance._lyrics_http_get = real_lyrics_get
 check("LRCLIB exact lookup returns synchronized lyrics",
       remote and remote["source"] == "lrclib"
       and remote["lines"] == [(1000, "Online line"), (3000, "Online two")]
@@ -403,7 +450,7 @@ check("LRCLIB exact lookup returns synchronized lyrics",
 
 def fake_search_lyrics_get(url, timeout=8):
     if "/api/get?" in url:
-        raise nebula.urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        raise ariance.urllib.error.HTTPError(url, 404, "Not Found", {}, None)
     return json.dumps([
         {"id": 1, "trackName": "Delta", "artistName": "MP3 Artist",
          "albumName": "First", "duration": 1, "instrumental": False,
@@ -417,11 +464,11 @@ def fake_search_lyrics_get(url, timeout=8):
     ]).encode("utf-8")
 remote_only = fresh_config(lyric_order=[["lrc", False], ["tags", False],
                                         ["lrclib", True], ["lyrics_ovh", False]])
-nebula._lyrics_http_get = fake_search_lyrics_get
+ariance._lyrics_http_get = fake_search_lyrics_get
 try:
-    match_result = nebula.resolve_lyrics(lyrics_mp3, remote_only)
+    match_result = ariance.resolve_lyrics(lyrics_mp3, remote_only)
 finally:
-    nebula._lyrics_http_get = real_lyrics_get
+    ariance._lyrics_http_get = real_lyrics_get
 check("multiple LRCLIB matches are offered as choices",
       match_result and len(match_result.get("choices") or []) == 3
       and [choice["label"] for choice in match_result["choices"]]
@@ -433,34 +480,34 @@ check("a length-mismatched match uses its plain lyrics",
       and match_result["choices"][2]["result"]["text"] == "Plain long version"
       and not match_result["choices"][2]["result"]["lines"],
       match_result["choices"][2]["result"])
-nebula.forget_lyrics_match(lyrics_mp3)
+ariance.forget_lyrics_match(lyrics_mp3)
 check("lyric shifts default to zero and save per track",
-      nebula.get_lyrics_offset(lyrics_mp3) == 0.0
-      and nebula.save_lyrics_offset(lyrics_mp3, 1.25)
-      and abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
-      nebula.get_lyrics_offset(lyrics_mp3))
-nebula._LYRICS_MATCH_CACHE = None
+      ariance.get_lyrics_offset(lyrics_mp3) == 0.0
+      and ariance.save_lyrics_offset(lyrics_mp3, 1.25)
+      and abs(ariance.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      ariance.get_lyrics_offset(lyrics_mp3))
+ariance._LYRICS_MATCH_CACHE = None
 check("a lyric shift reloads from disk",
-      abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
-      nebula.get_lyrics_offset(lyrics_mp3))
+      abs(ariance.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      ariance.get_lyrics_offset(lyrics_mp3))
 check("saving a match keeps the track's lyric shift",
-      nebula.save_lyrics_match(lyrics_mp3, 8, "Shifted match")
-      and abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
-      nebula.get_lyrics_match(lyrics_mp3))
+      ariance.save_lyrics_match(lyrics_mp3, 8, "Shifted match")
+      and abs(ariance.get_lyrics_offset(lyrics_mp3) - 1.25) < 1e-9,
+      ariance.get_lyrics_match(lyrics_mp3))
 check("a zero shift removes only the shift",
-      nebula.save_lyrics_offset(lyrics_mp3, 0)
-      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0
-      and (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 8,
-      nebula.get_lyrics_match(lyrics_mp3))
-nebula.forget_lyrics_match(lyrics_mp3)
+      ariance.save_lyrics_offset(lyrics_mp3, 0)
+      and ariance.get_lyrics_offset(lyrics_mp3) == 0.0
+      and (ariance.get_lyrics_match(lyrics_mp3) or {}).get("id") == 8,
+      ariance.get_lyrics_match(lyrics_mp3))
+ariance.forget_lyrics_match(lyrics_mp3)
 check("a chosen LRCLIB match is saved for its track",
-      nebula.save_lyrics_match(lyrics_mp3, 2, "Second")
-      and (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
-      nebula.get_lyrics_match(lyrics_mp3))
-nebula._LYRICS_MATCH_CACHE = None
+      ariance.save_lyrics_match(lyrics_mp3, 2, "Second")
+      and (ariance.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
+      ariance.get_lyrics_match(lyrics_mp3))
+ariance._LYRICS_MATCH_CACHE = None
 check("a saved match reloads from disk",
-      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
-      nebula.get_lyrics_match(lyrics_mp3))
+      (ariance.get_lyrics_match(lyrics_mp3) or {}).get("id") == 2,
+      ariance.get_lyrics_match(lyrics_mp3))
 saved_calls = []
 def fake_saved_lyrics_get(url, timeout=8):
     saved_calls.append(url)
@@ -468,18 +515,18 @@ def fake_saved_lyrics_get(url, timeout=8):
                        "albumName": "Second", "duration": 2, "instrumental": False,
                        "syncedLyrics": "[00:02.00]Saved version",
                        "plainLyrics": "Saved version"}).encode("utf-8")
-nebula._lyrics_http_get = fake_saved_lyrics_get
+ariance._lyrics_http_get = fake_saved_lyrics_get
 try:
-    saved_result = nebula.lookup_lrclib(lyrics_mp3)
+    saved_result = ariance.lookup_lrclib(lyrics_mp3)
 finally:
-    nebula._lyrics_http_get = real_lyrics_get
+    ariance._lyrics_http_get = real_lyrics_get
 check("a saved match is fetched by its LRCLIB id",
       saved_result and saved_result.get("saved_match")
       and saved_result.get("lrclib_id") == 2
       and saved_result.get("lines") == [(2000, "Saved version")]
       and saved_calls == ["https://lrclib.net/api/get/2"],
       (saved_result, saved_calls))
-nebula.forget_lyrics_match(lyrics_mp3)
+ariance.forget_lyrics_match(lyrics_mp3)
 
 section("tag writes: every field and format")
 tag_values = {
@@ -497,23 +544,23 @@ tag_sources = {
 for label, (source, ext) in tag_sources.items():
     target = os.path.join(HOME, "matrix-" + label.lower() + ext)
     shutil.copyfile(source, target)
-    skipped = nebula.write_tags(target, dict(tag_values))
-    core = nebula.read_tags(target)
-    extra = nebula.read_extra_tags(target)
+    skipped = ariance.write_tags(target, dict(tag_values))
+    core = ariance.read_tags(target)
+    extra = ariance.read_extra_tags(target)
     missing = [key for key, value in tag_values.items()
                if (extra.get(key, "") if key == "comment" else core.get(key, "")) != value]
     check(f"{label}: every tag writes and reads back", not skipped and not missing,
           (skipped, missing, core, extra))
-    skipped = nebula.write_tags(target, {key: "" for key in tag_values})
-    core = nebula.read_tags(target)
-    extra = nebula.read_extra_tags(target)
+    skipped = ariance.write_tags(target, {key: "" for key in tag_values})
+    core = ariance.read_tags(target)
+    extra = ariance.read_extra_tags(target)
     still = [key for key in tag_values
              if (extra.get(key, "") if key == "comment" else core.get(key, ""))]
     check(f"{label}: every tag clears again", not skipped and not still,
           (skipped, still, core, extra))
 
 db_file = os.path.join(HOME, "library.db")
-library = nebula.Library(db_file)
+library = ariance.Library(db_file)
 library.scan([MUSIC])
 check("the scan indexes every track", library.count() == 4, library.count())
 rows = library.tracks(order_by="title")
@@ -522,27 +569,27 @@ check("tracks come back ordered", [r["title"] for r in rows][:2] == ["Alpha", "B
 check("the library knows a path", FLAC1 in library.by_path())
 library.scan([MUSIC])
 check("a rescan keeps the same track count", library.count() == 4, library.count())
-nebula.save_lyrics_match(WAV1, 7, "Alpha match")
-nebula.save_lyrics_offset(WAV1, 1.5)
+ariance.save_lyrics_match(WAV1, 7, "Alpha match")
+ariance.save_lyrics_offset(WAV1, 1.5)
 gone = library.forget_prefix(ALBUM_A)
 library.rescan = None
 check("forgetting a folder drops only its tracks and its saved lyrics state",
-      gone == 2 and library.count() == 2 and nebula.get_lyrics_match(WAV1) is None
-      and nebula.get_lyrics_offset(WAV1) == 0.0,
-      (gone, library.count(), nebula.get_lyrics_match(WAV1),
-       nebula.get_lyrics_offset(WAV1)))
-nebula.save_lyrics_match(lyrics_mp3, 9, "Removed match")
-nebula.save_lyrics_offset(lyrics_mp3, 2.0)
+      gone == 2 and library.count() == 2 and ariance.get_lyrics_match(WAV1) is None
+      and ariance.get_lyrics_offset(WAV1) == 0.0,
+      (gone, library.count(), ariance.get_lyrics_match(WAV1),
+       ariance.get_lyrics_offset(WAV1)))
+ariance.save_lyrics_match(lyrics_mp3, 9, "Removed match")
+ariance.save_lyrics_offset(lyrics_mp3, 2.0)
 library.remove_paths([lyrics_mp3])
 check("removing a track from the library forgets its saved lyrics state",
-      nebula.get_lyrics_match(lyrics_mp3) is None
-      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0,
-      (nebula.get_lyrics_match(lyrics_mp3), nebula.get_lyrics_offset(lyrics_mp3)))
+      ariance.get_lyrics_match(lyrics_mp3) is None
+      and ariance.get_lyrics_offset(lyrics_mp3) == 0.0,
+      (ariance.get_lyrics_match(lyrics_mp3), ariance.get_lyrics_offset(lyrics_mp3)))
 library.scan([MUSIC])
 check("a rescan brings a forgotten folder back", library.count() == 4, library.count())
 
 section("playlists and smart playlists")
-playlists = nebula.PlaylistStore(lambda: [MUSIC])
+playlists = ariance.PlaylistStore(lambda: [MUSIC])
 playlists.write("Mix", [WAV1, FLAC1])
 raw = open(playlists.path("Mix"), encoding="utf-8").read().splitlines()
 check("a playlist starts with #EXTM3U", raw[0] == "#EXTM3U", raw[:2])
@@ -562,19 +609,19 @@ check("a playlist can be renamed", playlists.rename(imported, "Imported")
 playlists.remove("Imported")
 check("a playlist can be deleted", "Imported" not in playlists.names())
 
-store = nebula.SmartStore(library)
-never = next(p for p in nebula.SMART_PRESETS if p["name"] == "Never Played")
+store = ariance.SmartStore(library)
+never = next(p for p in ariance.SMART_PRESETS if p["name"] == "Never Played")
 check("a smart playlist runs against the real library",
       len(store.preset_tracks(library, never)) == 4,
       len(store.preset_tracks(library, never)))
-where, params = nebula.build_smart_where(
+where, params = ariance.build_smart_where(
     [{"field": "artist", "op": "contains", "value": "Aphex"}])
 check("the rule builder returns parameterised SQL", "?" in where and params == ["%Aphex%"],
       (where, params))
 check("the rule builder query runs",
       [r["title"] for r in library.tracks(where=where, args=params)] == ["Alpha", "Beta"],
       library.tracks(where=where, args=params))
-where, params = nebula.parse_filter("artist:Aphex")
+where, params = ariance.parse_filter("artist:Aphex")
 check("the filter language parses a field",
       where and [r["title"] for r in library.tracks(where=where, args=params)][:2]
       == ["Alpha", "Beta"], (where, params))
@@ -584,18 +631,18 @@ section("main window, menus and the two regressions")
 boot = fresh_config()
 boot["library_folders"] = [MUSIC]
 boot["audiobook_folders"] = [AB]
-boot["collections"] = [{"name": "Music", "folders": [MUSIC], "db": nebula.DB_FILE}]
+boot["collections"] = [{"name": "Music", "folders": [MUSIC], "db": ariance.DB_FILE}]
 boot["device_registry"] = [{"id": "mass:/stick", "name": "Stick", "kind": "mass",
                             "root": "/stick", "uri": ""}]
 boot["device_names"] = {"mass:/stick": "My Stick"}
-nebula.save_config(boot)
+ariance.save_config(boot)
 
-w = nebula.MainWindow()
+w = ariance.MainWindow()
 w.show()
 app.processEvents()
-check("the main window is titled Nebula Music Center",
-      w.windowTitle() == nebula.APP_NAME == "Nebula Music Center",
-      (w.windowTitle(), nebula.APP_NAME))
+check("the main window is titled Ariance Music Center",
+      w.windowTitle() == ariance.APP_NAME == "Ariance Music Center",
+      (w.windowTitle(), ariance.APP_NAME))
 titles = [w.tabs.tabText(i) for i in range(w.tabs.count())]
 check("the tabs are Music, Audiobooks, Tags, Devices, Syncing",
       titles == ["Music", "Audiobooks", "Tags", "Devices", "Syncing"], titles)
@@ -612,6 +659,17 @@ check("the Music tab shows the player menus",
       menu_titles() == ["Music", "Playlist", "Tools", "Playback", "Help"], menu_titles())
 w.tabs.setCurrentWidget(w.audiobooks_tab)
 app.processEvents()
+check("the Audiobooks tab hides the music player bar", w.player.isHidden())
+check("the Audiobooks tab shows its own player bar",
+      not w.audiobooks_tab.ab_player.isHidden())
+w.tabs.setCurrentWidget(w.library_tab)
+check("leaving Audiobooks brings the music player bar back", not w.player.isHidden())
+stop_calls = []
+real_stop = w.player.pause_playback
+w.player.pause_playback = lambda: stop_calls.append(True)
+w.tabs.setCurrentWidget(w.audiobooks_tab)
+check("switching to Audiobooks pauses music", bool(stop_calls))
+w.player.pause_playback = real_stop
 check("the Audiobooks tab has its own menu set",
       menu_titles() == ["Audiobooks", "Playlist", "Tools", "Playback", "Help"],
       menu_titles())
@@ -635,7 +693,7 @@ check("the Playback actions drive the player",
       (w.player.stop_after, w.player.gapless))
 w._playback_after.setChecked(False)
 w._playback_gapless.setChecked(False)
-crossfade = nebula.CrossfadeDialog(w.player, w)
+crossfade = ariance.CrossfadeDialog(w.player, w)
 crossfade.spin.setValue(2.5)
 check("the crossfade window updates the player and config",
       abs(w.player.crossfade_seconds - 2.5) < 0.01
@@ -648,7 +706,7 @@ check("the Playback menu shows the crossfade length",
 crossfade.close()
 w.player.set_crossfade(0)
 w.player.set_queue([sidecar_audio], start=0)
-lyrics_dialog = nebula.LyricsDialog(w.player, fresh_config(
+lyrics_dialog = ariance.LyricsDialog(w.player, fresh_config(
     lyric_order=[["lrc", True], ["tags", False], ["lrclib", False], ["lyrics_ovh", False]]), w)
 lyrics_dialog.show()
 for _attempt in range(50):
@@ -673,7 +731,7 @@ def lyric_item_for(millis):
     return None
 
 check("the lyrics window uses the compact wider layout",
-      lyrics_dialog.windowTitle() == "Lyrics - Nebula Music Center"
+      lyrics_dialog.windowTitle() == "Lyrics - Ariance Music Center"
       and lyrics_dialog.width() >= 775
       and lyrics_dialog.height() <= 460,
       (lyrics_dialog.windowTitle(), lyrics_dialog.width(), lyrics_dialog.height()))
@@ -708,12 +766,12 @@ check("the lyrics window has a hundredth-second shift control",
       and abs(lyrics_dialog.offset_spin.singleStep() - 0.01) < 1e-9,
       (lyrics_dialog.offset_spin.minimum(), lyrics_dialog.offset_spin.maximum(),
        lyrics_dialog.offset_spin.decimals(), lyrics_dialog.offset_spin.singleStep()))
-nebula.forget_lyrics_match(lyrics_mp3)
+ariance.forget_lyrics_match(lyrics_mp3)
 lyrics_dialog._lyrics_path = lyrics_mp3
 lyrics_dialog.offset_spin.setValue(1.5)
 check("the lyrics window saves a per-track shift",
-      abs(nebula.get_lyrics_offset(lyrics_mp3) - 1.5) < 1e-9,
-      nebula.get_lyrics_offset(lyrics_mp3))
+      abs(ariance.get_lyrics_offset(lyrics_mp3) - 1.5) < 1e-9,
+      ariance.get_lyrics_offset(lyrics_mp3))
 lyrics_dialog._render(match_result or {})
 shifted_item = lyric_item_for(2500)
 check("a positive shift moves synced timestamps later",
@@ -729,8 +787,8 @@ check("the lyrics window lists multiple LRCLIB matches",
       (lyrics_dialog.match_combo.count(),
        [lyric_text(i) for i in range(lyrics_dialog.list.count())]))
 check("the first match is saved for the track",
-      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 1,
-      nebula.get_lyrics_match(lyrics_mp3))
+      (ariance.get_lyrics_match(lyrics_mp3) or {}).get("id") == 1,
+      ariance.get_lyrics_match(lyrics_mp3))
 lyrics_dialog.match_combo.setCurrentIndex(1)
 check("choosing another match switches the lyrics",
       "Second version" in [lyric_text(i)
@@ -746,8 +804,8 @@ check("a length-mismatched match shows its plain lyrics",
       (lyrics_dialog.source_label.text(), lyrics_dialog.note.text(),
        [lyric_text(i) for i in range(lyrics_dialog.list.count())]))
 check("choosing a match replaces the saved one",
-      (nebula.get_lyrics_match(lyrics_mp3) or {}).get("id") == 3,
-      nebula.get_lyrics_match(lyrics_mp3))
+      (ariance.get_lyrics_match(lyrics_mp3) or {}).get("id") == 3,
+      ariance.get_lyrics_match(lyrics_mp3))
 lyrics_dialog.match_combo.setCurrentIndex(0)
 lrc_target = os.path.splitext(lyrics_mp3)[0] + ".lrc"
 check("Save as LRC is offered for a local track",
@@ -766,8 +824,8 @@ check("Save as LRC writes adjusted timestamps beside the audio",
        lyric_item_for(2500) is not None))
 check("saving as LRC clears the now-baked-in shift",
       lyrics_dialog.offset_spin.value() == 0.0
-      and nebula.get_lyrics_offset(lyrics_mp3) == 0.0,
-      (lyrics_dialog.offset_spin.value(), nebula.get_lyrics_offset(lyrics_mp3)))
+      and ariance.get_lyrics_offset(lyrics_mp3) == 0.0,
+      (lyrics_dialog.offset_spin.value(), ariance.get_lyrics_offset(lyrics_mp3)))
 check("matching LRC disables Save as LRC",
       lyrics_dialog.save_lrc_btn.text() == "Save"
       and not lyrics_dialog.save_lrc_btn.isEnabled()
@@ -844,19 +902,19 @@ check("Revert restores the LRC file and disables both buttons",
       (lyric_item_for(2510) is not None,
        lyrics_dialog.save_lrc_btn.isEnabled(), lyrics_dialog.revert_btn.isEnabled(),
        lyrics_dialog.save_lrc_btn.text()))
-nebula.forget_lyrics_match(lyrics_mp3)
+ariance.forget_lyrics_match(lyrics_mp3)
 lyrics_dialog.close()
 w.player.set_queue([])
 
 section("lyrics editor")
-editor = nebula.LyricsEditorDialog(w.library, w.config, w.player, w)
+editor = ariance.LyricsEditorDialog(w.library, w.config, w.player, w)
 check("the lyrics editor has the reference tabs and a song chooser",
       hasattr(editor, "song_btn")
       and [editor.editor_tabs.tabText(i) for i in range(editor.editor_tabs.count())]
       == ["Lyrics", "Syncer", "Preview", "Metadata", "Save"],
       (hasattr(editor, "song_btn"),
        [editor.editor_tabs.tabText(i) for i in range(editor.editor_tabs.count())]))
-chooser = nebula.LyricsSongChooserDialog(library, w.config, WAV1, w)
+chooser = ariance.LyricsSongChooserDialog(library, w.config, WAV1, w)
 check("the song chooser has a full-width library search",
       chooser.search.placeholderText() == "Search the library"
       and chooser.search.isVisibleTo(chooser),
@@ -868,8 +926,8 @@ stack = [chooser.tree.topLevelItem(i)
          for i in range(chooser.tree.topLevelItemCount())]
 while stack:
     item = stack.pop()
-    if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "file":
-        search_paths.append(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+    if item.data(0, ariance.LyricsSongChooserDialog.KIND_ROLE) == "file":
+        search_paths.append(item.data(0, ariance.LyricsSongChooserDialog.PATH_ROLE))
     stack.extend(item.child(i) for i in range(item.childCount()))
 check("searching the song chooser finds library tracks",
       FLAC1 in search_paths,
@@ -879,18 +937,18 @@ app.processEvents()
 chooser_roots = [chooser.tree.topLevelItem(i)
                  for i in range(chooser.tree.topLevelItemCount())]
 music_root = next((item for item in chooser_roots
-                   if item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE) == MUSIC), None)
+                   if item.data(0, ariance.LyricsSongChooserDialog.PATH_ROLE) == MUSIC), None)
 check("the song chooser shows only music library folders",
       music_root is not None and chooser.selected_path() == WAV1
-      and all(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE) != AB
+      and all(item.data(0, ariance.LyricsSongChooserDialog.PATH_ROLE) != AB
               for item in chooser_roots),
-      ([(item.text(0), item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+      ([(item.text(0), item.data(0, ariance.LyricsSongChooserDialog.PATH_ROLE))
         for item in chooser_roots], chooser.selected_path()))
 if music_root is not None:
     stack = [music_root]
     while stack:
         item = stack.pop()
-        if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "dir":
+        if item.data(0, ariance.LyricsSongChooserDialog.KIND_ROLE) == "dir":
             item.setExpanded(True)
             app.processEvents()
         stack.extend(item.child(i) for i in range(item.childCount()))
@@ -898,8 +956,8 @@ chooser_paths = []
 stack = [chooser.tree.topLevelItem(i) for i in range(chooser.tree.topLevelItemCount())]
 while stack:
     item = stack.pop()
-    if item.data(0, nebula.LyricsSongChooserDialog.KIND_ROLE) == "file":
-        chooser_paths.append(item.data(0, nebula.LyricsSongChooserDialog.PATH_ROLE))
+    if item.data(0, ariance.LyricsSongChooserDialog.KIND_ROLE) == "file":
+        chooser_paths.append(item.data(0, ariance.LyricsSongChooserDialog.PATH_ROLE))
     stack.extend(item.child(i) for i in range(item.childCount()))
 check("the song chooser lazy-loads tracks inside folders",
       WAV1 in chooser_paths and len(chooser_paths) >= 4,
@@ -913,18 +971,18 @@ check("the lyrics editor opens an existing LRC",
       (editor.table.rowCount(),
        editor.table.item(0, 1).text() if editor.table.rowCount() else "",
        editor.table.item(0, 2).text() if editor.table.rowCount() else ""))
-check("the lyrics editor loads LRC metadata and defaults Tool to Nebula Music Center",
+check("the lyrics editor loads LRC metadata and defaults Tool to Ariance Music Center",
       editor.meta_fields["ar"][0].isChecked()
       and editor.meta_fields["ar"][1].text() == "Test Artist"
       and editor.meta_fields["tool"][0].isChecked()
-      and editor.meta_fields["tool"][1].text() == nebula.APP_NAME,
+      and editor.meta_fields["tool"][1].text() == ariance.APP_NAME,
       (editor.meta_fields["ar"][0].isChecked(),
        editor.meta_fields["ar"][1].text(),
        editor.meta_fields["tool"][0].isChecked(),
        editor.meta_fields["tool"][1].text()))
 editor._apply_lyrics_text("[tool:SubtitleTools.com]\n[00:01.00]Line A")
-check("a pasted Tool header cannot replace Nebula Music Center",
-      editor.meta_fields["tool"][1].text() == nebula.APP_NAME
+check("a pasted Tool header cannot replace Ariance Music Center",
+      editor.meta_fields["tool"][1].text() == ariance.APP_NAME
       and editor.table.rowCount() == 1,
       (editor.meta_fields["tool"][1].text(), editor.table.rowCount()))
 editor._apply_lyrics_text("[00:01.00]Line A\n[00:03.50]Line B")
@@ -936,7 +994,7 @@ check("pasted timestamps become the line times",
       [(editor.table.item(i, 1).text(), editor.table.item(i, 2).text())
        for i in range(editor.table.rowCount())])
 check("the Lyrics tab is one plain-text document without row boxes",
-      isinstance(editor.lyrics_text, nebula.QPlainTextEdit)
+      isinstance(editor.lyrics_text, ariance.QPlainTextEdit)
       and not editor.lyrics_text.isReadOnly()
       and editor.table.isHidden()
       and editor.lyrics_text.toPlainText() == "[00:01.00] Line A\n[00:03.50] Line B",
@@ -1016,22 +1074,22 @@ check("the Preview tab shows a three-line first-lyric countdown",
        editor.preview_next.text()))
 sample_lyrics = [(29860, "One more time"), (31810, ""),
                  (45420, "One more time"), (47720, "")]
-sample_slots = nebula.lyric_display_slots(sample_lyrics, 33000)
+sample_slots = ariance.lyric_display_slots(sample_lyrics, 33000)
 check("a blank current lyric becomes a live countdown to the next lyric",
-      nebula.lyric_slot_text(sample_slots[0], sample_lyrics, 33000,
+      ariance.lyric_slot_text(sample_slots[0], sample_lyrics, 33000,
                              timestamp=True) == "[00:29.86] One more time"
       and "[00:31.81] Next lyric in 12.4s"
-      == nebula.lyric_slot_text(sample_slots[1], sample_lyrics, 33000,
+      == ariance.lyric_slot_text(sample_slots[1], sample_lyrics, 33000,
                                 timestamp=True)
-      and nebula.lyric_slot_text(sample_slots[2], sample_lyrics, 33000,
+      and ariance.lyric_slot_text(sample_slots[2], sample_lyrics, 33000,
                                  timestamp=True) == "[00:45.42] One more time",
-      [nebula.lyric_slot_text(slot, sample_lyrics, 33000, timestamp=True)
+      [ariance.lyric_slot_text(slot, sample_lyrics, 33000, timestamp=True)
        for slot in sample_slots])
 editor._save_lrc()
 with open(lrc_target, encoding="utf-8") as handle:
     editor_lrc = handle.read()
 check("the lyrics editor saves timestamps and metadata",
-      "[tool:Nebula Music Center]" in editor_lrc
+      "[tool:Ariance Music Center]" in editor_lrc
       and "[ar:Test Artist]" in editor_lrc
       and "[00:01.00] Line A" in editor_lrc
       and "[00:03.50] Line B" in editor_lrc,
@@ -1128,8 +1186,8 @@ asked = []
 real_question = QMessageBox.question
 QMessageBox.question = staticmethod(
     lambda *a, **k: asked.append(a[2] if len(a) > 2 else "") or QMessageBox.No)
-nebula.save_config(w.config)
-w2 = nebula.MainWindow()
+ariance.save_config(w.config)
+w2 = ariance.MainWindow()
 QTest.qWait(650)
 check("an existing library folder is not asked about again", not asked, asked)
 w2.close()
@@ -1137,19 +1195,19 @@ QMessageBox.question = real_question
 
 # and the opposite: a genuinely empty config does ask once
 empty = fresh_config()
-empty["collections"] = [{"name": "Music", "folders": [], "db": nebula.DB_FILE}]
-nebula.save_config(empty)
+empty["collections"] = [{"name": "Music", "folders": [], "db": ariance.DB_FILE}]
+ariance.save_config(empty)
 asked.clear()
 QMessageBox.question = staticmethod(
     lambda *a, **k: asked.append(a[2] if len(a) > 2 else "") or QMessageBox.No)
-w3 = nebula.MainWindow()
+w3 = ariance.MainWindow()
 QTest.qWait(650)
 check("an empty library asks for a folder", len(asked) == 1, asked)
 w3.close()
 QMessageBox.question = real_question
-nebula.save_config(w.config)
+ariance.save_config(w.config)
 
-prefs = nebula.PreferencesDialog(w.library_tab, w)
+prefs = ariance.PreferencesDialog(w.library_tab, w)
 check("Preferences has an Audiobooks page",
       [prefs.sidebar.item(i).text() for i in range(prefs.sidebar.count())]
       == ["Theme", "Library", "Audiobooks", "Devices", "Playback", "Syncing",
@@ -1215,7 +1273,7 @@ ab_tab.tree._grid_store()
 widths = w.config["grid_layouts"]["audiobooks"]["widths"]
 check("column widths are written too", widths[1] == 321, widths)
 saved_layout = json.loads(json.dumps(w.config["grid_layouts"]["audiobooks"]))
-ab2 = nebula.AudiobooksTab(w.player, dict(w.config, audiobook_folders=[AB]))
+ab2 = ariance.AudiobooksTab(w.player, dict(w.config, audiobook_folders=[AB]))
 check("a fresh Audiobooks tab restores the order",
       [ab2.tree.header().logicalIndex(v) for v in range(5)] == saved_layout["order"],
       [ab2.tree.header().logicalIndex(v) for v in range(5)])
@@ -1223,7 +1281,7 @@ check("a fresh Audiobooks tab restores the width", ab2.tree.columnWidth(1) == 32
       ab2.tree.columnWidth(1))
 legacy = fresh_config(audiobook_folders=[AB], grid_layouts={
     "audiobooks": {"order": [1, 2, 0, 3], "widths": [300, 200, 80, 70]}})
-legacy_tab = nebula.AudiobooksTab(w.player, legacy)
+legacy_tab = ariance.AudiobooksTab(w.player, legacy)
 check("a 1.16 audiobook layout gains the cover column in front",
       [legacy_tab.tree.header().logicalIndex(v) for v in range(5)] == [0, 2, 3, 1, 4],
       [legacy_tab.tree.header().logicalIndex(v) for v in range(5)])
@@ -1247,7 +1305,7 @@ w.config["lib_details"] = False
 # ---------------------------------------------------------------- audiobooks
 section("audiobooks: titles, chapters and import")
 ab_cfg = fresh_config(audiobook_folders=[AB])
-ab = nebula.AudiobooksTab(w.player, ab_cfg)
+ab = ariance.AudiobooksTab(w.player, ab_cfg)
 names = [ab.tree.topLevelItem(i).text(1) for i in range(ab.tree.topLevelItemCount())]
 check("the Audiobooks header has no .aax import button", not hasattr(ab, "aax_btn"))
 check("the .aax settings are gone",
@@ -1259,18 +1317,18 @@ check("a subfolder is one title and a loose file is a title of its own",
       sorted(names) == ["Dune", "The Hobbit"], names)
 
 # Opening the tab must not re-read every chapter's tags when nothing changed.
-real_details = nebula.audiobook_details
+real_details = ariance.audiobook_details
 detail_calls = []
 
 def spy_details(paths, cache=None):
     detail_calls.append(list(paths))
     return real_details(paths, cache)
 
-nebula.audiobook_details = spy_details
+ariance.audiobook_details = spy_details
 try:
     ab.refresh()
 finally:
-    nebula.audiobook_details = real_details
+    ariance.audiobook_details = real_details
 check("reopening an unchanged Audiobooks tab skips its tag and chapter scan",
       detail_calls == [], detail_calls)
 
@@ -1295,7 +1353,7 @@ check("sorting by Title puts the titles back in order",
       [ab.tree.topLevelItem(i).text(1) for i in range(ab.tree.topLevelItemCount())])
 dune = next(ab.tree.topLevelItem(i) for i in range(ab.tree.topLevelItemCount())
             if ab.tree.topLevelItem(i).text(1) == "Dune")
-check("the title shows its chapter count", dune.text(3) == "2", dune.text(3))
+check("the title shows its chapter count", dune.text(3) == "8", dune.text(3))
 check("the author is shown in its own column",
       dune.text(2) == "Frank Herbert", dune.text(2))
 ab._sort_by(2)
@@ -1307,12 +1365,29 @@ ab._sort_by(1)
 dune = next(ab.tree.topLevelItem(i) for i in range(ab.tree.topLevelItemCount())
             if ab.tree.topLevelItem(i).text(1) == "Dune")
 check("a real .m4b chapter list is counted",
-      nebula.m4b_chapter_count(AB_CH1) == 4, nebula.m4b_chapter_count(AB_CH1))
-check("chapters are listed under the title", dune.childCount() == 2, dune.childCount())
+      ariance.m4b_chapter_count(AB_CH1) == 4, ariance.m4b_chapter_count(AB_CH1))
+check("both M4B files expand to their embedded chapters",
+      dune.childCount() == 8, dune.childCount())
+check("embedded chapter names are shown",
+      [dune.child(i).text(1) for i in range(dune.childCount())]
+      == [f"Chapter {i}" for i in range(1, 5)] * 2,
+      [dune.child(i).text(1) for i in range(dune.childCount())])
 check("the first chapter has a length", dune.child(0).text(4) not in ("", "0:00"),
       dune.child(0).text(4))
+solo_rows = ariance.audiobook_chapters([AB_CH1], [12])
+check("a single M4B uses one file with embedded chapter offsets",
+      len(solo_rows) == 4 and all(row["path"] == AB_CH1 for row in solo_rows)
+      and [row["start"] for row in solo_rows] == [0, 3, 6, 9],
+      solo_rows)
+separate_rows = ariance.audiobook_chapters([WAV1, WAV2], [1, 1])
+check("separate chapter files use one row each, just like embedded chapters",
+      [(row["name"], row["path"], row["start"]) for row in separate_rows]
+      == [("Alpha", WAV1, 0.0), ("Beta", WAV2, 0.0)], separate_rows)
+check("a chapter-file folder gets one book key",
+      ariance.audiobook_book_key([WAV1, WAV2]) == os.path.normpath(os.path.dirname(WAV1)),
+      ariance.audiobook_book_key([WAV1, WAV2]))
 cover_file = os.path.join(AB_BOOK, "cover.png")
-shutil.copyfile(os.path.join(ROOT, "nebula.png"), cover_file)
+shutil.copyfile(os.path.join(ROOT, "ariance.png"), cover_file)
 ab.refresh(force=True)
 dune = next(ab.tree.topLevelItem(i) for i in range(ab.tree.topLevelItemCount())
             if ab.tree.topLevelItem(i).text(1) == "Dune")
@@ -1335,31 +1410,241 @@ dune = next(ab.tree.topLevelItem(i) for i in range(ab.tree.topLevelItemCount())
 check("the audiobook grid has a right-click menu",
       ab.tree.contextMenuPolicy() == Qt.CustomContextMenu)
 book_paths = ab._book_paths[dune.data(0, Qt.UserRole)]
-queued = []
-real_add = ab.player.add_paths
-ab.player.add_paths = lambda paths, **kwargs: queued.append((list(paths), kwargs))
-ab._queue_item(dune)
-check("right-clicking a title adds the whole book to the queue",
-      queued and queued[-1][0] == book_paths
-      and queued[-1][1].get("play_if_idle") is False, queued)
-ab._queue_item(dune.child(0))
-check("right-clicking a chapter adds that chapter to the queue",
-      queued[-1][0] == [book_paths[0]], queued[-1])
-ab.player.add_paths = real_add
-check("the default import folder is ~/Music/Nebula - Audiobooks",
-      nebula.audiobook_default_folder() ==
-      os.path.join(HOME, "Music", "Nebula - Audiobooks"),
-      nebula.audiobook_default_folder())
-default_tab = nebula.AudiobooksTab(w.player, fresh_config())
+book_key = ariance.audiobook_book_key(book_paths)
+check("the chapter drawer starts closed", ab.chapter_panel.isHidden())
+ab.tree.setCurrentItem(dune)
+ab._show_chapters(True)
+check("the chapter drawer lists every embedded chapter",
+      not ab.chapter_panel.isHidden() and ab.chapter_list.topLevelItemCount() == 8,
+      ab.chapter_list.topLevelItemCount())
+check("the chapter drawer shows chapter names",
+      ab.chapter_list.topLevelItem(0).text(0) == "Chapter 1"
+      and ab.chapter_list.topLevelItem(7).text(0) == "Chapter 4",
+      [ab.chapter_list.topLevelItem(i).text(0) for i in range(ab.chapter_list.topLevelItemCount())])
+check("the chapter buttons draw a |< and a >| glyph, not text",
+      ab.ab_player.prev_btn.text() == "" and ab.ab_player.next_btn.text() == ""
+      and not ab.ab_player.prev_btn.icon().isNull()
+      and not ab.ab_player.next_btn.icon().isNull())
+check("the audiobook bar can redraw its glyphs after a theme change",
+      not ab.ab_player.chapters_btn.icon().isNull()
+      and not ab.ab_player.prev_btn.icon().pixmap(22, 22).isNull()
+      and not ab.ab_player.next_btn.icon().pixmap(22, 22).isNull())
+drawer_real_load = ab.ab_player.load_book
+drawer_real_load({"key": "drawer-test", "title": "Drawer", "author": "Author"},
+                 ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+drawer_played = []
+ab.ab_player.load_book = lambda *args, **kwargs: drawer_played.append((args, kwargs))
+ab._chapter_clicked(ab.chapter_list.topLevelItem(3))
+check("a single click on a chapter in the drawer plays that chapter",
+      drawer_played and drawer_played[-1][0][2] == 3
+      and drawer_played[-1][1].get("autoplay") is True, drawer_played[-1])
+ab.ab_player.load_book = drawer_real_load
+ab._show_chapters(False)
+check("the chapter drawer can be closed again", ab.chapter_panel.isHidden())
+played = []
+real_load = ab.ab_player.load_book
+ab.ab_player.load_book = lambda *args, **kwargs: played.append((args, kwargs))
+queue_before = list(ab.player.queue)
+ab.ab_player.bookmarks.remember(book_key, 5, 2.0)
+ab._play_item(dune)
+check("double-clicking a book resumes its saved chapter and timestamp",
+      played and played[-1][0][2] == 5 and played[-1][0][3] == 2.0
+      and played[-1][1].get("autoplay") is True, played[-1])
+ab._play_item(dune.child(0))
+check("double-clicking a different chapter starts that chapter at zero",
+      played[-1][0][2] == 0 and played[-1][0][3] == 0.0, played[-1])
+ab.ab_player.load_book = real_load
+check("audiobook playback never touches the music queue",
+      ab.player.queue == queue_before, (queue_before, ab.player.queue))
+check("audiobook bookmarks have a file of their own, next to the config",
+      ariance.AUDIOBOOK_STATE_FILE ==
+      os.path.join(ariance.SETTINGS_DIR, "audiobooks.json") and
+      os.path.exists(ariance.AUDIOBOOK_STATE_FILE), ariance.AUDIOBOOK_STATE_FILE)
+check("config.json no longer holds any audiobook position",
+      "audiobook_positions" not in ariance.load_config()
+      and "audiobook_last" not in ariance.load_config(),
+      sorted(ariance.load_config()))
+ab.ab_player.load_book({"key": "book", "title": "Book", "author": "Author"},
+                       ab._book_chapters[book_key], 2, 2.0, autoplay=False)
+ab.ab_player.save_state()
+check("the audiobook player writes its chapter and timestamp to the bookmark file",
+      ab.ab_player.bookmarks.state("book") == (2, 2.0),
+      ab.ab_player.bookmarks.books.get("book"))
+book_file = json.load(open(ariance.AUDIOBOOK_STATE_FILE, encoding="utf-8"))
+check("the bookmark file is readable on its own: title, author and chapter name",
+      book_file.get("last") == "book"
+      and book_file["books"]["book"]["title"] == "Book"
+      and book_file["books"]["book"]["author"] == "Author"
+      and book_file["books"]["book"]["chapter_name"], book_file["books"].get("book"))
+ab.ab_player.load_book({"key": "first", "title": "First", "author": "Author"},
+                       ab._book_chapters[book_key], 1, 2.0, autoplay=False)
+ab.ab_player._chapter_pos = 7.25
+ab.ab_player.load_book({"key": "second", "title": "Second", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+check("opening another book saves the outgoing book's exact position",
+      ab.ab_player.bookmarks.state("first") == (1, 7.25),
+      ab.ab_player.bookmarks.state("first"))
+check("the book that was playing before keeps its own place in the file",
+      ab.ab_player.bookmarks.state("book") == (2, 2.0)
+      and ab.ab_player.bookmarks.state("second") == (0, 0.0),
+      ab.ab_player.bookmarks.books)
+check("a second book does not become another position for the first",
+      ab.ab_player.saved_state("book") == (2, 2.0)
+      and ab.ab_player.saved_state("first") == (1, 7.25),
+      (ab.ab_player.saved_state("book"), ab.ab_player.saved_state("first")))
+ab.ab_player.bookmarks.remember("other", 0, 1.0)
+ab.ab_player.load_book({"key": "book", "title": "Book", "author": "Author"},
+                       ab._book_chapters[book_key], 2, 2.0, autoplay=False)
+check("opening a book updates the startup bookmark even at the same position",
+      ab.ab_player.bookmarks.last == "book", ab.ab_player.bookmarks.last)
+check("reopening a book leaves the other bookmarks untouched",
+      ab.ab_player.bookmarks.state("other") == (0, 1.0),
+      ab.ab_player.bookmarks.state("other"))
+ab.ab_player.load_book({"key": "book", "title": "Book", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+ab.ab_player._position_changed(4500)
+check("a multi-M4B book advances through its first file's embedded chapters",
+      ab.ab_player.chapter == 1, ab.ab_player.chapter)
+ab.ab_player.load_book({"key": "book", "title": "Book", "author": "Author"},
+                       ab._book_chapters[book_key], 4, 0.0, autoplay=False)
+ab.ab_player._position_changed(4500)
+check("the second M4B in the same book advances by its own chapters",
+      ab.ab_player.chapter == 5, ab.ab_player.chapter)
+check("double-clicking a book does not unfold its chapters",
+      not ab.tree.expandsOnDoubleClick())
+
+# one small file for the whole audiobook library
+bookmark_path = os.path.join(HOME, "bookmark-test", "audiobooks.json")
+store = ariance.AudiobookBookmarks(path=bookmark_path)
+check("a bookmark store starts empty", store.books == {} and store.last == "",
+      (store.books, store.last))
+store.remember("a", 1, 12.5, title="A", author="Author", chapter_name="Two")
+store.remember("b", 0, 3.0, title="B")
+store.remember("a", 1, 20.0, title="A", author="Author", chapter_name="Two")
+reloaded = ariance.AudiobookBookmarks(path=bookmark_path)
+check("one file keeps every book's own chapter and timestamp",
+      reloaded.state("a") == (1, 20.0) and reloaded.state("b") == (0, 3.0),
+      reloaded.books)
+check("the bookmark file knows which book was played last", reloaded.last == "a",
+      reloaded.last)
+check("an unknown book starts at its first chapter",
+      reloaded.state("nope") == (0, 0.0), reloaded.state("nope"))
+old_bookmarks = {"audiobook_positions": {"b": {"chapter": 4, "position": 1.0},
+                                         "c": {"chapter": 2, "position": 9.5}},
+                 "audiobook_last": "c"}
+ariance.migrate_audiobook_bookmarks(old_bookmarks, path=bookmark_path)
+moved = ariance.AudiobookBookmarks(path=bookmark_path)
+check("the config's old bookmarks move into the file, leaving the config",
+      "audiobook_positions" not in old_bookmarks
+      and "audiobook_last" not in old_bookmarks
+      and moved.state("c") == (2, 9.5), (old_bookmarks, moved.books))
+check("a migrated bookmark never overwrites the newer place in the file",
+      moved.state("b") == (0, 3.0) and moved.last == "c", moved.books)
+
+
+class _StubMedia:
+    """Just enough of a QMediaPlayer to watch when the resume seek is issued."""
+
+    def __init__(self, state, seekable=True):
+        self.state = state
+        self.seekable = seekable
+        self.seeks = []
+
+    def isSeekable(self):
+        return self.seekable
+
+    def playbackState(self):
+        return self.state
+
+    def setPosition(self, ms):
+        self.seeks.append(ms)
+
+    def play(self):
+        pass
+
+
+media_before = ab.ab_player.media
+ab.ab_player.load_book({"key": "resume", "title": "Resume", "author": "Author"},
+                       ab._book_chapters[book_key], 2, 120.0, autoplay=False)
+stopped = _StubMedia(ariance.QMediaPlayer.StoppedState)
+ab.ab_player.media = stopped
+ab.ab_player._media_status = ariance.QMediaPlayer.BufferedMedia
+ab.ab_player._pending_seek = 120.0
+ab.ab_player._pending_play = False
+ab.ab_player._apply_pending_seek()
+check("a resume seek is not issued while the player is still stopped",
+      stopped.seeks == [] and ab.ab_player._pending_seek == 120.0,
+      (stopped.seeks, ab.ab_player._pending_seek))
+ab.ab_player._chapter_pos = 120.0
+ab.ab_player._position_changed(300)
+check("a position reported before the seek lands is not taken as the bookmark",
+      ab.ab_player._chapter_pos == 120.0, ab.ab_player._chapter_pos)
+stopped.state = ariance.QMediaPlayer.PlayingState
+ab.ab_player._apply_pending_seek()
+check("the resume seek is offered once playback is running",
+      stopped.seeks == [120000] and ab.ab_player._pending_seek == 120.0,
+      (stopped.seeks, ab.ab_player._pending_seek))
+
+# Switching books: the backend keeps answering for the file it has just closed,
+# so a seek sent right after another book starts playing is dropped and the
+# chapter plays from the top. The position report tells whether it took.
+ab.ab_player.load_book({"key": "seek-test", "title": "Seek", "author": "Author"},
+                       [{"name": "One", "path": WAV1, "start": 0.0,
+                         "duration": 3600.0}], 0, 0.0, autoplay=False)
+fresh = _StubMedia(ariance.QMediaPlayer.PlayingState)
+ab.ab_player.media = fresh
+ab.ab_player._media_status = ariance.QMediaPlayer.BufferedMedia
+ab.ab_player._pending_seek = 300.0
+ab.ab_player._pending_play = False
+ab.ab_player._seek_tries = 0
+ab.ab_player._seek_settle = 0
+ab.ab_player._chapter_pos = 300.0
+ab.ab_player._position_changed(0)
+check("a seek the player drops is asked for again at the next position",
+      fresh.seeks == [300000] and ab.ab_player._pending_seek == 300.0
+      and ab.ab_player._chapter_pos == 300.0,
+      (fresh.seeks, ab.ab_player._pending_seek, ab.ab_player._chapter_pos))
+ab.ab_player._position_changed(300400)
+check("a landed seek is not trusted until playback has moved past it",
+      ab.ab_player._pending_seek == 300.0, ab.ab_player._pending_seek)
+ab.ab_player._position_changed(302400)
+check("the book has arrived once playback moves past the bookmark",
+      ab.ab_player._pending_seek is None
+      and ab.ab_player._chapter_pos == 302.4, ab.ab_player._chapter_pos)
+fresh.seeks = []
+ab.ab_player._pending_seek = 300.0
+ab.ab_player._seek_tries = 0
+ab.ab_player._seek_settle = 0
+for _ in range(14):
+    ab.ab_player._position_changed(0)
+check("a file that refuses every seek is not scrubbed over and over",
+      len(fresh.seeks) == 8 and ab.ab_player._pending_seek is None,
+      (len(fresh.seeks), ab.ab_player._pending_seek))
+ab.ab_player.media = media_before
+ab.ab_player._pending_seek = None
+ab.ab_player._seek_tries = 0
+ab.ab_player._seek_settle = 0
+ab.ab_player.load_book(
+    {"key": "display", "title": "Out of the Silent Planet: Ransom", "author": "C.S. Lewis"},
+    [{"name": "Out of the Silent Planet: Chapter 4", "path": WAV1,
+      "start": 0.0, "duration": 3600.0}], 0, 0.0, autoplay=False)
+check("the chapter line drops a repeated book-title prefix",
+      ab.ab_player.chapter_label.text() == "Chapter 4",
+      ab.ab_player.chapter_label.text())
+check("the default import folder is ~/Music/Ariance - Audiobooks",
+      ariance.audiobook_default_folder() ==
+      os.path.join(HOME, "Music", "Ariance - Audiobooks"),
+      ariance.audiobook_default_folder())
+default_tab = ariance.AudiobooksTab(w.player, fresh_config())
 check("with no folder configured the destination is the default folder",
-      default_tab._target_folder() == nebula.audiobook_default_folder(),
+      default_tab._target_folder() == ariance.audiobook_default_folder(),
       default_tab._target_folder())
 check("with a folder configured its first folder is the destination",
       ab._target_folder() == AB, ab._target_folder())
 check("the import progress bar is hidden when no import is running",
       ab.import_progress.isHidden(), ab.import_progress.isVisible())
-check("an existing name gets a (2) suffix", nebula.unique_path(WAV1).endswith(" (2).wav"),
-      nebula.unique_path(WAV1))
+check("an existing name gets a (2) suffix", ariance.unique_path(WAV1).endswith(" (2).wav"),
+      ariance.unique_path(WAV1))
 import_root = os.path.join(HOME, "import-src")
 incoming = os.path.join(HOME, "import-dst")
 os.makedirs(import_root)
@@ -1368,7 +1653,7 @@ to_import = os.path.join(import_root, "Incoming Book.m4b")
 shutil.copyfile(AB_CH1, to_import)
 ab_cfg["audiobook_import_target"] = incoming
 ab_cfg["audiobook_folders"] = []
-ab = nebula.AudiobooksTab(w.player, ab_cfg)
+ab = ariance.AudiobooksTab(w.player, ab_cfg)
 real_import_audio, real_import_folder = (
     ab.import_audio, ab.import_folder)
 seen_imports = []
@@ -1429,7 +1714,7 @@ check("Import folder imports each book inside a shelf folder",
       sorted(os.listdir(incoming)))
 
 remove_cfg = fresh_config(audiobook_folders=[AB, incoming])
-remove_tab = nebula.AudiobooksTab(w.player, remove_cfg)
+remove_tab = ariance.AudiobooksTab(w.player, remove_cfg)
 real_get_item = QInputDialog.getItem
 QInputDialog.getItem = staticmethod(lambda *a, **k: (AB, True))
 remove_tab.remove_folder()
@@ -1441,26 +1726,26 @@ QInputDialog.getItem = real_get_item
 # ---------------------------------------------------------------- devices
 section("devices and presets")
 dev_cfg = fresh_config()
-dev1 = nebula.Device(id="mass:/stick", name="Stick", kind="mass", root="/media/stick")
-dev2 = nebula.Device(id="mtp:host=PHONE", name="Phone", kind="mtp", root="/run/phone",
+dev1 = ariance.Device(id="mass:/stick", name="Stick", kind="mass", root="/media/stick")
+dev2 = ariance.Device(id="mtp:host=PHONE", name="Phone", kind="mtp", root="/run/phone",
                      uri="mtp://PHONE/")
-check("a new device is recorded", nebula.remember_device(dev_cfg, dev1) is True)
-check("recording it again changes nothing", nebula.remember_device(dev_cfg, dev1) is False)
+check("a new device is recorded", ariance.remember_device(dev_cfg, dev1) is True)
+check("recording it again changes nothing", ariance.remember_device(dev_cfg, dev1) is False)
 check("the record has id, name, kind and root",
       dev_cfg["device_registry"][0] ==
       {"id": "mass:/stick", "name": "Stick", "kind": "mass", "root": "/media/stick",
        "uri": ""}, dev_cfg["device_registry"])
-nebula.remember_device(dev_cfg, dev2)
-nebula.save_config(dev_cfg)
-reloaded = nebula.load_config()
+ariance.remember_device(dev_cfg, dev2)
+ariance.save_config(dev_cfg)
+reloaded = ariance.load_config()
 check("remembered devices survive a restart",
       [r["id"] for r in reloaded["device_registry"]] == ["mass:/stick", "mtp:host=PHONE"],
       reloaded["device_registry"])
 
 dev_root = os.path.join(HOME, "stick")
 os.makedirs(os.path.join(dev_root, "Music"), exist_ok=True)
-live_stick = nebula.Device(id="mass:/stick", name="Stick", kind="mass", root=dev_root)
-dev_tab = nebula.DevicesTab(w.player, reloaded, nebula.Library(db_file))
+live_stick = ariance.Device(id="mass:/stick", name="Stick", kind="mass", root=dev_root)
+dev_tab = ariance.DevicesTab(w.player, reloaded, ariance.Library(db_file))
 dev_tab.set_devices([live_stick])
 app.processEvents()
 rows = dev_tab._device_rows()
@@ -1487,29 +1772,29 @@ check("removing a device hides it and remembers the removal",
       and [r["id"] for r in dev_tab._device_rows()] == ["mass:/stick"],
       (reloaded["removed_devices"], [r["id"] for r in dev_tab._device_rows()]))
 reloaded["removed_devices"].pop("mtp:host=PHONE", None)
-nebula.save_config(reloaded)
+ariance.save_config(reloaded)
 dev_tab.refresh_list()
 check("restoring it brings the row back with its name",
       [r["id"] for r in dev_tab._device_rows()] == ["mass:/stick", "mtp:host=PHONE"],
       [r["id"] for r in dev_tab._device_rows()])
 
-presets = [nebula.DevicePreset(name="Stick sync", device_id="mass:/stick", source=MUSIC,
+presets = [ariance.DevicePreset(name="Stick sync", device_id="mass:/stick", source=MUSIC,
                                target="Music", mode="mirror", method="hash"),
-           nebula.DevicePreset(name="Walkman sync", device_id="mtp:host=PHONE",
+           ariance.DevicePreset(name="Walkman sync", device_id="mtp:host=PHONE",
                                source=ALBUM_A, target="Music/Walkman", mode="add",
                                method="bytes", filesystem="exfat")]
-nebula.save_presets(presets)
-loaded_presets = nebula.load_presets()
+ariance.save_presets(presets)
+loaded_presets = ariance.load_presets()
 check("presets keep their saved ids for compatibility",
       [(p.name, p.device_id) for p in loaded_presets] ==
       [("Stick sync", "mass:/stick"), ("Walkman sync", "mtp:host=PHONE")],
       [(p.name, p.device_id) for p in loaded_presets])
 check("presets are shared, not filtered by device",
-      len(nebula.load_presets()) == 2, nebula.load_presets())
+      len(ariance.load_presets()) == 2, ariance.load_presets())
 check("a preset keeps its method and filesystem",
       loaded_presets[1].method == "bytes" and loaded_presets[1].filesystem == "exfat",
       (loaded_presets[1].method, loaded_presets[1].filesystem))
-profile = nebula.Profile(name="temp", device_id="mtp:host=PHONE")
+profile = ariance.Profile(name="temp", device_id="mtp:host=PHONE")
 loaded_presets[1].apply_to(profile)
 check("choosing a preset loads it into the profile",
       (profile.source, profile.target, profile.mode, profile.method, profile.filesystem,
@@ -1517,11 +1802,11 @@ check("choosing a preset loads it into the profile",
       (profile.source, profile.target, profile.mode, profile.method, profile.filesystem,
        profile.sources))
 check("presets are not lost when the device registry is",
-      ("device_registry" not in fresh_config() and len(nebula.load_presets()) == 2))
+      ("device_registry" not in fresh_config() and len(ariance.load_presets()) == 2))
 
 # the Syncing tab shows every preset, whichever device the profile targets
-w.sync_tab.presets = nebula.load_presets()
-w.sync_tab.profiles = [nebula.Profile(name="Shared", device_id="mass:/stick", source=MUSIC)]
+w.sync_tab.presets = ariance.load_presets()
+w.sync_tab.profiles = [ariance.Profile(name="Shared", device_id="mass:/stick", source=MUSIC)]
 w.sync_tab._reload_list()
 check("the Syncing tab lists presets saved for another device",
       w.sync_tab.preset.count() == 3, w.sync_tab.preset.count())
@@ -1536,8 +1821,8 @@ w.sync_tab.preset.setCurrentIndex(w.sync_tab.preset.findData(loaded_presets[1].i
 check("the chosen preset is saved on the profile",
       w.sync_tab.current().preset_id == loaded_presets[1].id,
       getattr(w.sync_tab.current(), "preset_id", ""))
-nebula.save_profiles(w.sync_tab.profiles)
-restored_preset_profiles = nebula.load_profiles()
+ariance.save_profiles(w.sync_tab.profiles)
+restored_preset_profiles = ariance.load_profiles()
 check("the chosen preset id survives a profile reload",
       restored_preset_profiles[0].preset_id == loaded_presets[1].id,
       restored_preset_profiles[0].preset_id)
@@ -1548,7 +1833,7 @@ check("the preset is selected again after a restart",
       w.sync_tab.preset.currentData())
 
 # force-transcode controls the Bitrate row
-bit_profile = nebula.Profile(name="Bits", source=MUSIC)
+bit_profile = ariance.Profile(name="Bits", source=MUSIC)
 w.sync_tab.profiles = [bit_profile]
 w.sync_tab._reload_list()
 check("Bitrate is hidden when Force transcode is off",
@@ -1590,59 +1875,59 @@ shutil.copyfile(WAV1, os.path.join(src, "Aphex Twin", "Selected Ambient Works",
 shutil.copyfile(WAV2, os.path.join(src, "Aphex Twin", "Selected Ambient Works",
                                    "02 - Beta.wav"))
 os.makedirs(dst)
-sync_profile = nebula.Profile(name="Stick", device_id=f"folder:{dst}", source=src,
+sync_profile = ariance.Profile(name="Stick", device_id=f"folder:{dst}", source=src,
                               target="Music")
-backend = nebula.LocalFolderBackend(dst)
-plan = nebula.compare(sync_profile, backend)
+backend = ariance.LocalFolderBackend(dst)
+plan = ariance.compare(sync_profile, backend)
 check("the first compare plans both files as new",
       sorted(a.kind for a in plan) == ["new", "new"], [(a.kind, a.rel) for a in plan])
-check("execute copies them without errors", nebula.execute(sync_profile, backend, plan) == 0)
+check("execute copies them without errors", ariance.execute(sync_profile, backend, plan) == 0)
 mirrored = os.path.join(dst, "Music", "Artists", "Aphex Twin", "Selected Ambient Works",
                         "01 - Alpha.wav")
 check("the copied file is equal", os.path.exists(mirrored)
-      and nebula.files_equal(os.path.join(src, "Aphex Twin", "Selected Ambient Works",
+      and ariance.files_equal(os.path.join(src, "Aphex Twin", "Selected Ambient Works",
                                           "01 - Alpha.wav"), lambda: open(mirrored, "rb")))
 check("a second compare finds everything equal",
-      [a.kind for a in nebula.compare(sync_profile, backend)] == ["equal", "equal"],
-      [a.kind for a in nebula.compare(sync_profile, backend)])
+      [a.kind for a in ariance.compare(sync_profile, backend)] == ["equal", "equal"],
+      [a.kind for a in ariance.compare(sync_profile, backend)])
 with open(mirrored, "r+b") as f:
     f.seek(-1, os.SEEK_END)
     last = f.read(1)
     f.seek(-1, os.SEEK_END)
     f.write(bytes([last[0] ^ 1]))
-changed = [a for a in nebula.compare(sync_profile, backend) if a.kind == "changed"]
+changed = [a for a in ariance.compare(sync_profile, backend) if a.kind == "changed"]
 check("a one-bit change at the same size is caught", len(changed) == 1, changed)
-nebula.execute(sync_profile, backend, nebula.compare(sync_profile, backend))
-check("the changed file is repaired", nebula.files_equal(
+ariance.execute(sync_profile, backend, ariance.compare(sync_profile, backend))
+check("the changed file is repaired", ariance.files_equal(
     os.path.join(src, "Aphex Twin", "Selected Ambient Works", "01 - Alpha.wav"),
     lambda: open(mirrored, "rb")))
 extra = os.path.join(dst, "Music", "Extra", "extra.mp3")
 os.makedirs(os.path.dirname(extra), exist_ok=True)
 shutil.copyfile(MP3A, extra)
-plan = nebula.compare(sync_profile, backend)
+plan = ariance.compare(sync_profile, backend)
 check("mirror notices a file the library does not have",
       any(a.kind in ("extra", "delete") for a in plan), [(a.kind, a.rel) for a in plan])
-nebula.execute(sync_profile, backend, plan)
+ariance.execute(sync_profile, backend, plan)
 check("mirror removes the extra file", not os.path.exists(extra))
 
 hash_dst = os.path.join(HOME, "hash-dst")
 os.makedirs(hash_dst)
-hash_profile = nebula.Profile(name="Hash", device_id=f"folder:{hash_dst}", source=src,
+hash_profile = ariance.Profile(name="Hash", device_id=f"folder:{hash_dst}", source=src,
                               target="Music", method="hash")
-hash_backend = nebula.LocalFolderBackend(hash_dst)
-nebula.execute(hash_profile, hash_backend, nebula.compare(hash_profile, hash_backend))
+hash_backend = ariance.LocalFolderBackend(hash_dst)
+ariance.execute(hash_profile, hash_backend, ariance.compare(hash_profile, hash_backend))
 restore = os.path.join(hash_dst, "Music", "Artists", "Aphex Twin", "Selected Ambient Works",
                        "02 - Beta.wav")
 os.remove(restore)
-nebula.execute(hash_profile, hash_backend, nebula.compare(hash_profile, hash_backend))
+ariance.execute(hash_profile, hash_backend, ariance.compare(hash_profile, hash_backend))
 check("hash sync restores a file deleted from the device", os.path.exists(restore))
-nebula.save_profiles([hash_profile])
+ariance.save_profiles([hash_profile])
 check("sync profiles survive a restart",
-      nebula.load_profiles()[0].name == "Hash"
-      and nebula.load_profiles()[0].method == "hash")
+      ariance.load_profiles()[0].name == "Hash"
+      and ariance.load_profiles()[0].method == "hash")
 check("device file names drop FAT32-reserved characters",
-      nebula.device_rel("A/VAMPIRE - DECO*27.m4a") == "A/VAMPIRE - DECO27.m4a",
-      nebula.device_rel("A/VAMPIRE - DECO*27.m4a"))
+      ariance.device_rel("A/VAMPIRE - DECO*27.m4a") == "A/VAMPIRE - DECO27.m4a",
+      ariance.device_rel("A/VAMPIRE - DECO*27.m4a"))
 
 src2_root = os.path.join(HOME, "sync-src2")
 src2 = os.path.join(src2_root, "Second")
@@ -1650,17 +1935,17 @@ os.makedirs(src2)
 shutil.copyfile(FLAC1, os.path.join(src2, "01 - Second.flac"))
 multi_dst = os.path.join(HOME, "multi-dst")
 os.makedirs(multi_dst)
-multi_profile = nebula.Profile(name="Multi", device_id=f"folder:{multi_dst}", source=src,
+multi_profile = ariance.Profile(name="Multi", device_id=f"folder:{multi_dst}", source=src,
                                sources=[src, src2_root], target="Music")
-multi_backend = nebula.LocalFolderBackend(multi_dst)
-multi_plan = nebula.compare(multi_profile, multi_backend)
+multi_backend = ariance.LocalFolderBackend(multi_dst)
+multi_plan = ariance.compare(multi_profile, multi_backend)
 check("both sync folders are planned together",
       sorted((a.kind, a.rel) for a in multi_plan) ==
       [("new", "Artists/Aphex Twin/Selected Ambient Works/01 - Alpha.wav"),
        ("new", "Artists/Aphex Twin/Selected Ambient Works/02 - Beta.wav"),
        ("new", "Artists/Second/01 - Second.flac")],
       [(a.kind, a.rel) for a in multi_plan])
-nebula.execute(multi_profile, multi_backend, multi_plan)
+ariance.execute(multi_profile, multi_backend, multi_plan)
 check("both source folders reach the device",
       os.path.exists(os.path.join(multi_dst, "Music", "Artists", "Second",
                                   "01 - Second.flac"))
@@ -1670,16 +1955,16 @@ check("both source folders reach the device",
 sel_dst = os.path.join(HOME, "selected-dst")
 os.makedirs(sel_dst)
 selected_rel = "Artists/Aphex Twin/Selected Ambient Works/01 - Alpha.wav"
-sel_profile = nebula.Profile(
+sel_profile = ariance.Profile(
     name="Selected", device_id=f"folder:{sel_dst}", source=src, sources=[src],
     target="Music", mode="mirror", selection_mode="selected",
     selection=[{"path": WAV1, "rel": selected_rel}])
-sel_backend = nebula.LocalFolderBackend(sel_dst)
-sel_plan = nebula.compare(sel_profile, sel_backend)
+sel_backend = ariance.LocalFolderBackend(sel_dst)
+sel_plan = ariance.compare(sel_profile, sel_backend)
 check("selected mode plans only the chosen item",
       [(a.kind, a.rel) for a in sel_plan] == [("new", selected_rel)],
       [(a.kind, a.rel) for a in sel_plan])
-nebula.execute(sel_profile, sel_backend, sel_plan)
+ariance.execute(sel_profile, sel_backend, sel_plan)
 check("only the chosen item is copied",
       os.path.exists(os.path.join(sel_dst, "Music", selected_rel))
       and not os.path.exists(os.path.join(sel_dst, "Music", "Artists", "Aphex Twin",
@@ -1687,41 +1972,41 @@ check("only the chosen item is copied",
 sel_extra = os.path.join(sel_dst, "Music", "Other", "keep.mp3")
 os.makedirs(os.path.dirname(sel_extra), exist_ok=True)
 shutil.copyfile(MP3A, sel_extra)
-sel_plan = nebula.compare(sel_profile, sel_backend)
+sel_plan = ariance.compare(sel_profile, sel_backend)
 check("selected mode leaves files it never synced alone",
       not any(a.kind == "delete" for a in sel_plan) and os.path.exists(sel_extra),
       [(a.kind, a.rel) for a in sel_plan])
-nebula.execute(sel_profile, sel_backend, sel_plan)
+ariance.execute(sel_profile, sel_backend, sel_plan)
 check("the file it never synced is still there after a sync", os.path.exists(sel_extra))
 
 # A copy this profile synced before and has now unticked is removed by Mirror only.
 beta_rel = "Artists/Aphex Twin/Selected Ambient Works/02 - Beta.wav"
-both_profile = nebula.Profile(
+both_profile = ariance.Profile(
     name="Selected both", device_id=f"folder:{sel_dst}", source=src, sources=[src],
     target="Music", mode="mirror", selection_mode="selected",
     selection=[{"path": WAV1, "rel": selected_rel}, {"path": WAV2, "rel": beta_rel}])
-both_plan = nebula.compare(both_profile, sel_backend)
+both_plan = ariance.compare(both_profile, sel_backend)
 check("a second ticked item is planned as new",
       sorted((a.kind, a.rel) for a in both_plan) ==
       [("equal", selected_rel), ("new", beta_rel)],
       [(a.kind, a.rel) for a in both_plan])
-nebula.execute(both_profile, sel_backend, both_plan)
+ariance.execute(both_profile, sel_backend, both_plan)
 both_profile.selection = [{"path": WAV1, "rel": selected_rel}]
 both_profile.mode = "update"
-update_plan = nebula.compare(both_profile, sel_backend)
+update_plan = ariance.compare(both_profile, sel_backend)
 check("update plans no deletion for an item that is no longer selected",
       not any(a.kind == "delete" for a in update_plan),
       [(a.kind, a.rel) for a in update_plan])
-nebula.execute(both_profile, sel_backend, update_plan)
+ariance.execute(both_profile, sel_backend, update_plan)
 check("update leaves the unselected copy on the device",
       os.path.exists(os.path.join(sel_dst, "Music", beta_rel)))
 both_profile.mode = "mirror"
-untick_plan = nebula.compare(both_profile, sel_backend)
+untick_plan = ariance.compare(both_profile, sel_backend)
 check("mirror plans to delete the item that is no longer selected",
       sorted((a.kind, a.rel) for a in untick_plan) ==
       [("delete", beta_rel), ("equal", selected_rel)],
       [(a.kind, a.rel) for a in untick_plan])
-nebula.execute(both_profile, sel_backend, untick_plan)
+ariance.execute(both_profile, sel_backend, untick_plan)
 check("the unselected copy is removed and the other one stays",
       not os.path.exists(os.path.join(sel_dst, "Music", beta_rel))
       and os.path.exists(os.path.join(sel_dst, "Music", selected_rel)))
@@ -1731,36 +2016,36 @@ check("deleting an unselected item leaves a file the profile never wrote",
 # The same rule for Fast hash.
 sel_hash_dst = os.path.join(HOME, "selected-hash-dst")
 os.makedirs(sel_hash_dst)
-sel_hash_profile = nebula.Profile(
+sel_hash_profile = ariance.Profile(
     name="Selected hash", device_id=f"folder:{sel_hash_dst}", source=src, sources=[src],
     target="Music", method="hash", mode="mirror", selection_mode="selected",
     selection=[{"path": WAV1, "rel": selected_rel}, {"path": WAV2, "rel": beta_rel}])
-sel_hash_backend = nebula.LocalFolderBackend(sel_hash_dst)
-nebula.execute(sel_hash_profile, sel_hash_backend,
-               nebula.compare(sel_hash_profile, sel_hash_backend))
+sel_hash_backend = ariance.LocalFolderBackend(sel_hash_dst)
+ariance.execute(sel_hash_profile, sel_hash_backend,
+               ariance.compare(sel_hash_profile, sel_hash_backend))
 hash_extra = os.path.join(sel_hash_dst, "Music", "Other", "keep.mp3")
 os.makedirs(os.path.dirname(hash_extra), exist_ok=True)
 shutil.copyfile(MP3A, hash_extra)
 sel_hash_profile.selection = [{"path": WAV1, "rel": selected_rel}]
-hash_untick = nebula.compare(sel_hash_profile, sel_hash_backend)
+hash_untick = ariance.compare(sel_hash_profile, sel_hash_backend)
 check("hash mirror plans to delete the item that is no longer selected",
       sorted((a.kind, a.rel) for a in hash_untick) ==
       [("delete", beta_rel), ("equal", selected_rel)],
       [(a.kind, a.rel) for a in hash_untick])
-nebula.execute(sel_hash_profile, sel_hash_backend, hash_untick)
+ariance.execute(sel_hash_profile, sel_hash_backend, hash_untick)
 check("hash mirror removes the unselected copy and keeps the other",
       not os.path.exists(os.path.join(sel_hash_dst, "Music", beta_rel))
       and os.path.exists(os.path.join(sel_hash_dst, "Music", selected_rel)))
 check("hash mirror leaves a file it never synced alone", os.path.exists(hash_extra))
 
-selection_dlg = nebula.SyncSelectionDialog(
+selection_dlg = ariance.SyncSelectionDialog(
     fresh_config(library_folders=[MUSIC], audiobook_folders=[AB]),
     library, [], None)
 selection_labels = [selection_dlg.tree.topLevelItem(i).text(0).split(" (")[0]
                     for i in range(selection_dlg.tree.topLevelItemCount())]
 music_rows = sum(1 for row in library.tracks()
                  if "podcast" not in str(row.get("genre") or "").lower())
-book_files = sum(len(paths) for _name, paths in nebula.audiobook_books([AB]))
+book_files = sum(len(paths) for _name, paths in ariance.audiobook_books([AB]))
 check("the selection window has Music and Audiobooks groups, without Podcasts",
       selection_labels == ["Music", "Audiobooks"], selection_labels)
 check("everything is selected by default",
@@ -1798,7 +2083,7 @@ check("an audiobook keeps its book folder on the device",
       [e["rel"] for e in selection_dlg.entries()][:6])
 all_entries = selection_dlg.entries()
 without_dune = [entry for entry in all_entries if not entry["rel"].startswith("Dune/")]
-partial = nebula.SyncSelectionDialog(
+partial = ariance.SyncSelectionDialog(
     fresh_config(library_folders=[MUSIC], audiobook_folders=[AB]), library,
     without_dune, None)
 partial_books = partial.tree.topLevelItem(1)
@@ -1808,7 +2093,7 @@ check("a book with all chapters unselected reopens unchecked",
       dune_book.checkState(0) == Qt.Unchecked
       and all(dune_book.child(i).checkState(0) == Qt.Unchecked
               for i in range(dune_book.childCount())))
-none_dlg = nebula.SyncSelectionDialog(
+none_dlg = ariance.SyncSelectionDialog(
     fresh_config(library_folders=[MUSIC], audiobook_folders=[AB]), library,
     [], None, select_all=False)
 check("an explicitly empty selection stays empty", none_dlg.entries() == [])
@@ -1822,7 +2107,7 @@ class PodcastLibrary:
              "genre": "Podcast"},
         ]
 
-podcast_dlg = nebula.SyncSelectionDialog(
+podcast_dlg = ariance.SyncSelectionDialog(
     fresh_config(library_folders=[MUSIC], audiobook_folders=[]),
     PodcastLibrary(), [], None)
 podcast_labels = [podcast_dlg.tree.topLevelItem(i).text(0).split(" (")[0]
@@ -1849,10 +2134,10 @@ os.makedirs(os.path.join(src, "Podcasts", "Show"), exist_ok=True)
 shutil.copyfile(MP3A, os.path.join(src, "Podcasts", "Show", "episode.mp3"))
 routed_dst = os.path.join(HOME, "routed-dst")
 os.makedirs(routed_dst)
-routed_profile = nebula.Profile(name="Routed", device_id=f"folder:{routed_dst}",
+routed_profile = ariance.Profile(name="Routed", device_id=f"folder:{routed_dst}",
                                source=src, sources=[src, AB], target="Music",
                                audiobook_roots=[AB])
-routed_plan = nebula.compare(routed_profile, nebula.LocalFolderBackend(routed_dst))
+routed_plan = ariance.compare(routed_profile, ariance.LocalFolderBackend(routed_dst))
 check("the profile sends music and audiobooks, but not podcasts",
       sorted((a.kind, a.rel) for a in routed_plan) == [
           ("new", "Artists/Aphex Twin/Selected Ambient Works/01 - Alpha.wav"),
@@ -1861,7 +2146,7 @@ check("the profile sends music and audiobooks, but not podcasts",
           ("new", "Audiobooks/Dune/Chapter 02.m4b"),
           ("new", "Audiobooks/The Hobbit.m4b")],
       [(a.kind, a.rel) for a in routed_plan])
-nebula.execute(routed_profile, nebula.LocalFolderBackend(routed_dst), routed_plan)
+ariance.execute(routed_profile, ariance.LocalFolderBackend(routed_dst), routed_plan)
 check("the rendered paths use the selected folder and its music/audiobook subfolders",
       os.path.exists(os.path.join(routed_dst, "Music", "Artists", "Aphex Twin",
                                   "Selected Ambient Works", "01 - Alpha.wav"))
@@ -1869,7 +2154,7 @@ check("the rendered paths use the selected folder and its music/audiobook subfol
                                       "Chapter 01.m4b"))
       and not os.path.exists(os.path.join(routed_dst, "Music", "Podcasts", "Show",
                                           "episode.mp3")))
-target_dialog = nebula.SyncTargetsDialog(routed_profile, routed_dst)
+target_dialog = ariance.SyncTargetsDialog(routed_profile, routed_dst)
 target_dialog.base.setText("Walkman/Music")
 target_dialog.music.setText("Artists")
 target_dialog.audiobooks.setText("Audiobooks")
@@ -1880,20 +2165,20 @@ check("Choose Target Folders edits only the Music and Audiobooks paths",
       and not hasattr(target_dialog, "podcasts"),
       (target_dialog.values(), target_dialog.preview.text()))
 target_dialog.close()
-legacy_podcast_profile = nebula.Profile(
+legacy_podcast_profile = ariance.Profile(
     name="Legacy podcast", selection_mode="selected",
     selection=[{"path": WAV1, "rel": "Podcasts/Show/episode.wav", "kind": "podcast"}])
 check("a legacy podcast selection is ignored by the sync engine",
-      nebula.profile_sync_files(legacy_podcast_profile) == {},
-      nebula.profile_sync_files(legacy_podcast_profile))
+      ariance.profile_sync_files(legacy_podcast_profile) == {},
+      ariance.profile_sync_files(legacy_podcast_profile))
 inactive_dst = os.path.join(HOME, "inactive-dst")
 os.makedirs(os.path.join(inactive_dst, "Music", "Audiobooks"))
 os.makedirs(os.path.join(inactive_dst, "Music", "Podcasts", "Keep"))
 shutil.copyfile(AB_CH1, os.path.join(inactive_dst, "Music", "Audiobooks", "keep.m4b"))
 shutil.copyfile(MP3A, os.path.join(inactive_dst, "Music", "Podcasts", "Keep", "keep.mp3"))
-inactive_profile = nebula.Profile(name="Music only", device_id=f"folder:{inactive_dst}",
+inactive_profile = ariance.Profile(name="Music only", device_id=f"folder:{inactive_dst}",
                                  source=src, sources=[src], target="Music", mode="mirror")
-inactive_plan = nebula.compare(inactive_profile, nebula.LocalFolderBackend(inactive_dst))
+inactive_plan = ariance.compare(inactive_profile, ariance.LocalFolderBackend(inactive_dst))
 check("a music profile does not delete the Audiobooks or Podcasts trees it is not sending",
       not any(a.kind == "delete" and (a.rel.startswith("Audiobooks/")
                                        or a.rel.startswith("Podcasts/"))
@@ -1902,15 +2187,15 @@ check("a music profile does not delete the Audiobooks or Podcasts trees it is no
                                       "keep.mp3")),
       [(a.kind, a.rel) for a in inactive_plan])
 
-saved_profiles = nebula.load_profiles()
-empty_profile = nebula.Profile(name="Empty selection", selection_mode="selected",
+saved_profiles = ariance.load_profiles()
+empty_profile = ariance.Profile(name="Empty selection", selection_mode="selected",
                                selection=[], selection_all=False)
-nebula.save_profiles([empty_profile])
-loaded_empty = nebula.load_profiles()[0]
+ariance.save_profiles([empty_profile])
+loaded_empty = ariance.load_profiles()[0]
 check("an empty selected-item choice survives a profile reload",
       loaded_empty.selection_mode == "selected" and not loaded_empty.selection
       and loaded_empty.selection_all is False)
-nebula.save_profiles(saved_profiles)
+ariance.save_profiles(saved_profiles)
 
 # ---------------------------------------------------------------- session
 section("session restore and the reported data loss")
@@ -1925,10 +2210,10 @@ w.tabs.setCurrentIndex(1)
 app.processEvents()
 w.player.set_queue([WAV1, FLAC1])
 w.library_tab._save_queue_state()
-nebula.save_config(w.config)
+ariance.save_config(w.config)
 w.close()
 
-restored = nebula.load_config()
+restored = ariance.load_config()
 check("the library folder is still there after closing",
       restored["library_folders"] == [MUSIC], restored["library_folders"])
 check("both remembered devices are still there after closing",
@@ -1943,7 +2228,7 @@ check("volume and tab survive the restart",
 asked.clear()
 QMessageBox.question = staticmethod(
     lambda *a, **k: asked.append(a[2] if len(a) > 2 else "") or QMessageBox.No)
-w4 = nebula.MainWindow()
+w4 = ariance.MainWindow()
 QTest.qWait(650)
 check("the next launch restores the queue", len(w4.player.queue) == 2, w4.player.queue)
 check("the next launch restores the remembered devices",
@@ -1953,28 +2238,35 @@ check("the next launch does not ask for the library folder", not asked, asked)
 QMessageBox.question = real_question
 w4.close()
 
-# reproduce the exact 1.09 accident: a stray defaults write, then recovery
+# a stray defaults write must never replace a configured install
 good = json.loads(json.dumps(restored))
-nebula.save_config(good)
-nebula.save_config(fresh_config())          # the bad write
-check("the bad write left an empty folder list in place",
-      nebula.load_config()["library_folders"] == [])
-backup_data = json.load(open(nebula.CONFIG_FILE + ".bak", encoding="utf-8"))
-check("the backup still has the folders and devices",
+ariance.save_config(good)
+ariance.save_config(good)                    # make the backup the good config
+stray = fresh_config()
+check("a defaults write is refused over an existing configured install",
+      ariance.save_config(stray) is False
+      and ariance.load_config()["library_folders"] == [MUSIC]
+      and ariance.load_config()["volume"] == 63,
+      (ariance.load_config().get("library_folders"), ariance.load_config().get("volume")))
+backup_data = json.load(open(ariance.CONFIG_FILE + ".bak", encoding="utf-8"))
+check("the refused defaults write leaves the good backup untouched",
       backup_data["library_folders"] == [MUSIC]
       and len(backup_data["device_registry"]) == 2, backup_data.get("library_folders"))
-with open(nebula.CONFIG_FILE, "w", encoding="utf-8") as f:
+# Bypass the guard deliberately: that is what an interrupted or external write
+# would look like, and the previous good file must still be recoverable.
+ariance.save_json(ariance.CONFIG_FILE, fresh_config())
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     f.write("{")
-check("a damaged config after the bad write comes back from the backup",
-      nebula.load_config()["library_folders"] == [MUSIC],
-      nebula.load_config()["library_folders"])
+check("a damaged config after an external defaults write comes back from the backup",
+      ariance.load_config()["library_folders"] == [MUSIC],
+      ariance.load_config()["library_folders"])
 
 # ---------------------------------------------------------------- settings backup
 section("settings backup")
 w.config["discogs_token"] = "secret-token"
 w.config["discogs_secret"] = "secret-secret"
 backup_groups = {"preferences", "sync_profiles", "device_presets", "smart_playlists"}
-backup = nebula.build_settings_bundle(w.config, backup_groups)
+backup = ariance.build_settings_bundle(w.config, backup_groups)
 check("a settings backup has all four parts",
       set(backup) >= {"nebula_settings", "preferences", "sync_profiles",
                       "device_presets", "smart_playlists"}, set(backup))
@@ -1982,12 +2274,12 @@ check("a settings backup leaves credentials out",
       not ({"discogs_token", "discogs_secret"}
            & set(backup["preferences"])), backup["preferences"].keys())
 backup_path = os.path.join(HOME, "settings-backup.json")
-nebula.write_settings_bundle(backup_path, w.config, backup_groups)
-loaded_backup = nebula.read_settings_bundle(backup_path)
+ariance.write_settings_bundle(backup_path, w.config, backup_groups)
+loaded_backup = ariance.read_settings_bundle(backup_path)
 check("an exported settings file reads back",
       loaded_backup.get("preferences", {}).get("volume") == w.config["volume"])
 try:
-    nebula.read_settings_bundle(nebula.CONFIG_FILE)
+    ariance.read_settings_bundle(ariance.CONFIG_FILE)
     bad_backup = False
 except ValueError:
     bad_backup = True
@@ -1995,13 +2287,13 @@ check("an ordinary JSON file is not mistaken for a settings backup", bad_backup)
 import_cfg = fresh_config(discogs_token="keep-me", volume=1)
 import_bundle = {"nebula_settings": 1, "preferences": {"volume": 13,
                   "discogs_token": "do-not-copy"}}
-imported = nebula.apply_settings_bundle(import_bundle, import_cfg, {"preferences"})
+imported = ariance.apply_settings_bundle(import_bundle, import_cfg, {"preferences"})
 check("importing merges preferences and keeps credentials",
       import_cfg["volume"] == 13 and import_cfg["discogs_token"] == "keep-me"
       and imported.get("preferences") is True,
       (import_cfg["volume"], import_cfg["discogs_token"]))
 try:
-    nebula.apply_settings_bundle({"nebula_settings": 1}, import_cfg, {"preferences"})
+    ariance.apply_settings_bundle({"nebula_settings": 1}, import_cfg, {"preferences"})
     missing_ok = False
 except ValueError:
     missing_ok = True

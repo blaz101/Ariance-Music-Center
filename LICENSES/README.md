@@ -5,7 +5,7 @@ in the root `LICENSE` and in `GPL-3.0.txt`.
 
 | Component | License | Text |
 |---|---|---|
-| Nebula Music Center | GPL-3.0-only | `GPL-3.0.txt` / `../LICENSE` |
+| Ariance Music Center | GPL-3.0-only | `GPL-3.0.txt` / `../LICENSE` |
 | PySide6 / Qt 6 | LGPL-3.0-only (open-source option) | `LGPL-3.0.txt` |
 | FFmpeg libraries | LGPL-2.1-or-later | `LGPL-2.1.txt` |
 | mutagen | GPL-2.0-or-later | `GPL-2.0.txt` |

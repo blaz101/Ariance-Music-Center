@@ -16,10 +16,10 @@ import sys
 import tempfile
 import traceback
 
-HOME = tempfile.mkdtemp(prefix="nebula-synchash-")
+HOME = tempfile.mkdtemp(prefix="ariance-synchash-")
 os.environ["HOME"] = HOME
-os.environ["NEBULA_DATA"] = os.path.join(HOME, "Nebula")
-os.environ["NEBULA_CACHE"] = os.path.join(HOME, ".cache", "Nebula")
+os.environ["ARIANCE_DATA"] = os.path.join(HOME, "Ariance")
+os.environ["ARIANCE_CACHE"] = os.path.join(HOME, ".cache", "Ariance")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 atexit.register(shutil.rmtree, HOME, True)
 
@@ -28,7 +28,7 @@ ASSETS = os.path.join(ROOT, "assets")
 sys.path.insert(0, ROOT)
 sys.path.insert(0, ASSETS)
 
-import nebula  # noqa: E402
+import ariance  # noqa: E402
 
 RESULTS = []
 NEXT = [0]
@@ -53,7 +53,7 @@ def write_bytes(path, data):
 
 
 def sha(data):
-    return nebula.hashlib.sha256(data).hexdigest()
+    return ariance.hashlib.sha256(data).hexdigest()
 
 
 def edit_same_size(path, byte=0x80):
@@ -127,7 +127,7 @@ class Scene:
         opts.setdefault("source", self.src)
         opts.setdefault("sources", [self.src])
         opts.setdefault("selection", entries)
-        self._p = nebula.Profile(**opts)
+        self._p = ariance.Profile(**opts)
         return self._p
 
     @property
@@ -140,20 +140,20 @@ class Scene:
         return target + "/" if target else ""
 
     def backend(self):
-        return nebula.LocalFolderBackend(self.dst)
+        return ariance.LocalFolderBackend(self.dst)
 
     # ---------------------------------------------------------------- paths
     def route_key(self, rel):
         full = os.path.realpath(self.files[rel])
-        files = nebula.profile_sync_files(self.p, False)
+        files = ariance.profile_sync_files(self.p, False)
         for key, (path, _size) in files.items():
             if os.path.realpath(path) == full:
                 return key
         raise KeyError((rel, list(files)))
 
     def dev(self, rel):
-        files = nebula.profile_sync_files(self.p, False)
-        names = nebula._sync_names(self.p, files.keys())
+        files = ariance.profile_sync_files(self.p, False)
+        names = ariance._sync_names(self.p, files.keys())
         return names[self.route_key(rel)]
 
     def full(self, dev):
@@ -174,18 +174,18 @@ class Scene:
 
     # ---------------------------------------------------------------- operations
     def compare(self, **kw):
-        return nebula.compare(self.p, self.backend(), **kw)
+        return ariance.compare(self.p, self.backend(), **kw)
 
     def sync(self, **kw):
         plan = self.compare(**kw)
-        errors = nebula.execute(self.p, self.backend(), plan)
+        errors = ariance.execute(self.p, self.backend(), plan)
         return plan, errors
 
     def manifest(self):
-        return nebula.DeviceManifest(self.p)
+        return ariance.DeviceManifest(self.p)
 
     def store(self):
-        return nebula.HashStore(self.p)
+        return ariance.HashStore(self.p)
 
     def record_duplicate(self, rel, dev, data=None):
         data = self.data(rel) if data is None else data
@@ -402,7 +402,7 @@ def group_lifecycle():
     real_open = b.open_read
     b.open_read = lambda rel: (reads.append(rel), real_open(rel))[1]
     try:
-        fast = nebula.compare(s.p, b)
+        fast = ariance.compare(s.p, b)
     finally:
         b.open_read = real_open
     check("life: a trusted repeat reads no device bytes", reads == [] and fast[0].kind == "equal",
@@ -834,7 +834,7 @@ def group_manifest_states():
     s = base()
     m = s.manifest()
     m.record(s.prefix + dup, dev, os.path.getsize(s.files[rel]),
-             nebula.file_hash256(s.files[rel]), 0, s.p.id)
+             ariance.file_hash256(s.files[rel]), 0, s.p.id)
     m.save()
     check("duplicate: a record for a missing extra plans nothing",
           rows(s.compare()) == [], rows(s.compare()))
@@ -870,7 +870,7 @@ def group_manifest_states():
     one = s.prefix + s.dev("Artist/One.flac")
     two = s.prefix + s.dev("Artist/Two.flac")
     m.record(two, s.route_key("Artist/One.flac"), os.path.getsize(s.files["Artist/Two.flac"]),
-             nebula.file_hash256(s.files["Artist/Two.flac"]), 0, s.p.id)
+             ariance.file_hash256(s.files["Artist/Two.flac"]), 0, s.p.id)
     # Remove the real record for Two and mark One unselected so its record can poison it.
     m.forget(two)
     m.record(two, s.route_key("Artist/One.flac"), 1, "0" * 64, 0, s.p.id)
@@ -947,7 +947,7 @@ def group_verify():
     m = s.manifest()
     ghost = "Artists/Artists/Artist/Album/01.flac"
     m.record(s.prefix + ghost, s.route_key(rel), os.path.getsize(s.files[rel]),
-             nebula.file_hash256(s.files[rel]), 0, s.p.id)
+             ariance.file_hash256(s.files[rel]), 0, s.p.id)
     m.save()
     s.compare(verify=True)
     check("verify: a ghost duplicate record is not recreated",
@@ -1057,7 +1057,7 @@ def group_reported_bug():
     real_open = b.open_read
     b.open_read = lambda rel: (reads.append(rel), real_open(rel))[1]
     try:
-        repeat = nebula.compare(s.p, b)
+        repeat = ariance.compare(s.p, b)
     finally:
         b.open_read = real_open
     check("bug: the cleaned album compares equal without reading device bytes",

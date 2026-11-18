@@ -3,14 +3,14 @@
 The **GPL-3.0-only** license applies to the source code and to the copyright in the
 project's artwork as described in `PROVENANCE.md`.
 
-The name **Nebula Music Center**, the shortened name **Nebula**, and the Nebula logo
+The name **Ariance Music Center**, the shortened name **Ariance**, and the Ariance logo
 are trademarks of **Roger Barthares**. The GPL does not grant permission to use these
 names or the logo as a trademark, trade name, or branding for a modified version.
 
 You may:
 
 - refer to the original project by name when describing it accurately;
-- state that your work is based on Nebula Music Center;
+- state that your work is based on Ariance Music Center;
 - redistribute an unmodified official release under its own name and logo.
 
 You may not:

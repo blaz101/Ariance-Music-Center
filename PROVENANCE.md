@@ -1,18 +1,18 @@
 # Asset provenance
 
-This file records the origin of the artwork shipped with Nebula Music Center. It is
+This file records the origin of the artwork shipped with Ariance Music Center. It is
 not a substitute for a legal review, but it is the project's written record of where
 each asset came from.
 
-## Nebula logo and app icon
+## Ariance logo and app icon
 
-- **Full logo source:** `branding/nebula-logo.png`
-- **App icon source (1.27):** `branding/nebula-icon.png`, the cleaner circular mark
-  supplied by the copyright holder (`/home/rba/Pictures/Nebula Icon.png`,
-  221 × 221 RGBA, transparent corners).
-- **App icon:** `nebula.png`, generated from `branding/nebula-icon.png` at
+- **Full logo source:** `branding/ariance-logo.png`
+- **App icon source (1.27):** `branding/ariance-icon.png`, the cleaner circular mark
+  supplied by the copyright holder (original file `Nebula Icon.png`,
+  221 × 221 RGBA, transparent corners); renamed with the app in 1.30.
+- **App icon:** `ariance.png`, generated from `branding/ariance-icon.png` at
   512 × 512.
-- **1.26 icon:** `nebula.png` was a crop of the purple circle in the full logo.
+- **1.26 icon:** `ariance.png` was a crop of the purple circle in the full logo.
 - **Copyright:** Copyright (C) 2026 Roger Barthares.
 - **License:** distributed under GPL-3.0-only with the application.
 - **Evidence:** original source image supplied by the copyright holder.
@@ -27,7 +27,7 @@ each asset came from.
 
 ## Repeat and shuffle icons
 
-- **Location:** vector paths drawn in `nebula.py` (`player_icon` / `mode_icon`).
+- **Location:** vector paths drawn in `ariance.py` (`player_icon` / `mode_icon`).
 - **Icons:** `repeat`, `repeat-one`, `repeat-off`, `shuffle`, `shuffle-off`.
 - **Source:** derived from Lucide's icon set.
 - **License:** ISC, with Feather-derived portions under MIT. See
@@ -36,7 +36,7 @@ each asset came from.
 ## EQ icon
 
 - **File:** `assets/icons/eq.svg`
-- **Icon:** a six-bar equalizer outline, drawn for Nebula Music Center by the
+- **Icon:** a six-bar equalizer outline, drawn for Ariance Music Center by the
   copyright holder. It is not taken from an icon set.
 - **License:** distributed under GPL-3.0-only with the application.
 - **Note:** `PySide6.QtSvg` is not bundled and the app does not depend on it, so
@@ -45,7 +45,7 @@ each asset came from.
 
 ## Other UI icons
 
-- The remaining interface glyphs are drawn in `nebula.py`, use Qt standard icons,
+- The remaining interface glyphs are drawn in `ariance.py`, use Qt standard icons,
   or are emoji rendered by the user's system font. They are not separate bundled
   image files.
 
