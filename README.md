@@ -1,4 +1,8 @@
-# Ariance Music Center 1.30
+# Ariance Music Center 1.31
+
+## What's new in 1.31
+
+- Bug fixes
 
 ## What's new in 1.30
 
@@ -84,8 +88,8 @@ https://github.com/blaz101/Ariance-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf ariance-music-center_1.30.orig.tar.xz
-cd ariance-music-center-1.30
+tar -xf ariance-music-center_1.31.orig.tar.xz
+cd ariance-music-center-1.31
 ./run.sh
 ```
 
@@ -102,7 +106,7 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./ariance-music-center_1.30_amd64.deb
+sudo apt install ./ariance-music-center_1.31_amd64.deb
 ariance-music-center              # or pick it from the menu
 ```
 
@@ -472,10 +476,9 @@ by folder when there is no albumartist; a single track gets track tags only. If
 
 ## Verification
 
-The 1.26 source and package were checked with:
+The 1.31 source and package were checked with:
 
-- the deep suite: **214/214 checks passed**;
-- the headless suite: **1057/1057 checks passed**;
+- the deep suite: **374/374 checks passed**;
 - `run.sh --check` from the extracted `.deb`, using a fresh cache;
 - a package audit confirming no VirtualKeyboard, PDF, `qpdf`, `rcrack` or `.aax`
   files are bundled.

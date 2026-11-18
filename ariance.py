@@ -145,7 +145,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Ariance Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Ariance"                 # short name used in menus and messages
-VERSION = "1.30"
+VERSION = "1.31"
 SOURCE_URL = "https://github.com/blaz101/Ariance-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -204,6 +204,9 @@ DATA_ROOT = migrate_legacy_root("ARIANCE_DATA", os.path.join("~", "Ariance"),
 CACHE_ROOT = migrate_legacy_root("ARIANCE_CACHE",
                                  os.path.join("~", ".cache", "Ariance"),
                                  os.path.join("~", ".cache", "Nebula"))
+# Where those two moved from: stored absolute paths still name these.
+LEGACY_DATA_ROOT = os.path.abspath(os.path.expanduser(os.path.join("~", "Nebula")))
+LEGACY_CACHE_ROOT = os.path.abspath(os.path.expanduser(os.path.join("~", ".cache", "Nebula")))
 SETTINGS_DIR = os.path.join(DATA_ROOT, "settings")
 LIBRARY_DIR = os.path.join(DATA_ROOT, "library")
 SYNC_DIR = os.path.join(DATA_ROOT, "sync")
@@ -328,7 +331,7 @@ DEFAULT_CONFIG = {
     "grouping_levels": ["artist", "album"],
     "saved_groupings": [],
     "lib_track_prefix": True,
-    "ui_revision": 43,
+    "ui_revision": 44,
     # multiple collections (each one is a separate database + folder list)
     "collections": [],
     "active_collection": 0,
@@ -397,6 +400,12 @@ def load_config():
         # 1.30: audiobook bookmarks move out of the config into settings/audiobooks.json.
         migrate_audiobook_bookmarks(cfg)
         cfg["ui_revision"] = 43
+    if revision < 44:
+        # 1.31: 1.30 moved ~/Nebula to ~/Ariance but left the config's absolute paths
+        # (the collection database) pointing at the old folder, so the app could not
+        # open its library at all.
+        repoint_legacy_paths(cfg)
+        cfg["ui_revision"] = 44
     for key, val in DEFAULT_CONFIG.items():
         if key not in cfg or not isinstance(cfg[key], type(val)):
             # Never hand out a mutable default: a tab changing its own settings
@@ -456,6 +465,48 @@ def migrate_collections(cfg):
     cols[idx]["folders"] = live
     cfg["library_folders"] = list(live)
     return cols
+
+
+def follow_moved_root(value, old_root, new_root):
+    """A stored path that names a folder which has since been moved."""
+    if not isinstance(value, str) or not value.startswith(old_root + os.sep):
+        return value
+    if os.path.abspath(new_root) == os.path.abspath(old_root):
+        return value
+    moved = new_root + value[len(old_root):]
+    # Only follow a move that really happened: the old folder is gone and the app is
+    # running from the new one. Anything else (an unmoved folder, a path from another
+    # machine) stays exactly as saved.
+    if not os.path.lexists(old_root) and os.path.isdir(new_root):
+        return moved
+    return value
+
+
+def repoint_legacy_paths(cfg):
+    """Make stored paths follow the 1.30 move of ~/Nebula to ~/Ariance.
+
+    The config keeps absolute paths of its own - a collection's database, above
+    all - and 1.30 moved the data folder without rewriting them. The next start
+    then opened ~/Nebula/library/library.db, which no longer existed, and died
+    with "unable to open database file". Paths outside the two data folders (the
+    user's music and audiobook folders) are never touched.
+    """
+    def walk(value):
+        if isinstance(value, dict):
+            return {key: walk(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [walk(val) for val in value]
+        for old, new in ((LEGACY_DATA_ROOT, DATA_ROOT),
+                         (LEGACY_CACHE_ROOT, CACHE_ROOT)):
+            value = follow_moved_root(value, old, new)
+        return value
+
+    fresh = walk(cfg)
+    if fresh == cfg:
+        return False
+    cfg.clear()
+    cfg.update(fresh)
+    return True
 
 
 def active_collection(cfg):
@@ -2691,7 +2742,19 @@ class Library:
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
         self._lock = threading.Lock()
-        self._migrate()
+        try:
+            self._migrate()
+        except sqlite3.OperationalError as err:
+            # A catalogue path we cannot open (a folder that moved away, a drive that
+            # is not mounted) must not stop the app from starting: fall back to the
+            # default catalogue and say so, rather than dying before the window opens.
+            if os.path.abspath(self.db_file) == os.path.abspath(DB_FILE):
+                raise
+            sys.stderr.write("ariance: cannot open %s (%s); using %s\n"
+                             % (self.db_file, err, DB_FILE))
+            self.db_file = DB_FILE
+            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+            self._migrate()
 
     def set_db_file(self, db_file):
         """Switch this catalogue to another collection database."""
@@ -27678,6 +27741,21 @@ class AudiobooksTab(QWidget):
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
 
+def saved_size_fills_screen(w, h, avail):
+    """Is a saved window size the work area itself, i.e. was the window maximized?
+
+    Compared as a share of the area, not by equality: window sizes are kept in
+    logical pixels, so a maximized window is 1920 wide on a 1080p screen, 2560 on a
+    1440p one and 3840 on a 4K one (or its scaled equivalent). A size saved on one
+    screen still has to be recognised when the app is opened on another, which the
+    95% / 90% allowances also cover: the work area can shrink between runs as
+    panels and taskbars change.
+    """
+    if avail is None or avail.width() <= 0 or avail.height() <= 0:
+        return False
+    return w >= avail.width() * 0.95 and h >= avail.height() * 0.9
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -27687,6 +27765,17 @@ class MainWindow(QMainWindow):
         migrate_collections(self.config)
         self._sleep_timer = QTimer(self, singleShot=True, timeout=self._sleep_fire)
         apply_theme(QApplication.instance(), self.config)
+        # The smallest the window may be dragged: 1080x720 keeps the sidebar, the
+        # list and the whole player bar laid out properly. On a display smaller than
+        # that the minimum follows the display instead, so the window is never forced
+        # wider or taller than the screen it is on.
+        min_w, min_h = 1080, 720
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        if avail is not None and avail.width() > 0 and avail.height() > 0:
+            min_w = min(min_w, max(320, avail.width()))
+            min_h = min(min_h, max(240, avail.height()))
+        self.setMinimumSize(min_w, min_h)
         self._restore_window_size()
         self.library = Library(active_collection(self.config)["db"])
         self.playlists = PlaylistStore(lambda: self.config["library_folders"])
@@ -27784,6 +27873,12 @@ class MainWindow(QMainWindow):
         1366x768 with a 1024x600 netbook still around. A window taller than the
         display puts its status bar and player bar off the bottom of the screen, so
         the saved size is cut down to the available area first.
+
+        The size a maximized window reports is the work area, not a normal window
+        size: restoring it made the next start draw the window's bottom behind the
+        taskbar, because the title bar is extra. A stored size that fills the screen
+        is therefore opened maximized, which lets the window manager keep the whole
+        window clear of panels and taskbars on every desktop.
         """
         try:
             saved = self.config.get("window") or [1360, 860]
@@ -27792,9 +27887,16 @@ class MainWindow(QMainWindow):
             w, h = 1360, 860
         screen = self.screen() or QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
-        if avail is not None and avail.width() > 0 and avail.height() > 0:
+        has_avail = avail is not None and avail.width() > 0 and avail.height() > 0
+        wants_max = bool(self.config.get("window_maximized"))
+        if (has_avail and "window_maximized" not in self.config
+                and saved_size_fills_screen(w, h, avail)):
+            wants_max = True      # a 1.29/1.30 config saved while maximized
+            w, h = 1360, 860      # the size to come back to when unmaximized
+        if has_avail:
             w = min(w, avail.width())
             h = min(h, avail.height())
+        self._start_maximized = wants_max
         self.resize(max(w, 320), max(h, 240))
 
     # ---------------- menus ----------------
@@ -28009,8 +28111,33 @@ class MainWindow(QMainWindow):
     def _build_shortcuts(self):
         for seq, fn in ((QKeySequence("Space"), self.player.toggle),
                         (QKeySequence("Ctrl+Right"), lambda: self.player.next()),
-                        (QKeySequence("Ctrl+Left"), self.player.prev)):
+                        (QKeySequence("Ctrl+Left"), self.player.prev),
+                        (QKeySequence("F11"), self.toggle_fullscreen)):
             QShortcut(seq, self, activated=fn)
+
+    def toggle_fullscreen(self):
+        """F11: fill the whole display, at the screen's own resolution.
+
+        Maximizing stops at the work area the panels leave over; a fullscreen
+        window takes the screen's full geometry, so it covers exactly the
+        resolution the user runs. Leaving fullscreen returns to the window state
+        the window had before.
+        """
+        if self.isFullScreen():
+            self.showNormal()
+            if getattr(self, "_fullscreen_was_maximized", False):
+                self.showMaximized()
+            return
+        self._fullscreen_was_maximized = self.isMaximized()
+        self.showFullScreen()
+
+    def keyPressEvent(self, e):
+        # Esc leaves fullscreen, the way every other player does. Nothing else in
+        # the main window is bound to it, so it costs no shortcut.
+        if e.key() == Qt.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen()
+            return
+        super().keyPressEvent(e)
 
     def _open_preferences(self):
         PreferencesDialog(self.library_tab, self).exec()
@@ -28585,7 +28712,15 @@ class MainWindow(QMainWindow):
         self.audiobooks_tab.shutdown()
         store_active_collection(self.config)
         self.config["tab"] = self.tabs.currentIndex()
-        self.config["window"] = [self.width(), self.height()]
+        # While maximized or fullscreen, width()/height() are the work area or the
+        # whole screen, not a size a normal window can take: saving them made the next
+        # start open a window 40 px too tall, with its bottom behind the taskbar.
+        normal = (self.normalGeometry()
+                  if (self.isMaximized() or self.isFullScreen()) else self.geometry())
+        if normal.width() <= 0 or normal.height() <= 0:
+            normal = self.geometry()
+        self.config["window"] = [normal.width(), normal.height()]
+        self.config["window_maximized"] = bool(self.isMaximized())
         path = self.player.current_path()
         if path and not is_cd_entry(path) and not is_device_entry(path):
             self.config["last_track"] = path
@@ -28608,7 +28743,10 @@ def main():
     app.setWindowIcon(QIcon(ICON_FILE))
     install_app_style(app)
     w = MainWindow()
-    w.show()
+    if getattr(w, "_start_maximized", False):
+        w.showMaximized()      # the window manager keeps it off the taskbar
+    else:
+        w.show()
     sys.exit(app.exec())
 
 

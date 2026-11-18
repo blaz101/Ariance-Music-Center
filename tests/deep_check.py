@@ -42,7 +42,7 @@ sys.path.insert(0, ASSETS)
 
 from mutagen.id3 import ID3, TALB, TCON, TDRC, TIT2, TPE1, TRCK, USLT  # noqa: E402
 from mutagen.wave import WAVE  # noqa: E402
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QRect, Qt  # noqa: E402
 from PySide6.QtGui import QTextCursor  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog,  # noqa: E402
@@ -185,13 +185,13 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.30", ariance.VERSION == "1.30", ariance.VERSION)
+check("version is 1.31", ariance.VERSION == "1.31", ariance.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Ariance Music Center 1.30\n"), readme[:40])
-check("README has a 1.30 section", "## What's new in 1.30" in readme)
+      readme.startswith("# Ariance Music Center 1.31\n"), readme[:40])
+check("README has a 1.31 section", "## What's new in 1.31" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.30", "\nV=1.30\n" in build, build[:200])
+check("the package script builds 1.31", "\nV=1.31\n" in build, build[:200])
 check("the package is named after the app", "PKG=ariance-music-center" in build, build[:200])
 
 # ------------------------------------------------------- the move from 1.29
@@ -236,7 +236,7 @@ section("config: defaults, types, backup and recovery")
 cfg = ariance.load_config()
 check("every default key is present",
       all(k in cfg for k in ariance.DEFAULT_CONFIG), sorted(set(ariance.DEFAULT_CONFIG) - set(cfg)))
-check("defaults keep the current UI revision", cfg["ui_revision"] == 43, cfg["ui_revision"])
+check("defaults keep the current UI revision", cfg["ui_revision"] == 44, cfg["ui_revision"])
 
 cfg["library_folders"] = [MUSIC]
 cfg["audiobook_folders"] = [AB]
@@ -306,8 +306,29 @@ with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     json.dump({"ui_revision": 0, "tab": 2}, f)
 migrated = ariance.load_config()
 check("a pre-1.07 tab index moves past the new Audiobooks tab",
-      migrated["tab"] == 3 and migrated["ui_revision"] == 43,
+      migrated["tab"] == 3 and migrated["ui_revision"] == 44,
       (migrated["tab"], migrated["ui_revision"]))
+
+# 1.31: 1.30 moved ~/Nebula to ~/Ariance, but the config's absolute paths (the
+# collection database) still named the old folder, so the app died at startup with
+# "unable to open database file". They have to follow the move.
+stale_db = os.path.join(ariance.LEGACY_DATA_ROOT, "library", "library.db")
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump({"ui_revision": 43, "library_folders": [MUSIC],
+               "collections": [{"name": "Music", "folders": [MUSIC], "db": stale_db}]}, f)
+followed = ariance.load_config()
+check("a collection database that moved with the app is repointed",
+      followed["collections"][0]["db"] == ariance.DB_FILE,
+      followed["collections"][0]["db"])
+check("the path migration is recorded so it runs once", followed["ui_revision"] == 44,
+      followed["ui_revision"])
+check("a music folder that merely shares the old name is left alone",
+      ariance.follow_moved_root(AB, ariance.LEGACY_DATA_ROOT,
+                                ariance.DATA_ROOT) == AB, AB)
+check("a path outside a real move is left alone",
+      ariance.follow_moved_root(os.path.join(ariance.LEGACY_DATA_ROOT, "nope.db"),
+                                ariance.LEGACY_DATA_ROOT, ariance.LEGACY_DATA_ROOT)
+      == os.path.join(ariance.LEGACY_DATA_ROOT, "nope.db"))
 
 # defaults filled into an old config must be copies, not shared module state
 with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -561,6 +582,13 @@ for label, (source, ext) in tag_sources.items():
 
 db_file = os.path.join(HOME, "library.db")
 library = ariance.Library(db_file)
+
+# A catalogue path that cannot be opened (the folder moved away, a drive is not
+# mounted) must not stop the app from starting: it falls back and still works.
+broken = ariance.Library(os.path.join(HOME, "no-such-folder", "library.db"))
+check("an unopenable catalogue path falls back to the default catalogue",
+      os.path.abspath(broken.db_file) == os.path.abspath(ariance.DB_FILE), broken.db_file)
+check("the fallback catalogue answers queries", broken.count() == 0, broken.count())
 library.scan([MUSIC])
 check("the scan indexes every track", library.count() == 4, library.count())
 rows = library.tracks(order_by="title")
@@ -661,8 +689,61 @@ check("a saved window larger than the screen is clamped to it",
       (w.width(), w.height(), _screen.width(), _screen.height()))
 w.config["window"] = [1360, 860]
 w._restore_window_size()
-w.resize(1200, 700)
-check("the window can be made 700 px tall", w.height() == 700, w.height())
+check("the minimum height still fits a 1366x768 screen", w.minimumHeight() <= 768,
+      w.minimumHeight())
+# 1.29/1.30 stored the size a maximized window reported as its normal size. Restored
+# as a normal window, the title bar pushed its bottom behind the taskbar.
+w.config["window"] = [_screen.width(), _screen.height() - 60]
+w.config.pop("window_maximized", None)
+w._restore_window_size()
+check("a size saved while maximized comes back maximized instead of oversized",
+      getattr(w, "_start_maximized", False) is True
+      and (w.width(), w.height()) == (min(1360, _screen.width()),
+                                      min(860, _screen.height())),
+      (getattr(w, "_start_maximized", None), w.width(), w.height()))
+w.config["window"] = [600, 500]
+w.config.pop("window_maximized", None)
+w._restore_window_size()
+check("an ordinary saved size opens as a normal window",
+      getattr(w, "_start_maximized", None) is False,
+      getattr(w, "_start_maximized", None))
+# Sizes are logical pixels, so the same rules must hold on 1080p, 1440p and 4K.
+check("a maximized window saved on 1440p is recognised on 1080p",
+      ariance.saved_size_fills_screen(2560, 1400, QRect(0, 0, 1920, 1040)))
+check("a maximized window saved on 4K is recognised on 1080p",
+      ariance.saved_size_fills_screen(3840, 2080, QRect(0, 0, 1920, 1040)))
+check("a maximized window saved on 4K is recognised on 1440p",
+      ariance.saved_size_fills_screen(3840, 2080, QRect(0, 0, 2560, 1400)))
+check("a maximized window is recognised at 100% and 200% scaling alike",
+      ariance.saved_size_fills_screen(3840, 2120, QRect(0, 0, 3840, 2120))
+      and ariance.saved_size_fills_screen(1920, 1060, QRect(0, 0, 1920, 1060)))
+check("an ordinary 1600x900 window is not mistaken for maximized on 4K",
+      not ariance.saved_size_fills_screen(1600, 900, QRect(0, 0, 3840, 2120)))
+check("an ordinary 1360x860 window is not mistaken for maximized on 1440p",
+      not ariance.saved_size_fills_screen(1360, 860, QRect(0, 0, 2560, 1400)))
+check("an ordinary window saved on a big screen stays normal on a small one",
+      ariance.saved_size_fills_screen(1600, 900, QRect(0, 0, 1920, 1040)) is False)
+w.config["window"] = [1360, 860]
+w._restore_window_size()
+w.resize(1200, w.minimumHeight())
+check("the window can be made as short as its minimum",
+      w.height() == w.minimumHeight(), (w.height(), w.minimumHeight()))
+_min_screen = ariance.QApplication.primaryScreen().availableGeometry()
+_want_min = (min(1080, max(320, _min_screen.width())),
+             min(720, max(240, _min_screen.height())))
+check("the smallest window is 1080x720 on a screen that fits it",
+      (w.minimumWidth(), w.minimumHeight()) == _want_min,
+      (w.minimumWidth(), w.minimumHeight(), _want_min))
+check("the minimum never exceeds the screen",
+      w.minimumWidth() <= _min_screen.width() and w.minimumHeight() <= _min_screen.height(),
+      (w.minimumWidth(), w.minimumHeight(), _min_screen.width(), _min_screen.height()))
+check("F11 is bound to fullscreen",
+      any(s.key().toString() == "F11" for s in w.findChildren(ariance.QShortcut)),
+      [s.key().toString() for s in w.findChildren(ariance.QShortcut)])
+check("a fullscreen window covers the screen's own geometry",
+      w.toggle_fullscreen() is None and w.isFullScreen())
+w.toggle_fullscreen()
+check("leaving fullscreen gives the window back", not w.isFullScreen(), w.windowState())
 w.resize(1360, 860)
 w.library_tab.refresh()
 w.audiobooks_tab.refresh()
@@ -2324,4 +2405,11 @@ print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 for sec, name, _ok, detail in failed:
     print(f"  FAILED [{sec}] {name}: {detail}")
 print(f"\nscratch home: {HOME} (removed when the run ends)")
-sys.exit(1 if failed else 0)
+# Thousands of widgets, players and worker threads are still alive here, and letting
+# Python tear Qt down in its own order made this harness abort after the results were
+# already printed (malloc_consolidate / segfault, about one run in three). Everything
+# that matters has been written, so leave without running those destructors.
+shutil.rmtree(HOME, ignore_errors=True)
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(1 if failed else 0)
