@@ -6,18 +6,10 @@
 
 ## What's new in 1.30
 
-- **A dedicated audiobook player.** Audiobooks get their own deck instead of
-  borrowing the music player: author and title blocks, the chapter drawer, chapter
-  skipping, and a remembered place in every book - play one, pause, start another,
-  come back, and it carries on where it stopped. Chapters come from the M4B file's
-  own marks or from a folder of chapter files, and both play the same way.
-- **Fixed the settings bug.** A stray defaults write can no longer turn a
-  configured install back into a fresh one.
+- **Dedicated audiobook player.** .
+- **Fixed settings bug.**
 - **Full rename.** The app is now Ariance Music Center; the old name was much too
-  crowded. On the first start `~/Nebula` moves to `~/Ariance` and `~/.cache/Nebula`
-  to `~/.cache/Ariance` - nothing is copied or deleted, and if the move fails the
-  old folders keep being used. The package is now `ariance-music-center`, so
-  uninstall the old one before installing this.
+  crowded. 
 
 ## What's new in 1.29
 
