@@ -1,4 +1,12 @@
-# Ariance Music Center 1.32
+# Ariance Music Center 1.33
+
+## What's new in 1.33
+
+- Runs in the tray: closing the window keeps the app and the music going, and it
+  can start with no window at all
+- Added resource usage limits
+- Full podcast support
+- Updating item sync
 
 ## What's new in 1.32
 
@@ -87,8 +95,8 @@ https://github.com/blaz101/Ariance-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf ariance-music-center_1.32.orig.tar.xz
-cd ariance-music-center-1.32
+tar -xf ariance-music-center_1.33.orig.tar.xz
+cd ariance-music-center-1.33
 ./run.sh
 ```
 
@@ -105,7 +113,7 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./ariance-music-center_1.32_amd64.deb
+sudo apt install ./ariance-music-center_1.33_amd64.deb
 ariance-music-center              # or pick it from the menu
 ```
 
@@ -120,8 +128,8 @@ program away and leaves your music and settings alone (add `--purge` plus a dele
 
 ```
 ~/Ariance/                                    settings and data
-  settings/   config.json, audiobooks.json, profiles.json, smart_playlists.json,
-              queue-meta.json
+  settings/   config.json, audiobooks.json, podcasts.json, profiles.json,
+              smart_playlists.json, queue-meta.json
   library/    library.db, collections/, playlists/
   sync/       hashdb/, manifests/
 
@@ -356,13 +364,30 @@ by folder when there is no albumartist; a single track gets track tags only. If
   **Remove from the Devices tab…**; removed devices wait under **Preferences > Devices**
   and **Restore selected** brings them back, connected or not. MTP requires gvfs and an
   unlocked phone in File Transfer mode.
+- **Podcasts** is a tab of its own, modelled on Rhythmbox. Subscriptions are on
+  the left with All Episodes on top; the chosen show's episodes are on the right,
+  newest first, with Episode, Show, Date, Length and Status columns. **Add
+  podcast…** takes a feed address (`feed://` and `itpc://` work too), searches the
+  public iTunes podcast directory, or imports an OPML list; **More…** exports OPML
+  and opens the downloads folder. **Refresh all** checks every feed in the
+  background, and the tab checks the feeds once when it is first opened
+  (Preferences > Podcasts can switch that off). Double-click an episode to play
+  it: a downloaded file plays at once, anything else is downloaded first and then
+  played. **Download** saves an episode, **Delete download** removes the file but
+  keeps the episode listed, and **Mark played** keeps the state the tab colours and
+  counts. The context menu refreshes one feed, opens the show's website and copies
+  the episode address. Downloads are named `date - episode title` by default; the
+  show/date/number styles and one folder per show are in Preferences > Podcasts,
+  and changing the folder only affects new downloads. Downloads stay out of the
+  music library and are synced from **What to sync > Podcasts**, landing in
+  `Podcasts` below the device folder.
 - **Syncing** stores profiles for one or more library folders and a device/folder
-  destination. **Folder(s) to sync** takes as many folders as you add, or switch **What
-  to sync** to **Selected items** and tick individual music and audiobooks in the
-  selection window (**Select All** and **Unselect All** are there too). Selected-item
-  **Mirror** sync copies those files and removes copies it wrote for items that are no
-  longer ticked; **Update** never deletes, and files the profile never wrote are left
-  alone.
+    destination. **What to sync** starts on **Selected items**: tick individual music,
+  audiobooks and downloaded podcast episodes in the selection window (**Select All**
+  and **Unselect All** are there too). Switch it to **Folder(s)** to copy everything
+  below the folders you add instead. Selected-item **Mirror** sync copies those files
+  and removes copies it wrote for items that are no longer ticked; **Update** never
+  deletes, and files the profile never wrote are left alone.
   The tab has three buttons. **Compare** only builds the plan and lists it.
   **Sync** runs the plan you reviewed last (it asks you to press Compare first if
   there is none). **Compare+Sync** compares fresh and then runs the result in one
@@ -461,6 +486,9 @@ by folder when there is no albumartist; a single track gets track tags only. If
 - Audiobook bookmarks: `~/Ariance/settings/audiobooks.json` (the chapter,
   timestamp and playback speed of every book, and the one to reopen at start); the same file is
   rewritten as you listen, so a position saved mid-chapter never touches the config
+- Podcast subscriptions: `~/Ariance/settings/podcasts.json` (feeds, played state
+  and where each downloaded episode is); the audio itself is in `~/Music/Podcasts`
+  or whichever folder Preferences > Podcasts picks
 - Smart playlists: `~/Ariance/settings/smart_playlists.json`
 - Sync profiles: `~/Ariance/settings/profiles.json`; PC hash cache:
   `~/Ariance/sync/hashdb/`; per-device sync manifests:
@@ -475,9 +503,11 @@ by folder when there is no albumartist; a single track gets track tags only. If
 
 ## Verification
 
-The 1.32 source and package were checked with:
+The 1.33 source and package were checked with:
 
-- the deep suite: **397/397 checks passed**;
+- the deep suite: **448/448 checks passed**;
+- the sync routing suite: **264/264 scenarios passed**
+  (`QT_QPA_PLATFORM=offscreen python3 tests/sync_hash_check.py`);
 - `run.sh --check` from the extracted `.deb`, using a fresh cache;
 - a package audit confirming no VirtualKeyboard, PDF, `qpdf`, `rcrack` or `.aax`
   files are bundled.
@@ -488,6 +518,13 @@ drive are still the parts that need a real desktop check.
 
 ## Honest limitations
 
+- Podcast episodes are downloaded before they play: there is no streaming mode, so
+  starting a new episode waits for the download. Feeds are read when the Podcasts
+  tab is first opened and when **Refresh all** is pressed; there is no timer
+  checking them in the background and no new-episode notification. The directory
+  search uses the public iTunes API; a feed address works without it.
+- Removing a podcast keeps the episodes already downloaded, and deleting a
+  download leaves the episode in the list and does not mark it unplayed.
 - Fast hash trusts what this app last wrote. A device file edited outside the app
   while keeping both its size and timestamp is reported equal until the **Verify
   content** button (or *Bit-by-bit*) reads it. The manifest is a record of past

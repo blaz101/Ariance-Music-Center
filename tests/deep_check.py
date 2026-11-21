@@ -173,7 +173,7 @@ dialog_calls = [
     and isinstance(node.func.value, ast.Name) and node.func.value.id == "QFileDialog"
     and node.func.attr.startswith("get")]
 check("every file dialog call passes the native chooser options",
-      len(dialog_calls) == 23 and all(
+      len(dialog_calls) == 27 and all(
           any(keyword.arg == "options" and isinstance(keyword.value, ast.Name)
               and keyword.value.id in {"FILE_DIALOG_OPTIONS", "DIRECTORY_DIALOG_OPTIONS"}
               for keyword in call.keywords)
@@ -188,13 +188,13 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.32", ariance.VERSION == "1.32", ariance.VERSION)
+check("version is 1.33", ariance.VERSION == "1.33", ariance.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Ariance Music Center 1.32\n"), readme[:40])
-check("README has a 1.32 section", "## What's new in 1.32" in readme)
+      readme.startswith("# Ariance Music Center 1.33\n"), readme[:40])
+check("README has a 1.33 section", "## What's new in 1.33" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.32", "\nV=1.32\n" in build, build[:200])
+check("the package script builds 1.33", "\nV=1.33\n" in build, build[:200])
 check("the package is named after the app", "PKG=ariance-music-center" in build, build[:200])
 
 # ------------------------------------------------------- the move from 1.29
@@ -239,7 +239,7 @@ section("config: defaults, types, backup and recovery")
 cfg = ariance.load_config()
 check("every default key is present",
       all(k in cfg for k in ariance.DEFAULT_CONFIG), sorted(set(ariance.DEFAULT_CONFIG) - set(cfg)))
-check("defaults keep the current UI revision", cfg["ui_revision"] == 44, cfg["ui_revision"])
+check("defaults keep the current UI revision", cfg["ui_revision"] == 45, cfg["ui_revision"])
 
 cfg["library_folders"] = [MUSIC]
 cfg["audiobook_folders"] = [AB]
@@ -308,8 +308,8 @@ check("the repaired config has a usable collection",
 with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
     json.dump({"ui_revision": 0, "tab": 2}, f)
 migrated = ariance.load_config()
-check("a pre-1.07 tab index moves past the new Audiobooks tab",
-      migrated["tab"] == 3 and migrated["ui_revision"] == 44,
+check("a pre-1.07 tab index moves past the Audiobooks and Podcasts tabs",
+      migrated["tab"] == 4 and migrated["ui_revision"] == 45,
       (migrated["tab"], migrated["ui_revision"]))
 
 # 1.31: 1.30 moved ~/Nebula to ~/Ariance, but the config's absolute paths (the
@@ -323,7 +323,7 @@ followed = ariance.load_config()
 check("a collection database that moved with the app is repointed",
       followed["collections"][0]["db"] == ariance.DB_FILE,
       followed["collections"][0]["db"])
-check("the path migration is recorded so it runs once", followed["ui_revision"] == 44,
+check("the path migration is recorded so it runs once", followed["ui_revision"] == 45,
       followed["ui_revision"])
 # 1.32: a config that saved revision 44 while still naming ~/Nebula must be repaired
 # on the next load; 1.31 bumped the revision even when it could not follow the move.
@@ -338,6 +338,18 @@ check("a 1.31 config still naming the old database is repaired on load",
       repaired["collections"][0]["db"] ==
       os.path.join(ariance.DATA_ROOT, "library", "library.db"),
       repaired["collections"][0]["db"])
+# 1.33: a 1.32 config has Tags at index 2, which moves past the new Podcasts tab,
+# and its podcast downloads move from Music/Podcasts to their own Podcasts folder.
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump({"ui_revision": 44, "tab": 2, "library_folders": [MUSIC],
+               "device_podcast_folder": "Music/Podcasts"}, f)
+pod_migrated = ariance.load_config()
+check("a 1.32 config moves past the Podcasts tab and adopts /Podcasts",
+      pod_migrated["tab"] == 3
+      and pod_migrated["device_podcast_folder"] == "Podcasts"
+      and pod_migrated["ui_revision"] == 45,
+      (pod_migrated["tab"], pod_migrated["device_podcast_folder"],
+       pod_migrated["ui_revision"]))
 check("a music folder that merely shares the old name is left alone",
       ariance.follow_moved_root(AB, ariance.LEGACY_DATA_ROOT,
                                 ariance.DATA_ROOT) == AB, AB)
@@ -688,15 +700,18 @@ check("the main window is titled Ariance Music Center",
       w.windowTitle() == ariance.APP_NAME == "Ariance Music Center",
       (w.windowTitle(), ariance.APP_NAME))
 titles = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-check("the tabs are Music, Audiobooks, Tags, Devices, Syncing",
-      titles == ["Music", "Audiobooks", "Tags", "Devices", "Syncing"], titles)
+check("the tabs are Music, Audiobooks, Podcasts, Tags, Devices, Syncing",
+      titles == ["Music", "Audiobooks", "Podcasts", "Tags", "Devices", "Syncing"],
+      titles)
+check("Podcasts sits right after Audiobooks",
+      titles.index("Podcasts") == titles.index("Audiobooks") + 1, titles)
 # A window that insists on being taller than the display gets its bottom cut off:
 # the Syncing form alone used to force 1017 px, more than a 1000 px screen.
 check("the window's minimum fits a 1366x768 laptop",
       w.minimumSizeHint().height() <= 700, w.minimumSizeHint().height())
 check("the Syncing page scrolls instead of forcing the window taller",
-      w.tabs.widget(4).minimumSizeHint().height() < 200,
-      w.tabs.widget(4).minimumSizeHint().height())
+      w.tabs.widget(5).minimumSizeHint().height() < 200,
+      w.tabs.widget(5).minimumSizeHint().height())
 _screen = ariance.QApplication.primaryScreen().availableGeometry()
 w.config["window"] = [9999, 9999]
 w._restore_window_size()
@@ -1325,8 +1340,8 @@ ariance.save_config(w.config)
 prefs = ariance.PreferencesDialog(w.library_tab, w)
 check("Preferences has an Audiobooks page",
       [prefs.sidebar.item(i).text() for i in range(prefs.sidebar.count())]
-      == ["Theme", "Library", "Audiobooks", "Devices", "Playback", "Syncing",
-          "Backup", "Audio CD", "Identification", "Lyrics"],
+      == ["Theme", "Library", "Audiobooks", "Podcasts", "Devices", "Playback",
+          "Performance", "Syncing", "Backup", "Audio CD", "Identification", "Lyrics"],
       [prefs.sidebar.item(i).text() for i in range(prefs.sidebar.count())])
 check("Preferences has a Lyrics source list in priority order",
       [prefs.lyric_list.item(i).data(Qt.ItemDataRole.UserRole)
@@ -1360,6 +1375,105 @@ check("Preferences has settings export and import",
       and len(prefs.backup_checks) == 4
       and all(box.isChecked() for box in prefs.backup_checks.values()))
 prefs.close()
+
+# --------------------------------------------- 1.33 tray running and limits
+section("1.33: running in the tray and what the app may use")
+check("a closed window stays in the tray by default",
+      ariance.DEFAULT_CONFIG["close_to_tray"] is True
+      and ariance.DEFAULT_CONFIG["start_in_tray"] is False
+      and ariance.DEFAULT_CONFIG["poll_hidden"] is True,
+      (ariance.DEFAULT_CONFIG["close_to_tray"],
+       ariance.DEFAULT_CONFIG["start_in_tray"],
+       ariance.DEFAULT_CONFIG["poll_hidden"]))
+check("the app can be started with no window at all",
+      ariance.start_hidden({"start_in_tray": True}) is True
+      and ariance.start_hidden({"start_in_tray": False}, ["--tray"]) is True
+      and ariance.start_hidden({"start_in_tray": False}, ["--hidden"]) is True
+      and ariance.start_hidden({"start_in_tray": False}) is False)
+check("the tray probe answers with a decision",
+      ariance.tray_available() in (True, False), ariance.tray_available())
+real_tray_available = ariance.tray_available
+ariance.tray_available = lambda: False
+check("a desktop with no tray closes the window for real",
+      w._close_to_tray() is False)
+ariance.tray_available = real_tray_available
+w.config["close_to_tray"] = False
+check("switching the tray setting off closes the window for real",
+      w._close_to_tray() is False and w._started_hidden is False)
+w.config["close_to_tray"] = True
+perf = ariance.PreferencesDialog(w.library_tab, w)
+titles = [perf.sidebar.item(i).text() for i in range(perf.sidebar.count())]
+check("Preferences has a Performance page right after Playback",
+      titles[titles.index("Playback") + 1] == "Performance", titles)
+check("the Performance page has the tray and resource controls",
+      {"close_to_tray", "start_in_tray", "poll_hidden", "cpu_cores",
+       "memory_limit_mb"} <= set(perf.widgets), sorted(perf.widgets))
+cores = ariance.system_cpus()
+check("the core list is the CPUs this app was handed",
+      cores == sorted(ariance.ALL_CPUS)
+      and perf.widgets["cpu_cores"].count() == max(1, len(cores)),
+      (cores, perf.widgets["cpu_cores"].count()))
+check("every core is the default",
+      perf.widgets["cpu_cores"].currentData() == 0
+      and perf.widgets["cpu_cores"].itemText(0).startswith("All"),
+      (perf.widgets["cpu_cores"].currentData(),
+       perf.widgets["cpu_cores"].itemText(0)))
+check("the memory budget runs from no limit to 4 GB",
+      [perf.widgets["memory_limit_mb"].itemData(i)
+       for i in range(perf.widgets["memory_limit_mb"].count())]
+      == [mb for mb, _label in ariance.MEMORY_LIMITS]
+      and perf.widgets["memory_limit_mb"].currentData() == 0,
+      [perf.widgets["memory_limit_mb"].itemData(i)
+       for i in range(perf.widgets["memory_limit_mb"].count())])
+perf.widgets["cpu_cores"].setCurrentIndex(perf.widgets["cpu_cores"].findData(1))
+collected = perf._collect()
+check("the Performance page collects the limits",
+      collected["cpu_cores"] == 1 and collected["memory_limit_mb"] == 0
+      and collected["close_to_tray"] is True and collected["poll_hidden"] is True,
+      {k: collected[k] for k in ("cpu_cores", "memory_limit_mb", "close_to_tray",
+                                 "poll_hidden")})
+perf.close()
+check("one core leaves the app on one CPU",
+      ariance.apply_cpu_limit(1) == 1 and len(os.sched_getaffinity(0)) == 1,
+      sorted(os.sched_getaffinity(0)))
+check("choosing every core gives them all back",
+      ariance.apply_cpu_limit(0) == len(cores)
+      and sorted(os.sched_getaffinity(0)) == cores,
+      sorted(os.sched_getaffinity(0)))
+w.config["poll_hidden"] = True
+check("a shown window polls for devices", w._timer.isActive())
+w._hide_to_tray()
+check("a window hidden in the tray stops device polling",
+      not w.isVisible() and not w._timer.isActive(),
+      (w.isVisible(), w._timer.isActive()))
+w._show_from_tray()
+QTest.qWait(50)
+check("the tray brings the window and its polling back",
+      w.isVisible() and w._timer.isActive(),
+      (w.isVisible(), w._timer.isActive()))
+w.config["poll_hidden"] = False
+w._hide_to_tray()
+check("polling can be kept while the window is hidden", w._timer.isActive())
+w._show_from_tray()
+w.config["poll_hidden"] = True
+w._update_polling()
+tray_texts = [a.text() for a in w._tray.contextMenu().actions() if a.text()]
+check("the tray menu still offers the window and a real quit",
+      f"Show {ariance.APP_SHORT}" in tray_texts and tray_texts[-1] == "Quit",
+      tray_texts)
+w.config["memory_limit_mb"] = 1          # a budget no process can stay under
+check("a memory budget over the limit releases cached covers",
+      w._enforce_memory_budget() is True)
+w.config["memory_limit_mb"] = 0
+check("no budget means no trimming", w._enforce_memory_budget() is False)
+w.config["cpu_cores"] = 1
+check("the window applies the core limit from its config",
+      w.apply_resource_limits() == 1 and len(os.sched_getaffinity(0)) == 1,
+      sorted(os.sched_getaffinity(0)))
+w.config["cpu_cores"] = 0
+w.apply_resource_limits()
+check("the window removes the limit when it is taken away",
+      sorted(os.sched_getaffinity(0)) == cores, sorted(os.sched_getaffinity(0)))
 
 # ---------------------------------------------------------------- grids
 section("grids: movable columns, remembered order and widths")
@@ -1862,9 +1976,8 @@ ab.ab_player.load_book(
 check("the chapter line drops a repeated book-title prefix",
       ab.ab_player.chapter_label.text() == "Chapter 4",
       ab.ab_player.chapter_label.text())
-check("the default import folder is ~/Music/Ariance - Audiobooks",
-      ariance.audiobook_default_folder() ==
-      os.path.join(HOME, "Music", "Ariance - Audiobooks"),
+check("the default import folder is ~/Audiobooks",
+      ariance.audiobook_default_folder() == os.path.join(HOME, "Audiobooks"),
       ariance.audiobook_default_folder())
 default_tab = ariance.AudiobooksTab(w.player, fresh_config())
 check("with no folder configured the destination is the default folder",
@@ -2097,6 +2210,12 @@ w.sync_tab.selection_mode.setCurrentIndex(
 check("folder mode shows the source folder row again",
       not w.sync_tab.source_box.isHidden() and not w.sync_tab.source_label.isHidden())
 
+check("new sync profiles start with Choose items, not whole folders",
+      ariance.Profile().selection_mode == "selected"
+      and w.sync_tab.selection_mode.itemData(0) == "selected"
+      and w.sync_tab.selection_mode.itemData(1) == "folders",
+      (ariance.Profile().selection_mode, w.sync_tab.selection_mode.itemData(0)))
+
 section("sync engine")
 src = os.path.join(HOME, "sync-src")
 dst = os.path.join(HOME, "sync-dst")
@@ -2107,7 +2226,7 @@ shutil.copyfile(WAV2, os.path.join(src, "Aphex Twin", "Selected Ambient Works",
                                    "02 - Beta.wav"))
 os.makedirs(dst)
 sync_profile = ariance.Profile(name="Stick", device_id=f"folder:{dst}", source=src,
-                              target="Music")
+                              target="Music", selection_mode="folders")
 backend = ariance.LocalFolderBackend(dst)
 plan = ariance.compare(sync_profile, backend)
 check("the first compare plans both files as new",
@@ -2144,7 +2263,7 @@ check("mirror removes the extra file", not os.path.exists(extra))
 hash_dst = os.path.join(HOME, "hash-dst")
 os.makedirs(hash_dst)
 hash_profile = ariance.Profile(name="Hash", device_id=f"folder:{hash_dst}", source=src,
-                              target="Music", method="hash")
+                              target="Music", method="hash", selection_mode="folders")
 hash_backend = ariance.LocalFolderBackend(hash_dst)
 ariance.execute(hash_profile, hash_backend, ariance.compare(hash_profile, hash_backend))
 restore = os.path.join(hash_dst, "Music", "Artists", "Aphex Twin", "Selected Ambient Works",
@@ -2167,7 +2286,8 @@ shutil.copyfile(FLAC1, os.path.join(src2, "01 - Second.flac"))
 multi_dst = os.path.join(HOME, "multi-dst")
 os.makedirs(multi_dst)
 multi_profile = ariance.Profile(name="Multi", device_id=f"folder:{multi_dst}", source=src,
-                               sources=[src, src2_root], target="Music")
+                               sources=[src, src2_root], target="Music",
+                               selection_mode="folders")
 multi_backend = ariance.LocalFolderBackend(multi_dst)
 multi_plan = ariance.compare(multi_profile, multi_backend)
 check("both sync folders are planned together",
@@ -2277,8 +2397,8 @@ selection_labels = [selection_dlg.tree.topLevelItem(i).text(0).split(" (")[0]
 music_rows = sum(1 for row in library.tracks()
                  if "podcast" not in str(row.get("genre") or "").lower())
 book_files = sum(len(paths) for _name, paths in ariance.audiobook_books([AB]))
-check("the selection window has Music and Audiobooks groups, without Podcasts",
-      selection_labels == ["Music", "Audiobooks"], selection_labels)
+check("the selection window has Music, Audiobooks and Podcasts groups",
+      selection_labels == ["Music", "Audiobooks", "Podcasts"], selection_labels)
 check("everything is selected by default",
       len(selection_dlg.entries()) == music_rows + book_files,
       (len(selection_dlg.entries()), music_rows, book_files))
@@ -2343,8 +2463,9 @@ podcast_dlg = ariance.SyncSelectionDialog(
     PodcastLibrary(), [], None)
 podcast_labels = [podcast_dlg.tree.topLevelItem(i).text(0).split(" (")[0]
                   for i in range(podcast_dlg.tree.topLevelItemCount())]
-check("podcast tracks are kept out of the sync selection by tag or folder",
-      podcast_dlg.entries() == [] and podcast_labels == ["Music", "Audiobooks"],
+check("podcast files stay out of the music group in the sync picker",
+      podcast_dlg.entries() == []
+      and podcast_labels == ["Music", "Audiobooks", "Podcasts"],
       (podcast_dlg.entries(), podcast_labels))
 podcast_dlg.close()
 selection_dlg._select_none()
@@ -2359,17 +2480,17 @@ partial.close()
 none_dlg.close()
 selection_dlg.close()
 
-# Every profile carries its own target tree. Music and books land below the chosen
-# device folder; podcasts are paused and are not offered or copied.
+# Every profile carries its own target tree. Music, books and podcasts each land
+# below the chosen device folder in their own subfolder.
 os.makedirs(os.path.join(src, "Podcasts", "Show"), exist_ok=True)
 shutil.copyfile(MP3A, os.path.join(src, "Podcasts", "Show", "episode.mp3"))
 routed_dst = os.path.join(HOME, "routed-dst")
 os.makedirs(routed_dst)
 routed_profile = ariance.Profile(name="Routed", device_id=f"folder:{routed_dst}",
                                source=src, sources=[src, AB], target="Music",
-                               audiobook_roots=[AB])
+                               audiobook_roots=[AB], selection_mode="folders")
 routed_plan = ariance.compare(routed_profile, ariance.LocalFolderBackend(routed_dst))
-check("the profile sends music and audiobooks, but not podcasts",
+check("the profile sends its music and audiobooks",
       sorted((a.kind, a.rel) for a in routed_plan) == [
           ("new", "Artists/Aphex Twin/Selected Ambient Works/01 - Alpha.wav"),
           ("new", "Artists/Aphex Twin/Selected Ambient Works/02 - Beta.wav"),
@@ -2389,26 +2510,28 @@ target_dialog = ariance.SyncTargetsDialog(routed_profile, routed_dst)
 target_dialog.base.setText("Walkman/Music")
 target_dialog.music.setText("Artists")
 target_dialog.audiobooks.setText("Audiobooks")
-check("Choose Target Folders edits only the Music and Audiobooks paths",
-      target_dialog.values() == ("Walkman/Music", "Artists", "Audiobooks")
+target_dialog.podcasts.setText("Podcasts")
+check("Choose Target Folders edits the Music, Audiobooks and Podcasts paths",
+      target_dialog.values() == ("Walkman/Music", "Artists", "Audiobooks", "Podcasts")
       and "Walkman/Music/Audiobooks" in target_dialog.preview.text()
-      and "Podcasts" not in target_dialog.preview.text()
-      and not hasattr(target_dialog, "podcasts"),
+      and "Walkman/Music/Podcasts" in target_dialog.preview.text(),
       (target_dialog.values(), target_dialog.preview.text()))
 target_dialog.close()
 legacy_podcast_profile = ariance.Profile(
     name="Legacy podcast", selection_mode="selected",
     selection=[{"path": WAV1, "rel": "Podcasts/Show/episode.wav", "kind": "podcast"}])
-check("a legacy podcast selection is ignored by the sync engine",
-      ariance.profile_sync_files(legacy_podcast_profile) == {},
-      ariance.profile_sync_files(legacy_podcast_profile))
+check("a selected podcast keeps its tree under Podcasts",
+      list(ariance.profile_sync_files(legacy_podcast_profile))
+      == ["Podcasts/Show/episode.wav"],
+      list(ariance.profile_sync_files(legacy_podcast_profile)))
 inactive_dst = os.path.join(HOME, "inactive-dst")
 os.makedirs(os.path.join(inactive_dst, "Music", "Audiobooks"))
 os.makedirs(os.path.join(inactive_dst, "Music", "Podcasts", "Keep"))
 shutil.copyfile(AB_CH1, os.path.join(inactive_dst, "Music", "Audiobooks", "keep.m4b"))
 shutil.copyfile(MP3A, os.path.join(inactive_dst, "Music", "Podcasts", "Keep", "keep.mp3"))
 inactive_profile = ariance.Profile(name="Music only", device_id=f"folder:{inactive_dst}",
-                                 source=src, sources=[src], target="Music", mode="mirror")
+                                 source=src, sources=[src], target="Music", mode="mirror",
+                                 selection_mode="folders")
 inactive_plan = ariance.compare(inactive_profile, ariance.LocalFolderBackend(inactive_dst))
 check("a music profile does not delete the Audiobooks or Podcasts trees it is not sending",
       not any(a.kind == "delete" and (a.rel.startswith("Audiobooks/")
@@ -2427,6 +2550,229 @@ check("an empty selected-item choice survives a profile reload",
       loaded_empty.selection_mode == "selected" and not loaded_empty.selection
       and loaded_empty.selection_all is False)
 ariance.save_profiles(saved_profiles)
+
+# ---------------------------------------------------------------- podcasts
+section("podcasts: feeds, naming, downloads, the tab and their sync")
+PODCAST_RSS = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Test Show</title>
+    <itunes:author>Test Author</itunes:author>
+    <description>A show about tests.</description>
+    <link>https://example.com/show</link>
+    <itunes:image href="https://example.com/cover.jpg"/>
+    <item>
+      <title>Episode One</title>
+      <guid>ep-1</guid>
+      <pubDate>Sat, 21 Nov 2026 10:00:00 +0000</pubDate>
+      <description>The first one.</description>
+      <itunes:duration>1:02:03</itunes:duration>
+      <itunes:episode>1</itunes:episode>
+      <enclosure url="{audio}" type="audio/mpeg" length="1234"/>
+    </item>
+  </channel>
+</rss>
+"""
+podcast_dir = os.path.join(MUSIC, "Podcasts")
+os.makedirs(podcast_dir, exist_ok=True)
+podcast_audio = os.path.join(podcast_dir, "source-episode.mp3")
+shutil.copyfile(MP3A, podcast_audio)
+podcast_feed_path = os.path.join(HOME, "podcast-feed.xml")
+with open(podcast_feed_path, "w", encoding="utf-8") as fh:
+    fh.write(PODCAST_RSS.format(audio="file://" + podcast_audio))
+
+parsed = ariance.parse_podcast_feed(
+    PODCAST_RSS.format(audio="file://" + podcast_audio).encode(),
+    "https://example.com/feed.xml")
+check("an RSS podcast feed gives its title, author and episodes",
+      parsed["title"] == "Test Show" and parsed["author"] == "Test Author"
+      and len(parsed["episodes"]) == 1, parsed)
+check("iTunes artwork, duration and episode numbers are read",
+      parsed["image"].endswith("cover.jpg")
+      and parsed["episodes"][0]["duration"] == 3723
+      and parsed["episodes"][0]["episode"] == "1", parsed["episodes"][0])
+check("an episode date becomes YYYY-MM-DD",
+      parsed["episodes"][0]["date"] == "2026-11-21", parsed["episodes"][0]["date"])
+atom = (b'<feed xmlns="http://www.w3.org/2005/Atom"><title>Atom Cast</title>'
+        b'<entry><id>a1</id><title>Atom Episode</title>'
+        b'<published>2026-11-20T08:00:00Z</published>'
+        b'<link rel="enclosure" href="https://example.com/a1.m4a" type="audio/mp4"/>'
+        b'</entry></feed>')
+atom_parsed = ariance.parse_podcast_feed(atom, "https://example.com/atom.xml")
+check("an Atom podcast feed is read too",
+      atom_parsed["title"] == "Atom Cast"
+      and atom_parsed["episodes"][0]["url"] == "https://example.com/a1.m4a"
+      and atom_parsed["episodes"][0]["date"] == "2026-11-20", atom_parsed)
+check("a pasted address becomes a feed address",
+      ariance.podcast_feed_url("example.com/feed.xml") == "https://example.com/feed.xml"
+      and ariance.podcast_feed_url("feed://example.com/feed") == "http://example.com/feed"
+      and ariance.podcast_feed_url("nonsense") == "",
+      [ariance.podcast_feed_url(value) for value in
+       ("example.com/feed.xml", "feed://example.com/feed", "nonsense")])
+safe_name = ariance.podcast_safe_name('AC/DC: "Live" / Best')
+check("episode names are made safe for any filesystem",
+      safe_name and not (set(safe_name) & set('/\\:*?"<>|')), safe_name)
+episode = parsed["episodes"][0]
+check("episode file names follow the chosen style",
+      ariance.podcast_episode_relpath(
+          episode, "Test Show", {"podcast_naming": "date_title",
+                                 "podcast_show_folders": True})
+      == "Test Show/2026-11-21 - Episode One.mp3"
+      and ariance.podcast_episode_relpath(
+          episode, "Test Show", {"podcast_naming": "title",
+                                 "podcast_show_folders": False})
+      == "Episode One.mp3",
+      ariance.podcast_episode_relpath(episode, "Test Show",
+                                      {"podcast_naming": "date_title",
+                                       "podcast_show_folders": True}))
+check("the episode-number style is offered as well",
+      ariance.podcast_episode_relpath(
+          episode, "Test Show", {"podcast_naming": "number_title",
+                                 "podcast_show_folders": False})
+      == "Episode 1 - Episode One.mp3",
+      ariance.podcast_episode_relpath(episode, "Test Show",
+                                      {"podcast_naming": "number_title",
+                                       "podcast_show_folders": False}))
+merged = {"url": "https://example.com/feed.xml", "episodes": {}}
+ariance.podcast_merge_feed(merged, parsed, now=1000)
+merged["episodes"]["ep-1"]["played"] = True
+merged["episodes"]["ep-1"]["downloaded"] = WAV1
+ariance.podcast_merge_feed(merged, parsed, now=2000)
+check("checking a feed again keeps what was played and downloaded",
+      merged["episodes"]["ep-1"]["played"] is True
+      and merged["episodes"]["ep-1"]["downloaded"] == WAV1
+      and merged["last_checked"] == 2000,
+      merged["episodes"]["ep-1"])
+only_newer = dict(parsed, episodes=[{"key": "ep-2", "title": "Episode Two",
+                                    "url": "https://example.com/ep2.mp3",
+                                    "date": "2026-11-22"}])
+ariance.podcast_merge_feed(merged, only_newer, now=3000)
+check("an episode the feed drops stays listed while its download is on disk",
+      "ep-1" in merged["episodes"] and merged["episodes"]["ep-1"]["downloaded"] == WAV1,
+      sorted(merged["episodes"]))
+check("a feed can be fetched and parsed from a file address",
+      ariance.parse_podcast_feed(
+          ariance.podcast_fetch("file://" + podcast_feed_path))["title"] == "Test Show")
+
+real_warning = QMessageBox.warning
+warnings = []
+QMessageBox.warning = staticmethod(
+    lambda *a, **k: warnings.append(a[2] if len(a) > 2 else "") or QMessageBox.Ok)
+
+def wait_until(condition, seconds=10.0):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        app.processEvents()
+        if condition():
+            return True
+        QTest.qWait(25)
+    return bool(condition())
+
+w.config["podcast_folder"] = podcast_dir
+w.config["podcast_naming"] = "date_title"
+w.config["podcast_show_folders"] = True
+pod = w.podcasts_tab
+pod.subscribe(["file://" + podcast_feed_path])
+wait_until(lambda: pod._worker is None)
+check("subscribing to a feed adds it with its episodes",
+      len(pod.store["feeds"]) == 1
+      and len(pod.store["feeds"][0]["episodes"]) == 1
+      and pod.store["feeds"][0]["title"] == "Test Show"
+      and not warnings, (pod.store["feeds"], warnings))
+pod_feed = pod.store["feeds"][0]
+pod_key = next(iter(pod_feed["episodes"]))
+podcast_dest = os.path.join(podcast_dir, "Test Show",
+                            "2026-11-21 - Episode One.mp3")
+pod.download_episode(pod_feed, pod_key)
+wait_until(lambda: pod._download_worker is None and not pod._download_id)
+check("the tab downloads an episode into the chosen folder",
+      os.path.isfile(podcast_dest) and not warnings,
+      (podcast_dest, os.path.isdir(os.path.dirname(podcast_dest)), warnings))
+check("the downloaded episode is remembered",
+      pod_feed["episodes"][pod_key]["downloaded"] == podcast_dest,
+      pod_feed["episodes"][pod_key].get("downloaded"))
+pod.feed_list.setCurrentRow(1)
+pod.tree.setCurrentItem(pod.tree.topLevelItem(0))
+pod.mark_selected()
+check("marking an episode played is remembered",
+      pod_feed["episodes"][pod_key]["played"] is True,
+      pod_feed["episodes"][pod_key].get("played"))
+check("the Podcasts tab lists the subscription and its episode",
+      pod.feed_list.count() == 2 and pod.tree.topLevelItemCount() == 1,
+      (pod.feed_list.count(), pod.tree.topLevelItemCount()))
+w.library.skip_folders = [ariance.podcast_folder(w.config)]
+w.library.scan([MUSIC])
+library_paths = [row["path"] for row in w.library.tracks()]
+check("podcast downloads stay out of the music library",
+      WAV1 in library_paths
+      and not any(os.sep + "Podcasts" + os.sep in path for path in library_paths),
+      library_paths)
+pod_profile = ariance.Profile(sources=[MUSIC], target="Music", music_folder="Artists",
+                              audiobook_folder="Audiobooks", podcast_folder="Podcasts",
+                              selection_mode="folders")
+pod_files = ariance.profile_sync_files(pod_profile)
+check("a folder sync copies the music library and leaves podcast downloads out",
+      pod_files and all(rel.startswith("Artists/") for rel in pod_files),
+      sorted(pod_files))
+selected_pod = ariance.Profile(
+    selection_mode="selected", podcast_folder="Podcasts",
+    selection=[{"path": podcast_dest, "kind": "podcast",
+                "rel": "Test Show/2026-11-21 - Episode One.mp3"}])
+check("a selected podcast is routed to the device's Podcasts folder",
+      list(ariance.profile_sync_files(selected_pod))
+      == ["Podcasts/Test Show/2026-11-21 - Episode One.mp3"],
+      list(ariance.profile_sync_files(selected_pod)))
+check("a device target keeps podcasts in /Podcasts by default",
+      ariance.default_device_folder(
+          fresh_config(),
+          os.path.join(os.path.expanduser("~/Music/Podcasts"), "Show", "e.mp3"))
+      == "Podcasts")
+pod_sel = ariance.SyncSelectionDialog(
+    fresh_config(library_folders=[MUSIC], podcast_folder=podcast_dir),
+    w.library, [], None)
+pod_labels = [pod_sel.tree.topLevelItem(i).text(0).split(" (")[0]
+              for i in range(pod_sel.tree.topLevelItemCount())]
+pod_entries = [entry for entry in pod_sel.entries() if entry.get("kind") == "podcast"]
+check("the sync picker offers the downloaded episode under Podcasts",
+      pod_labels == ["Music", "Audiobooks", "Podcasts"]
+      and len(pod_entries) == 1
+      and pod_entries[0]["rel"] == "Test Show/2026-11-21 - Episode One.mp3",
+      (pod_labels, pod_entries))
+pod_sel.close()
+opml = ariance.podcast_opml(pod.store)
+check("an OPML export carries every subscription",
+      [url for _title, url in ariance.podcast_opml_urls(opml)] == [pod_feed["url"]])
+itunes = ariance.parse_itunes_podcasts(json.dumps({"results": [{
+    "collectionName": "Found Show", "artistName": "Someone",
+    "feedUrl": "https://example.com/found.xml", "trackCount": 12,
+    "primaryGenreName": "Technology"}]}))
+check("directory results turn into subscribable shows",
+      [row["feed"] for row in itunes] == ["https://example.com/found.xml"]
+      and itunes[0]["episodes"] == 12, itunes)
+pod_prefs = ariance.PreferencesDialog(w.library_tab, w)
+check("Preferences has a Podcasts page with folder and naming options",
+      {"podcast_folder", "podcast_naming", "podcast_show_folders",
+       "podcast_delete_played", "podcast_check_on_open"} <= set(pod_prefs.widgets)
+      and [pod_prefs.widgets["podcast_naming"].itemData(i)
+           for i in range(pod_prefs.widgets["podcast_naming"].count())]
+      == [key for key, _label, _template in ariance.PODCAST_NAMINGS],
+      sorted(pod_prefs.widgets))
+pod_prefs.close()
+w.tabs.setCurrentWidget(w.podcasts_tab)
+check("the Podcasts tab swaps in its own menu",
+      w._menu_mode == "podcasts"
+      and w._menu_sets["podcasts"][0].title() == "&Podcasts",
+      (w._menu_mode, [menu.title() for menu in w._menu_sets["podcasts"]]))
+w.tabs.setCurrentWidget(w.library_tab)
+pod.tree.setCurrentItem(pod.tree.topLevelItem(0))
+pod.delete_selected()
+check("deleting a download keeps the episode in the list",
+      not os.path.exists(podcast_dest)
+      and pod_feed["episodes"][pod_key]["downloaded"] == ""
+      and pod.tree.topLevelItemCount() == 1,
+      (os.path.exists(podcast_dest), pod_feed["episodes"][pod_key].get("downloaded"),
+       pod.tree.topLevelItemCount()))
+QMessageBox.warning = real_warning
 
 # ---------------------------------------------------------------- session
 section("session restore and the reported data loss")

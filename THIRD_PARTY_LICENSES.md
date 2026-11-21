@@ -1,7 +1,7 @@
 # Third-party licence audit for Ariance Music Center
 
 Audited: 2026-11-12  
-Target: Ariance Music Center 1.32, released under **GPL-3.0-only**.
+Target: Ariance Music Center 1.33, released under **GPL-3.0-only**.
 
 This is a distribution audit, not legal advice. It covers the files actually shipped
 in the source tree and in the `.deb`, plus the external programs the app invokes.
@@ -84,7 +84,7 @@ configuration: ... --enable-gpl ... --enable-libx264 --enable-libx265 ...
 That is acceptable for a separate-process dependency. It is not acceptable to copy
 those GPL libraries into a differently licensed bundle.
 
-## Release requirements met in 1.32
+## Release requirements met in 1.33
 
 1. The full **GPL-3.0** licence text is in `LICENSE`, with copyright and SPDX headers
    in the application, launcher, build script and tests.
@@ -113,5 +113,5 @@ those GPL libraries into a differently licensed bundle.
   PDF were removed in 1.28.
 - The GPL FAQ / licence-compatibility guidance for LGPL-2.1+ and GPLv2+ combinations.
 - A source-tree search confirming no `rcrack`, `.aax`, activation-byte or
-  rainbow-table code or settings remain in 1.32.
-- A package audit confirming no VirtualKeyboard/PDF files are present in 1.32.
+  rainbow-table code or settings remain in 1.33.
+- A package audit confirming no VirtualKeyboard/PDF files are present in 1.33.

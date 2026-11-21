@@ -278,11 +278,16 @@ def group_routing():
               len(second) == 1 and second[0].kind == "equal" and not second[0].verified,
               [(a.kind, a.dev) for a in second])
 
-    # A podcast selection is deliberately ignored.
+    # A podcast selection keeps its own tree under Podcasts.
     s = Scene()
     s.add("Show/episode.mp3", kind="podcast")
-    check("routing: a podcast selection is paused and never copied",
-          s.compare() == [] and s.device_files() == [], s.device_files())
+    check("routing: a podcast selection goes under Podcasts",
+          [(a.kind, a.dev) for a in s.compare()] == [("new", "Podcasts/Show/episode.mp3")],
+          [(a.kind, a.dev) for a in s.compare()])
+    plan, errors = s.sync()
+    check("routing: the podcast file reaches the device's Podcasts folder",
+          errors == 0 and os.path.exists(s.full("Podcasts/Show/episode.mp3")),
+          (errors, s.device_files()))
 
     # A music file explicitly marked as an audiobook follows the audiobook folder.
     s = Scene()

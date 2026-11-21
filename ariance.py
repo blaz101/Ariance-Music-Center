@@ -27,6 +27,7 @@ import atexit
 import base64
 import concurrent.futures
 import fcntl
+import gc
 import getpass
 import hashlib
 import copy
@@ -50,6 +51,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote
 
@@ -64,7 +68,7 @@ from PySide6.QtCore import (QObject, QThread, QUrl, Qt, Signal, QPoint, QPointF,
                             QSize, QTimer, QEvent, QBuffer, QFileSystemWatcher)
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon,
                            QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap, QPolygonF, QShortcut, QTextCursor)
+                           QPixmap, QPixmapCache, QPolygonF, QShortcut, QTextCursor)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -145,7 +149,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Ariance Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Ariance"                 # short name used in menus and messages
-VERSION = "1.32"
+VERSION = "1.33"
 SOURCE_URL = "https://github.com/blaz101/Ariance-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -274,10 +278,16 @@ DEFAULT_CONFIG = {
     # where Import moves files, and where the last file dialog was left
     "audiobook_import_target": "",
     "audiobook_import_last": "",
+    # 1.33 podcasts: downloads, how they are named, and when feeds are checked
+    "podcast_folder": "",              # "" = ~/Music/Podcasts
+    "podcast_show_folders": True,      # one folder per show
+    "podcast_naming": "date_title",    # PODCAST_NAMINGS key
+    "podcast_delete_played": False,    # delete a download when it is marked played
+    "podcast_check_on_open": True,     # refresh feeds when the tab is opened
     # where new sync profiles and Copy to device put each kind of audio
     "device_music_folder": "Music/Artists",
     "device_audiobook_folder": "Audiobooks",
-    "device_podcast_folder": "Music/Podcasts",
+    "device_podcast_folder": "Podcasts",
     # column order and widths each grid was left with
     "grid_layouts": {},
     "volume": 70,
@@ -304,6 +314,12 @@ DEFAULT_CONFIG = {
     "crossfade_seconds": 0.0,
     # clicking the time bar jumps to that point (Preferences > Playback)
     "seek_click": True,
+    # 1.33: a closed window can leave the app in the tray, and what it may use
+    "close_to_tray": True,
+    "start_in_tray": False,
+    "poll_hidden": True,
+    "cpu_cores": 0,             # 0 = every CPU the process was started with
+    "memory_limit_mb": 0,       # 0 = no budget
     "window": [1360, 860],
     "split": [760, 640],
     # library tab (Strawberry collection view parity)
@@ -331,7 +347,7 @@ DEFAULT_CONFIG = {
     "grouping_levels": ["artist", "album"],
     "saved_groupings": [],
     "lib_track_prefix": True,
-    "ui_revision": 44,
+    "ui_revision": 45,
     # multiple collections (each one is a separate database + folder list)
     "collections": [],
     "active_collection": 0,
@@ -405,6 +421,16 @@ def load_config():
         # (the collection database) pointing at the old folder, so the app could not
         # open its library at all.
         cfg["ui_revision"] = 44
+    if revision < 45:
+        # 1.33: Podcasts is a tab of its own between Audiobooks and Tags, so a tab
+        # saved from Tags on moves along with it, and podcast downloads go to their
+        # own Podcasts folder on a device instead of Music/Podcasts.
+        tab = cfg.get("tab")
+        if isinstance(tab, int) and tab >= 2:
+            cfg["tab"] = tab + 1
+        if str(cfg.get("device_podcast_folder") or "") == "Music/Podcasts":
+            cfg["device_podcast_folder"] = "Podcasts"
+        cfg["ui_revision"] = 45
     # 1.32: 1.31 recorded the revision even when the move could not be followed yet
     # (a leftover ~/Nebula, a drive not mounted), and then never looked again. Follow
     # the move on every load; once the stored paths are new this changes nothing.
@@ -2744,6 +2770,8 @@ class Library:
 
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
+        # folders this library must not index (podcast downloads live inside Music)
+        self.skip_folders = []
         self._lock = threading.Lock()
         try:
             self._migrate()
@@ -2836,11 +2864,18 @@ class Library:
     def scan(self, folders, progress=None, cancel=lambda: False):
         """Incremental scan. progress(done, total, path)."""
         files = []
+        skip = [f for f in (getattr(self, "skip_folders", None) or []) if f]
         for folder in folders:
             if not os.path.isdir(folder):
                 continue
             for root, _dirs, names in os.walk(folder):
-                files.extend(os.path.join(root, n) for n in names if is_audio(n))
+                for name in names:
+                    if not is_audio(name):
+                        continue
+                    path = os.path.join(root, name)
+                    if any(_path_is_below(path, folder) for folder in skip):
+                        continue        # a podcast download, not a track
+                    files.append(path)
         with self._lock, self._conn() as c:
             known = dict(c.execute("SELECT path, mtime FROM tracks"))
             seen = set()
@@ -4151,15 +4186,14 @@ class Profile:
     device_id: str = ""          # Device.id, or "folder:/path" for any folder
     source: str = ""             # first local library folder (kept for old profiles)
     sources: list = field(default_factory=list)  # every local folder this profile syncs
-    selection_mode: str = "folders"  # "folders" or "selected"
+    selection_mode: str = "selected"  # "selected" (the default) or "folders"
     selection: list = field(default_factory=list)  # [{"path", "rel"}] when selected
     # True means an empty selection has not been chosen yet, so the picker starts with
     # everything ticked. After Unselect All it is False and the empty list means none.
     selection_all: bool = True
     target: str = "Music"        # selected folder on the device, relative to device root
     # These subfolders sit below target. Each kind of audio gets its own tree, so a
-    # profile can carry music and books to one user-chosen device folder. Podcasts are
-    # paused for now; podcast_folder stays so older profiles and presets survive.
+    # profile can carry music, books and podcasts to one user-chosen device folder.
     music_folder: str = "Artists"
     audiobook_folder: str = "Audiobooks"
     podcast_folder: str = "Podcasts"
@@ -4713,9 +4747,8 @@ def route_profile_rel(profile, rel, kind):
     """Put a source-relative path below its media folder without repeating the folder.
 
     A library root may already contain Artists/Podcasts (the user's Music folder, for
-    example), while an audiobook root may start directly at a book. Both reach the
-    same device layout: selected folder/Artists or /Audiobooks. Podcasts are paused
-    for now.
+    example), while an audiobook root may start directly at a book. All three reach
+    the same device layout: selected folder/Artists, /Audiobooks or /Podcasts.
     """
     rel = str(rel or "").replace("\\", "/").strip("/")
     folder = profile_sync_folder(profile, kind)
@@ -4745,8 +4778,6 @@ def profile_sync_files(profile, audio_only=True):
                 continue
             kind = entry.get("kind") or media_kind_for_path(
                 path, {"audiobook_folders": roots})
-            if kind == "podcast":
-                continue  # paused for now; legacy selections are ignored
             try:
                 out.setdefault(route_profile_rel(profile, rel, kind),
                                (path, os.path.getsize(path)))
@@ -4764,14 +4795,16 @@ def profile_sync_files(profile, audio_only=True):
             path = os.path.join(root, rel)
             kind = media_kind_for_path(path, {"audiobook_folders": roots})
             if kind == "podcast":
-                continue  # paused for now
+                # Podcast downloads are not music library files: a folder sync copies
+                # the library, and episodes are chosen in the Podcasts group instead.
+                continue
             out.setdefault(route_profile_rel(profile, rel, kind), (path, size))
     return out
 
 
 def _profile_media_folders(profile):
-    # Podcasts are paused, but keep the folder here so Mirror still knows
-    # that a device's existing Podcasts tree is not an extra it may delete.
+    # Every kind of audio keeps its own tree on the device, so a profile that sends
+    # only music never treats the Audiobooks or Podcasts tree beside it as an extra.
     return [f for f in (profile_sync_folder(profile, kind)
                         for kind in ("music", "audiobook", "podcast")) if f]
 
@@ -8911,8 +8944,10 @@ class PreferencesDialog(QDialog):
         for title, page in (("Theme", self._theme_page(cfg)),
                             ("Library", self._library_page(cfg)),
                             ("Audiobooks", self._audiobooks_page(cfg)),
+                            ("Podcasts", self._podcasts_page(cfg)),
                             ("Devices", self._devices_page(cfg)),
                             ("Playback", self._playback_page(cfg)),
+                            ("Performance", self._performance_page(cfg)),
                             ("Syncing", self._sync_page(cfg)),
                             ("Backup", self._backup_page(cfg)),
                             ("Audio CD", self._cd_page(cfg)),
@@ -9162,6 +9197,61 @@ class PreferencesDialog(QDialog):
         if folder:
             self.import_target.setText(folder)
 
+    def _podcasts_page(self, cfg):
+        """Where podcast downloads live and how their files are named."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        folder_row = QWidget()
+        folder_lay = QHBoxLayout(folder_row)
+        folder_lay.setContentsMargins(0, 0, 0, 0)
+        folder_lay.setSpacing(6)
+        self.podcast_target = self._line("podcast_folder", cfg, "", "~/Music/Podcasts")
+        browse = QPushButton("Select folder…")
+        browse.clicked.connect(self._browse_podcast_folder)
+        folder_lay.addWidget(self.podcast_target, 1)
+        folder_lay.addWidget(browse)
+        form.addRow("Downloads folder", folder_row)
+        naming = self._combo("podcast_naming",
+                             [(key, label) for key, label, _template in PODCAST_NAMINGS],
+                             cfg, "date_title")
+        form.addRow("Episode file names", naming)
+        form.addRow(self._checkbox("podcast_show_folders",
+                                   "Keep one folder per show", cfg, True))
+        form.addRow(self._checkbox("podcast_delete_played",
+                                   "Delete the download when an episode is marked played",
+                                   cfg, False))
+        form.addRow(self._checkbox("podcast_check_on_open",
+                                   "Check feeds when the Podcasts tab is opened",
+                                   cfg, True))
+        lay.addLayout(form)
+        preview = QLabel()
+        preview.setObjectName("Muted")
+        preview.setWordWrap(True)
+
+        def show_preview(*_args):
+            preview.setText("Saved as " + podcast_naming_preview(naming.currentData()))
+
+        naming.currentIndexChanged.connect(show_preview)
+        show_preview()
+        lay.addWidget(preview)
+        note = QLabel("Downloaded episodes go in this folder and are left out of the "
+                      "music library, so a podcast never turns into an album. Sync "
+                      "copies them to the Podcasts folder on the device.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch()
+        return page
+
+    def _browse_podcast_folder(self):
+        start = self.podcast_target.text().strip() or podcast_folder(self.library_tab.config)
+        folder = QFileDialog.getExistingDirectory(self, "Podcast downloads folder", start,
+                                                  options=DIRECTORY_DIALOG_OPTIONS)
+        if folder:
+            self.podcast_target.setText(folder)
+
     def _devices_page(self, cfg):
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -9280,6 +9370,54 @@ class PreferencesDialog(QDialog):
         device_buffered.setObjectName("Muted")
         device_buffered.setWordWrap(True)
         lay.addWidget(device_buffered)
+        lay.addStretch()
+        return page
+
+    def _performance_page(self, cfg):
+        """How the app behaves without a window, and what it may use on this machine."""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        form = QFormLayout()
+        form.setSpacing(8)
+        close_box = self._checkbox("close_to_tray",
+                                   "Keep running in the tray when the window is closed",
+                                   cfg, True)
+        close_box.setToolTip("The X button hides the window and the music carries on. "
+                             "Quit in the tray menu stops the app.")
+        form.addRow(close_box)
+        start_box = self._checkbox("start_in_tray", "Start with the window hidden", cfg, False)
+        start_box.setToolTip("The app opens in the tray; click its icon for the window.")
+        form.addRow(start_box)
+        poll_box = self._checkbox("poll_hidden",
+                                  "Stop looking for devices while the window is hidden",
+                                  cfg, True)
+        poll_box.setToolTip("The one-second device check pauses with the window and runs "
+                            "again as soon as it comes back.")
+        form.addRow(poll_box)
+        lay.addLayout(form)
+
+        cores = system_cpus()
+        limits = QFormLayout()
+        limits.setSpacing(8)
+        choices = [(0, "All %d cores" % len(cores) if len(cores) != 1 else "All 1 core")]
+        choices += [(n, "%d core%s" % (n, "" if n == 1 else "s"))
+                    for n in range(1, len(cores))]
+        limits.addRow("Cores the app may use", self._combo("cpu_cores", choices, cfg, 0))
+        limits.addRow("Memory budget", self._combo("memory_limit_mb", MEMORY_LIMITS,
+                                                     cfg, 0))
+        lay.addLayout(limits)
+        note = QLabel("The core limit keeps the app off the cores you do not give it, so the "
+                      "rest of the machine stays free while it plays or scans. Apply "
+                      "changes it at once; a start applies it before anything else runs.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        note = QLabel("The memory budget is housekeeping: when the app goes over it, cached "
+                      "covers and other spare data are dropped so it comes back down. \n"
+                      "Playback, scanning and the queue are not cut to fit.")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
         lay.addStretch()
         return page
 
@@ -9662,6 +9800,7 @@ class PreferencesDialog(QDialog):
 
     def _apply(self):
         cfg = self.library_tab.config
+        old_podcast_folder = podcast_folder(cfg)
         devices_changed = (dict(cfg.get("removed_devices") or {}) != self.removed_devices)
         cfg.update(self._collect())
         cfg["id_order"] = self._id_order_value()
@@ -9670,9 +9809,17 @@ class PreferencesDialog(QDialog):
         window = self.library_tab.window()
         window.apply_theme()
         window.sync_disc_buffer()          # the disc in the drive, if the option changed
+        window.apply_resource_limits()     # the cores and the memory budget, at once
         window.player.set_click_to_seek(cfg.get("seek_click", True))
         window.player.refresh_buffers()
         window.sync_tab.trim_logs()        # a smaller limit applies to logs already kept
+        podcasts = getattr(window, "podcasts_tab", None)
+        if podcasts is not None:
+            podcasts.refresh()             # new folder or naming, shown at once
+        if podcast_folder(cfg) != old_podcast_folder:
+            # the old folder leaves the music library, the new one joins it
+            window.library_tab.library.skip_folders = [podcast_folder(cfg)]
+            window.library_tab.rescan(silent=True)
         if devices_changed:
             window.devices_tab.refresh_list()   # a restored device comes back right away
         lyrics = getattr(window, "_lyrics_dialog", None)
@@ -17690,6 +17837,7 @@ class LibraryTab(QWidget):
         super().__init__(parent)
         self.library = library
         self.config = config
+        self.library.skip_folders = [podcast_folder(config)]
         self.player = player
         self.playlists = playlists
         self.smart = smart_store
@@ -20169,6 +20317,7 @@ class LibraryTab(QWidget):
         if not folders and not silent:
             self.window().notify("Library is empty - add a music folder")
         self._scan_silent = silent
+        self.library.skip_folders = [podcast_folder(self.config)]
         if not silent:
             self.scan_bar.show()
             self.scan_bar.setFormat("Scanning… %v/%m")
@@ -24784,7 +24933,8 @@ class SyncSelectionDialog(QDialog):
     then its chapters. Checking a group or a book checks everything under it; Select
     All checks the lot. Each chosen file keeps the relative path it has inside its
     library/audiobook folder, so it lands on the device in the same artist/album/book
-    layout as a folder sync. Podcasts are paused, so they are not offered here.
+    layout as a folder sync. Podcasts are the episodes the Podcasts tab downloaded:
+    a streaming address cannot be copied to a device, so only files are offered.
     """
 
     def __init__(self, config, library=None, selected=None, parent=None, select_all=None):
@@ -24879,7 +25029,8 @@ class SyncSelectionDialog(QDialog):
     def _populate(self):
         self._updating = True
         groups = {"music": self._group("Music"),
-                  "audiobooks": self._group("Audiobooks")}
+                  "audiobooks": self._group("Audiobooks"),
+                  "podcasts": self._group("Podcasts")}
         book_roots = [os.path.abspath(f) for f in self._book_folders]
         rows = []
         if self.library is not None:
@@ -24887,7 +25038,7 @@ class SyncSelectionDialog(QDialog):
                 rows = self.library.tracks()
             except Exception:
                 rows = []
-        counts = {"music": 0, "audiobooks": 0}
+        counts = {"music": 0, "audiobooks": 0, "podcasts": 0}
         music = []
         for row in rows:
             path = row.get("path") or ""
@@ -24940,7 +25091,30 @@ class SyncSelectionDialog(QDialog):
             # a book whose tracks are all unselected would reopen marked as selected.
             self._sync_parent(book)
             book.setExpanded(False)
-        for key, label in (("music", "Music"), ("audiobooks", "Audiobooks")):
+        # Podcasts are the episodes the Podcasts tab has downloaded, newest first.
+        for feed in load_podcast_store().get("feeds") or []:
+            episodes = [episode for episode in (feed.get("episodes") or {}).values()
+                        if isinstance(episode, dict) and episode.get("downloaded")
+                        and os.path.isfile(episode["downloaded"])]
+            if not episodes:
+                continue
+            show_title = feed.get("title") or feed.get("url") or "Podcast"
+            show = QTreeWidgetItem(groups["podcasts"], [show_title, "", ""])
+            show.setFlags(show.flags() | Qt.ItemIsUserCheckable)
+            show.setCheckState(0, Qt.Unchecked)
+            for episode in sorted(episodes, key=lambda e: str(e.get("date") or ""),
+                                  reverse=True):
+                path = episode["downloaded"]
+                entry = {"path": path,
+                         "rel": library_rel(path, [podcast_folder(self.config)]),
+                         "kind": "podcast"}
+                self._add_item(show, entry, episode.get("title") or os.path.basename(path),
+                               feed.get("author") or "", show_title)
+                counts["podcasts"] += 1
+            self._sync_parent(show)
+            show.setExpanded(False)
+        for key, label in (("music", "Music"), ("audiobooks", "Audiobooks"),
+                           ("podcasts", "Podcasts")):
             groups[key].setText(0, f"{label} ({counts[key]})")
             self._sync_tree(groups[key])
         self._updating = False
@@ -25030,9 +25204,8 @@ class SyncSelectionDialog(QDialog):
 class SyncTargetsDialog(QDialog):
     """Choose the one device folder each kind of audio is copied into.
 
-    The selected folder is the common destination. Music and audiobooks each get a
-    subfolder below it, which is what the sync planner actually writes to. Podcasts
-    are paused and keep their stored folder untouched.
+    The selected folder is the common destination. Music, audiobooks and podcasts
+    each get a subfolder below it, which is what the sync planner actually writes to.
     """
 
     def __init__(self, profile, device_root="", parent=None):
@@ -25043,9 +25216,10 @@ class SyncTargetsDialog(QDialog):
         self.base = QLineEdit(profile.target or "")
         self.music = QLineEdit(profile.music_folder or "Artists")
         self.audiobooks = QLineEdit(profile.audiobook_folder or "Audiobooks")
+        self.podcasts = QLineEdit(profile.podcast_folder or "Podcasts")
         self._browse = []
 
-        intro = QLabel("Pick the folder on the device, then the two folders below it. "
+        intro = QLabel("Pick the folder on the device, then the three folders below it. "
                        "The actual paths are shown at the bottom.")
         intro.setWordWrap(True)
         form = QFormLayout()
@@ -25055,6 +25229,8 @@ class SyncTargetsDialog(QDialog):
                   lambda: self._choose_sub(self.music, "Music"))
         self._row(form, "Audiobooks", self.audiobooks,
                   lambda: self._choose_sub(self.audiobooks, "Audiobooks"))
+        self._row(form, "Podcasts", self.podcasts,
+                  lambda: self._choose_sub(self.podcasts, "Podcasts"))
         self.preview = QLabel()
         self.preview.setObjectName("Muted")
         self.preview.setWordWrap(True)
@@ -25136,6 +25312,7 @@ class SyncTargetsDialog(QDialog):
         self.base.setText("Music")
         self.music.setText("Artists")
         self.audiobooks.setText("Audiobooks")
+        self.podcasts.setText("Podcasts")
 
     def _full(self, folder):
         return "/".join(part for part in (self.base.text().strip("/"),
@@ -25143,12 +25320,14 @@ class SyncTargetsDialog(QDialog):
 
     def _update_preview(self, *_args):
         self.preview.setText(f"Music: {self._full(self.music)}\n"
-                             f"Audiobooks: {self._full(self.audiobooks)}")
+                             f"Audiobooks: {self._full(self.audiobooks)}\n"
+                             f"Podcasts: {self._full(self.podcasts)}")
 
     def values(self):
         return (self.base.text().strip().strip("/"),
                 self.music.text().strip().strip("/"),
-                self.audiobooks.text().strip().strip("/"))
+                self.audiobooks.text().strip().strip("/"),
+                self.podcasts.text().strip().strip("/"))
 
 
 class SyncTab(QWidget):
@@ -25224,12 +25403,12 @@ class SyncTab(QWidget):
         source_lay.addLayout(source_btns)
         # iTunes calls this "Entire library" vs "Selected playlists, artists, albums…".
         self.selection_mode = QComboBox()
-        self.selection_mode.addItem("Folder(s) - sync these folders", "folders")
         self.selection_mode.addItem("Selected items - choose what to sync", "selected")
-        self.selection_mode.setToolTip("Sync every file below the folders, or only the "
-                                       "music and audiobooks you tick. Mirror deletes "
-                                       "the copies it wrote for items you untick; "
-                                       "Update never deletes.")
+        self.selection_mode.addItem("Folder(s) - sync these folders", "folders")
+        self.selection_mode.setToolTip("Choose what to sync, or switch to Folder(s) to "
+                                       "copy everything below those folders. Mirror "
+                                       "deletes the copies it wrote for items you "
+                                       "untick; Update never deletes.")
         self.select_btn = QPushButton("Choose items…")
         self.select_btn.clicked.connect(self.choose_sync_items)
         self.selection_summary = QLabel("")
@@ -25243,8 +25422,8 @@ class SyncTab(QWidget):
         self.target_summary = QLabel("")
         self.target_summary.setObjectName("Muted")
         self.target_summary.setWordWrap(True)
-        self.target_summary.setToolTip("The actual device paths for music and audiobooks, "
-                                       "below the folder selected on the device.")
+        self.target_summary.setToolTip("The actual device paths for music, audiobooks and "
+                                       "podcasts, below the folder selected on the device.")
         self.mode = QComboBox()
         for k, v in MODES.items():
             self.mode.addItem(v, k)
@@ -26025,7 +26204,8 @@ class SyncTab(QWidget):
         def full(folder):
             return "/".join(part for part in (profile.target, folder) if part) or "device root"
         return (f"Music: {full(profile.music_folder)}  ·  "
-                f"Audiobooks: {full(profile.audiobook_folder)}")
+                f"Audiobooks: {full(profile.audiobook_folder)}  ·  "
+                f"Podcasts: {full(profile.podcast_folder)}")
 
     def _choose_target_folders(self):
         p = self.current()
@@ -26040,7 +26220,7 @@ class SyncTab(QWidget):
         dlg = SyncTargetsDialog(p, root, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        p.target, p.music_folder, p.audiobook_folder = dlg.values()
+        p.target, p.music_folder, p.audiobook_folder, p.podcast_folder = dlg.values()
         p.audiobook_roots = list(self.config.get("audiobook_folders") or [])
         save_profiles(self.profiles)
         self.plan = None
@@ -26847,7 +27027,8 @@ def audiobook_details(paths, cache=None):
 
 
 def audiobook_default_folder():
-    return os.path.join(os.path.expanduser("~"), "Music", "Ariance - Audiobooks")
+    """Where audiobooks go until a folder is chosen: ~/Audiobooks, beside Music."""
+    return os.path.join(os.path.expanduser("~"), "Audiobooks")
 
 
 def unique_path(path):
@@ -26871,6 +27052,8 @@ def _path_is_below(path, folder):
 
 def media_kind_for_path(path, config):
     """Which device destination a file or folder belongs to."""
+    if path and _path_is_below(path, podcast_folder(config)):
+        return "podcast"
     if os.path.splitext(str(path or ""))[1].lower() == ".m4b":
         return "audiobook"
     folders = config.get("audiobook_folders") or []
@@ -26892,7 +27075,7 @@ def default_device_folder(config, path=""):
                                                "device_music_folder")
     defaults = {"device_music_folder": "Music/Artists",
                 "device_audiobook_folder": "Audiobooks",
-                "device_podcast_folder": "Music/Podcasts"}
+                "device_podcast_folder": "Podcasts"}
     value = str(config.get(key, defaults[key]) or defaults[key]).strip()
     return value.strip("/")
 
@@ -26917,7 +27100,9 @@ def copy_device_rel(path, config):
     if kind == "audiobook":
         folders = books + libraries
     elif kind == "podcast":
-        folders = libraries + books
+        # a download is relative to the podcast folder, so the show folder is
+        # kept without repeating "Podcasts" inside the Podcasts target
+        folders = [podcast_folder(config)] + libraries + books
     else:
         folders = libraries
     rel = library_rel(path, folders)
@@ -27821,6 +28006,1339 @@ class AudiobookBar(QWidget):
             self.media.setSource(QUrl())
 
 
+# ======================================================================
+# podcasts.py - subscriptions, feeds, downloads and the Podcasts tab
+# ======================================================================
+PODCAST_FILE = os.path.join(SETTINGS_DIR, "podcasts.json")
+PODCAST_STORE_VERSION = 1
+PODCAST_FEED_TIMEOUT = 15
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
+PODCAST_USER_AGENT = f"{APP_SHORT}/{VERSION} (+{SOURCE_URL})"
+
+# How a downloaded episode is named inside the podcast folder. {show}, {date},
+# {title}, {number} and {season} are filled in; the audio extension is added.
+PODCAST_NAMINGS = (
+    ("date_title", "Date and episode title", "{date} - {title}"),
+    ("show_date_title", "Show, date and title", "{show} - {date} - {title}"),
+    ("number_title", "Episode number and title", "{number} - {title}"),
+    ("title", "Episode title", "{title}"),
+)
+PODCAST_NAMING_TEMPLATES = {key: template for key, _label, template in PODCAST_NAMINGS}
+
+
+def podcast_folder(config=None):
+    """Where episodes are kept: the chosen folder, else ~/Music/Podcasts."""
+    value = str((config or {}).get("podcast_folder") or "").strip()
+    if value:
+        return os.path.abspath(os.path.expanduser(value))
+    return os.path.join(os.path.expanduser("~"), "Music", "Podcasts")
+
+
+def podcast_feed_url(text):
+    """A usable feed address from what was pasted: feed:// and itpc:// included."""
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    low = value.lower()
+    if low.startswith("feed://"):
+        value = "http://" + value[len("feed://"):]
+    elif low.startswith(("itpc://", "itpcss://")):
+        value = "http" + value[value.index("//"):]
+    elif not re.match(r"^[a-z][a-z0-9+.-]*://", value, re.I):
+        if value.startswith("//"):
+            value = "https:" + value
+        elif re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", value, re.I):
+            value = "https://" + value
+        else:
+            return ""
+    return value
+
+
+def podcast_duration_seconds(value):
+    """iTunes duration: seconds ("3120"), or "52:00" / "1:02:03"."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        if ":" not in text:
+            return max(0.0, float(text))
+        total = 0.0
+        for part in text.split(":"):
+            total = total * 60 + float(part or 0)
+        return max(0.0, total)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def podcast_date(value):
+    """A YYYY-MM-DD date from an RSS or Atom date, or "" when it cannot be read."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return parsedate_to_datetime(text).date().isoformat()
+    except (TypeError, ValueError, IndexError, OverflowError):
+        pass
+    try:                      # Atom's ISO 8601, with or without a Z
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def _local_tag(tag):
+    return str(tag or "").rsplit("}", 1)[-1].lower()
+
+
+def _children(node, name):
+    name = name.lower()
+    return [child for child in list(node) if _local_tag(child.tag) == name]
+
+
+def _child(node, *names):
+    wanted = {name.lower() for name in names}
+    for child in list(node):
+        if _local_tag(child.tag) in wanted:
+            return child
+    return None
+
+
+def _node_text(node, *names):
+    for name in names:
+        child = _child(node, name)
+        if child is not None and (child.text or "").strip():
+            return child.text.strip()
+    return ""
+
+
+def _atom_link(node, rel):
+    for child in _children(node, "link"):
+        if (child.get("rel") or "").lower() == rel and child.get("href"):
+            return child.get("href", "").strip()
+    return ""
+
+
+def _enclosure_size(enclosure):
+    try:
+        return max(0, int(enclosure.get("length") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rss_episode(item):
+    enclosure = _child(item, "enclosure")
+    href = ""
+    mime = ""
+    size = 0
+    if enclosure is not None:
+        href = (enclosure.get("url") or enclosure.get("href") or "").strip()
+        mime = (enclosure.get("type") or "").strip()
+        size = _enclosure_size(enclosure)
+    if not href:                      # a link rel="enclosure" is the same thing
+        href = _atom_link(item, "enclosure")
+        for link in _children(item, "link"):
+            if (link.get("rel") or "").lower() == "enclosure" \
+                    and (link.get("href") or "").strip() == href:
+                mime = (link.get("type") or "").strip()
+                size = _enclosure_size(link)
+                break
+    if not href:
+        return None
+    title = _node_text(item, "title") or "Untitled episode"
+    published = _node_text(item, "pubdate", "published", "updated", "date")
+    guid = _node_text(item, "guid", "id")
+    return {
+        "key": guid or href or f"{title}|{published}",
+        "title": title,
+        "description": _node_text(item, "description", "summary", "subtitle"),
+        "url": href,
+        "mimetype": mime,
+        "size": size,
+        "date": podcast_date(published),
+        "published": published,
+        "duration": podcast_duration_seconds(_node_text(item, "duration")),
+        "episode": _node_text(item, "episode"),
+        "season": _node_text(item, "season"),
+        "author": _node_text(item, "author"),
+    }
+
+
+def _atom_episode(entry):
+    href = _atom_link(entry, "enclosure")
+    if not href:
+        return None
+    title = _node_text(entry, "title") or "Untitled episode"
+    published = _node_text(entry, "published", "updated")
+    mime = ""
+    size = 0
+    for link in _children(entry, "link"):
+        if (link.get("rel") or "").lower() == "enclosure" \
+                and (link.get("href") or "").strip() == href:
+            mime = (link.get("type") or "").strip()
+            size = _enclosure_size(link)
+            break
+    return {
+        "key": _node_text(entry, "id") or href,
+        "title": title,
+        "description": _node_text(entry, "summary", "content", "subtitle"),
+        "url": href,
+        "mimetype": mime,
+        "size": size,
+        "date": podcast_date(published),
+        "published": published,
+        "duration": podcast_duration_seconds(_node_text(entry, "duration")),
+        "episode": _node_text(entry, "episode"),
+        "season": _node_text(entry, "season"),
+        "author": _node_text(entry, "author"),
+    }
+
+
+def parse_podcast_feed(data, url=""):
+    """Read an RSS 2.0 or Atom podcast feed.
+
+    Returns {"title", "author", "description", "link", "image", "episodes"} where
+    every episode is {key, title, description, url, mimetype, size, date, published,
+    duration, episode, season, author}. iTunes' namespace is read by its local name,
+    so feeds that use iTunes tags and feeds that do not read the same way.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    root = ET.fromstring(data)
+    if _local_tag(root.tag) == "feed":
+        episodes = [episode for episode in map(_atom_episode, _children(root, "entry"))
+                    if episode]
+        return {"title": _node_text(root, "title") or url or "Podcast",
+                "author": _node_text(root, "author"),
+                "description": _node_text(root, "subtitle", "summary"),
+                "link": _atom_link(root, "alternate") or _atom_link(root, "self"),
+                "image": _node_text(root, "logo", "icon"),
+                "episodes": episodes}
+    channel = _child(root, "channel") or root
+    image = ""
+    node = _child(channel, "image")
+    if node is not None:
+        image = (node.get("href") or node.get("url") or "").strip()
+        if not image:
+            image = _node_text(node, "url")
+    episodes = [episode for episode in map(_rss_episode, _children(channel, "item"))
+                if episode]
+    return {"title": _node_text(channel, "title") or url or "Podcast",
+            "author": _node_text(channel, "author"),
+            "description": _node_text(channel, "description", "subtitle"),
+            "link": _node_text(channel, "link"),
+            "image": image,
+            "episodes": episodes}
+
+
+def podcast_fetch(url, timeout=PODCAST_FEED_TIMEOUT):
+    """Read a feed or an episode. file:// works too, which keeps the tests offline."""
+    request = urllib.request.Request(url, headers={"User-Agent": PODCAST_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def podcast_download(url, dest, progress=None, cancel=None, timeout=60):
+    """Fetch one episode to dest through a .part file; returns the bytes written."""
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    temporary = dest + ".part"
+    request = urllib.request.Request(url, headers={"User-Agent": PODCAST_USER_AGENT})
+    written = 0
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response, \
+                open(temporary, "wb") as out:
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError, AttributeError):
+                total = 0
+            while True:
+                if cancel is not None and cancel():
+                    raise OSError("Download cancelled")
+                block = response.read(256 * 1024)
+                if not block:
+                    break
+                out.write(block)
+                written += len(block)
+                if progress is not None:
+                    progress(written, total)
+        os.replace(temporary, dest)
+    except Exception:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+    return written
+
+
+def podcast_safe_name(text, fallback="Episode"):
+    """A file or folder name that every filesystem, and a device, can store."""
+    value = re.sub(r"[\x00-\x1f]", "", str(text or ""))
+    value = re.sub(r'[\\/:*?"<>|]', "-", value)
+    value = re.sub(r"\s+", " ", value).strip(" .-")
+    return value[:120].strip(" .-") or fallback
+
+
+def _podcast_extension(episode):
+    path = urllib.parse.urlparse(str(episode.get("url") or "")).path
+    extension = os.path.splitext(path)[1].lower()
+    if extension in AUDIO_EXT:
+        return extension
+    mime = str(episode.get("mimetype") or "").lower()
+    return {"audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a", "audio/aac": ".aac", "audio/ogg": ".ogg",
+            "audio/opus": ".opus", "audio/flac": ".flac",
+            "audio/x-flac": ".flac"}.get(mime, ".mp3")
+
+
+def podcast_episode_relpath(episode, show, config=None):
+    """The path a downloaded episode keeps below the podcast folder."""
+    config = config or {}
+    naming = str(config.get("podcast_naming") or "date_title")
+    template = PODCAST_NAMING_TEMPLATES.get(naming, "{date} - {title}")
+    number = str(episode.get("episode") or "").strip()
+    date = str(episode.get("date") or "").strip() or "undated"
+    values = {"show": podcast_safe_name(show, "Podcast"),
+              "date": podcast_safe_name(date, "undated"),
+              "title": podcast_safe_name(episode.get("title"), "Untitled episode"),
+              "number": f"Episode {number}" if number else date,
+              "season": str(episode.get("season") or "").strip()}
+    name = template.format(**values)
+    name = re.sub(r"\s+", " ", name).strip(" .-") or "Episode"
+    name += _podcast_extension(episode)
+    folder = podcast_safe_name(show, "Podcast") \
+        if config.get("podcast_show_folders", True) else ""
+    return f"{folder}/{name}" if folder else name
+
+
+def podcast_episode_path(episode, show, config=None):
+    return os.path.join(podcast_folder(config),
+                        podcast_episode_relpath(episode, show, config))
+
+
+def podcast_naming_preview(naming, show="Example Show"):
+    """The file a sample episode would get, for the Preferences page."""
+    episode = {"title": "A Very Good Episode", "date": "2026-11-21", "episode": "42",
+               "url": "https://example.com/episode.mp3"}
+    return os.path.join("~/Music/Podcasts",
+                        podcast_episode_relpath(episode, show,
+                                                {"podcast_naming": naming,
+                                                 "podcast_show_folders": True}))
+
+
+def load_podcast_store():
+    """The subscriptions file: feeds, and what was played or downloaded of each."""
+    data = load_json(PODCAST_FILE, {})
+    feeds = []
+    if isinstance(data, dict):
+        for entry in data.get("feeds") or []:
+            if not isinstance(entry, dict) or not entry.get("url"):
+                continue
+            entry = dict(entry)
+            entry["url"] = str(entry["url"]).strip()
+            episodes = entry.get("episodes")
+            entry["episodes"] = episodes if isinstance(episodes, dict) else {}
+            feeds.append(entry)
+    return {"version": PODCAST_STORE_VERSION, "feeds": feeds}
+
+
+def save_podcast_store(store):
+    save_json(PODCAST_FILE, {"version": PODCAST_STORE_VERSION,
+                             "feeds": [feed for feed in (store or {}).get("feeds") or []
+                                       if isinstance(feed, dict) and feed.get("url")]})
+
+
+def podcast_find_feed(store, url):
+    for feed in (store or {}).get("feeds") or []:
+        if feed.get("url") == url:
+            return feed
+    return None
+
+
+def podcast_merge_feed(entry, feed, now=None):
+    """Fold a parsed feed into a subscription, keeping played and downloaded state."""
+    now = time.time() if now is None else float(now)
+    entry["title"] = feed.get("title") or entry.get("title") or entry.get("url", "")
+    for key in ("author", "description", "link", "image"):
+        if feed.get(key):
+            entry[key] = feed[key]
+    entry.setdefault("added", now)
+    entry["last_checked"] = now
+    entry["last_error"] = ""
+    episodes = entry.setdefault("episodes", {})
+    seen = set()
+    for episode in feed.get("episodes") or []:
+        key = str(episode.get("key") or episode.get("url") or "")
+        if not key:
+            continue
+        seen.add(key)
+        state = episodes.get(key)
+        if not isinstance(state, dict):
+            state = {"first_seen": now, "played": False, "played_at": 0,
+                     "downloaded": ""}
+        for field in ("title", "description", "url", "date", "published", "duration",
+                      "mimetype", "size", "episode", "season", "author"):
+            if episode.get(field) not in (None, ""):
+                state[field] = episode[field]
+        state.setdefault("first_seen", now)
+        state.setdefault("played", False)
+        state.setdefault("played_at", 0)
+        state.setdefault("downloaded", "")
+        episodes[key] = state
+    # A feed that drops an old episode keeps the ones downloaded here, so a file that
+    # is on disk never disappears from the tab just because the show aged it out.
+    for key in list(episodes):
+        if key in seen:
+            continue
+        state = episodes.get(key)
+        path = state.get("downloaded") if isinstance(state, dict) else ""
+        if not (path and os.path.isfile(path)):
+            episodes.pop(key, None)
+    return entry
+
+
+def podcast_episodes(store, feed_url=None):
+    """(feed, key, episode) for one subscription, or for every subscription."""
+    out = []
+    for feed in (store or {}).get("feeds") or []:
+        if feed_url and feed.get("url") != feed_url:
+            continue
+        for key, episode in (feed.get("episodes") or {}).items():
+            if isinstance(episode, dict):
+                out.append((feed, key, episode))
+    return out
+
+
+def podcast_unplayed(feed):
+    return sum(1 for episode in (feed.get("episodes") or {}).values()
+               if isinstance(episode, dict) and not episode.get("played"))
+
+
+def podcast_opml_urls(data):
+    """(title, xmlUrl) for every outline in an OPML file."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    root = ET.fromstring(data)
+    found = []
+    for node in root.iter():
+        url = node.get("xmlUrl") or node.get("xmlurl") or node.get("XMLURL")
+        if url:
+            found.append((node.get("title") or node.get("text") or url, url.strip()))
+    return found
+
+
+def podcast_opml(store):
+    """An OPML 2.0 file another podcast app can import."""
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<opml version="2.0">',
+             "  <head>", f"    <title>{APP_NAME} podcasts</title>", "  </head>",
+             "  <body>"]
+    for feed in (store or {}).get("feeds") or []:
+        title = html.escape(str(feed.get("title") or feed.get("url") or ""), quote=True)
+        url = html.escape(str(feed.get("url") or ""), quote=True)
+        lines.append(f'    <outline type="rss" text="{title}" title="{title}" '
+                     f'xmlUrl="{url}"/>')
+    lines += ["  </body>", "</opml>", ""]
+    return "\n".join(lines)
+
+
+def parse_itunes_podcasts(payload):
+    """The podcast rows from an iTunes Search API answer."""
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    data = json.loads(payload) if isinstance(payload, str) else (payload or {})
+    out = []
+    for row in (data or {}).get("results") or []:
+        if not isinstance(row, dict):
+            continue
+        feed = str(row.get("feedUrl") or "").strip()
+        if not feed:
+            continue
+        try:
+            episodes = int(row.get("trackCount") or 0)
+        except (TypeError, ValueError):
+            episodes = 0
+        out.append({"title": str(row.get("collectionName") or row.get("trackName")
+                                  or feed),
+                    "author": str(row.get("artistName") or ""),
+                    "feed": feed,
+                    "image": str(row.get("artworkUrl600") or row.get("artworkUrl100")
+                                 or ""),
+                    "episodes": episodes,
+                    "genre": str(row.get("primaryGenreName") or "")})
+    return out
+
+
+def itunes_podcast_search(term, limit=15, timeout=12):
+    """Search the public iTunes podcast directory; no key and no sign-up."""
+    term = str(term or "").strip()
+    if not term:
+        return []
+    query = urllib.parse.urlencode({"media": "podcast", "entity": "podcast",
+                                    "limit": int(limit), "term": term})
+    return parse_itunes_podcasts(podcast_fetch(f"{ITUNES_SEARCH_URL}?{query}", timeout))
+
+
+class AddPodcastDialog(QDialog):
+    """Subscribe to a feed address, find a show in the directory, or import OPML."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add podcast")
+        self.resize(780, 500)
+        self.feeds = []
+        self._search_worker = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+        intro = QLabel("Paste the address of a podcast feed, or search the directory for "
+                       "a show.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.address = QLineEdit()
+        self.address.setPlaceholderText("https://example.com/podcast/feed.xml")
+        self.address.setClearButtonEnabled(True)
+        add = QPushButton("Subscribe")
+        add.setObjectName("Primary")
+        add.clicked.connect(self._add_address)
+        self.address.returnPressed.connect(self._add_address)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Feed address"))
+        row.addWidget(self.address, 1)
+        row.addWidget(add)
+        lay.addLayout(row)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setObjectName("Separator")
+        lay.addWidget(line)
+
+        search_row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search the podcast directory")
+        self.search.setClearButtonEnabled(True)
+        self.search.returnPressed.connect(self._search)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self._search)
+        search_row.addWidget(self.search, 1)
+        search_row.addWidget(self.search_btn)
+        lay.addLayout(search_row)
+        self.search_hint = QLabel("Searches the public iTunes podcast directory.")
+        self.search_hint.setObjectName("Muted")
+        self.search_hint.setWordWrap(True)
+        lay.addWidget(self.search_hint)
+        self.results = QListWidget()
+        self.results.setAlternatingRowColors(True)
+        self.results.itemDoubleClicked.connect(lambda _item: self._subscribe_result())
+        lay.addWidget(self.results, 1)
+
+        row = QHBoxLayout()
+        self.import_btn = QPushButton("Import OPML…")
+        self.import_btn.clicked.connect(self._import_opml)
+        subscribe = QPushButton("Subscribe to selected")
+        subscribe.clicked.connect(self._subscribe_result)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(self.import_btn)
+        row.addStretch(1)
+        row.addWidget(cancel)
+        row.addWidget(subscribe)
+        lay.addLayout(row)
+
+    def _add_address(self):
+        url = podcast_feed_url(self.address.text())
+        if not url:
+            QMessageBox.warning(self, "Add podcast",
+                                "That does not look like a feed address. It should start "
+                                "with http://, https:// or feed://.")
+            return
+        self.feeds = [url]
+        self.accept()
+
+    def _search(self):
+        term = self.search.text().strip()
+        if not term:
+            return
+        if self._search_worker is not None and self._search_worker.isRunning():
+            return
+        self.search_btn.setEnabled(False)
+        self.search_hint.setText("Searching…")
+        self.results.clear()
+        worker = Worker(lambda _p, _l, _c: itunes_podcast_search(term), self)
+        self._search_worker = worker
+        worker.done.connect(self._search_done)
+        worker.failed.connect(self._search_failed)
+        worker.finished.connect(self._search_finished)
+        worker.start()
+
+    def _search_done(self, results):
+        self.results.clear()
+        for row in results or []:
+            title = row.get("title") or row.get("feed")
+            detail = " — ".join(part for part in (row.get("author"), row.get("genre"))
+                               if part)
+            item = QListWidgetItem(title + (f" — {detail}" if detail else ""))
+            item.setData(Qt.UserRole, row)
+            item.setToolTip(row.get("feed") or "")
+            self.results.addItem(item)
+        self.search_hint.setText(
+            f"{len(results or [])} show{'s' if len(results or []) != 1 else ''} found. "
+            "Double-click one to subscribe."
+            if results else "No shows found. Try another name.")
+
+    def _search_failed(self, _trace):
+        self.results.clear()
+        self.search_hint.setText("The directory could not be reached. A feed address "
+                                "still works without it.")
+
+    def _search_finished(self):
+        worker, self._search_worker = self._search_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        self.search_btn.setEnabled(True)
+
+    def _subscribe_result(self):
+        item = self.results.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Add podcast", "Choose a show from the list first.")
+            return
+        row = item.data(Qt.UserRole) or {}
+        feed = podcast_feed_url(row.get("feed"))
+        if not feed:
+            return
+        self.feeds = [feed]
+        self.accept()
+
+    def _import_opml(self):
+        path, _chosen = QFileDialog.getOpenFileName(
+            self, "Import podcast list", os.path.expanduser("~"),
+            "OPML files (*.opml *.xml);;All files (*)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                urls = [url for _title, url in podcast_opml_urls(fh.read())]
+        except (OSError, ET.ParseError) as exc:
+            QMessageBox.warning(self, "Import OPML", f"That file could not be read:\n{exc}")
+            return
+        if not urls:
+            QMessageBox.information(self, "Import OPML", "That file lists no podcast feeds.")
+            return
+        self.feeds = urls
+        self.accept()
+
+    def done(self, result):
+        """Close only once a running search has stopped, whichever button did it."""
+        if self._search_worker is not None and self._search_worker.isRunning():
+            self._search_worker.cancel()
+            self._search_worker.wait(13000)
+        super().done(result)
+
+
+class PodcastsTab(QWidget):
+    """Podcast subscriptions, modelled on Rhythmbox's podcast browser.
+
+    Subscriptions are on the left; the episodes of the chosen show on the right,
+    newest first. An episode plays from its downloaded file, or is downloaded first.
+    Downloading, checking feeds and searching all run on workers, so the window never
+    waits for the network. Everything is remembered in settings/podcasts.json.
+    """
+
+    def __init__(self, player, config, parent=None):
+        super().__init__(parent)
+        self.player = player
+        self.config = config
+        self.store = load_podcast_store()
+        self._feed = ""                 # "" shows every subscription
+        self._rows = {}                 # (feed url, episode key) -> (feed, key, ep, file)
+        self._items = {}                # (feed url, episode key) -> tree item
+        self._worker = None
+        self._download_worker = None
+        self._download_id = ""
+        self._download_percent = 0
+        self._checked_once = False
+        self._shutting_down = False
+        self._sort_column = None
+        self._sort_desc = False
+        self.setObjectName("Panel")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+        head = QHBoxLayout()
+        title = QLabel("Podcasts")
+        title.setObjectName("Heading")
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("Muted")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedWidth(190)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("Checking feeds %p%")
+        self.progress.setToolTip("Feed checks and downloads run in the background")
+        self.progress.hide()
+        self.add_btn = QPushButton("Add podcast…")
+        self.add_btn.setToolTip("Subscribe to a feed address, search the directory, or "
+                                "import an OPML list")
+        self.add_btn.clicked.connect(self.add_podcast)
+        self.refresh_btn = QPushButton("Refresh all")
+        self.refresh_btn.setToolTip("Check every subscription for new episodes")
+        self.refresh_btn.clicked.connect(lambda: self.check_feeds(None))
+        self.more_btn = QToolButton()
+        self.more_btn.setText("More…")
+        self.more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more = QMenu(self.more_btn)
+        more.addAction("Import OPML…", self.import_opml)
+        more.addAction("Export OPML…", self.export_opml)
+        more.addSeparator()
+        more.addAction("Open downloads folder", self.open_folder)
+        self.more_btn.setMenu(more)
+        head.addWidget(title)
+        head.addWidget(self.count_label)
+        head.addWidget(self.progress)
+        head.addStretch(1)
+        head.addWidget(self.add_btn)
+        head.addWidget(self.refresh_btn)
+        head.addWidget(self.more_btn)
+        lay.addLayout(head)
+
+        # ---- subscriptions, on the left like Rhythmbox's source list
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(6)
+        subs = QLabel("Subscriptions")
+        subs.setObjectName("Heading")
+        lv.addWidget(subs)
+        self.feed_list = QListWidget()
+        self.feed_list.setAlternatingRowColors(True)
+        self.feed_list.setToolTip("Choose a show to see its episodes; All Episodes "
+                                  "shows everything you subscribe to")
+        self.feed_list.currentRowChanged.connect(self._feed_changed)
+        lv.addWidget(self.feed_list, 1)
+        feed_row = QHBoxLayout()
+        feed_add = QPushButton("Add…")
+        feed_add.setToolTip("Subscribe to a podcast")
+        feed_add.clicked.connect(self.add_podcast)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setToolTip("Unsubscribe from the chosen show; its downloads stay "
+                                   "on disk")
+        self.remove_btn.clicked.connect(self.remove_feed)
+        feed_row.addWidget(feed_add)
+        feed_row.addWidget(self.remove_btn)
+        lv.addLayout(feed_row)
+
+        # ---- episodes, on the right
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+        self.show_info = QLabel()
+        self.show_info.setObjectName("Muted")
+        self.show_info.setWordWrap(True)
+        self.show_info.setTextFormat(Qt.RichText)
+        self.show_info.setOpenExternalLinks(True)
+        self.show_info.hide()
+        rv.addWidget(self.show_info)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search episodes or shows")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._render_episodes)
+        rv.addWidget(self.search)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Episode", "Show", "Date", "Length", "Status"])
+        self.tree.setColumnWidth(0, 380)
+        self.tree.setColumnWidth(1, 200)
+        self.tree.setColumnWidth(2, 100)
+        self.tree.setColumnWidth(3, 80)
+        self.tree.setColumnWidth(4, 130)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSortingEnabled(False)
+        self.tree.itemDoubleClicked.connect(lambda _i, _c=0: self.play_selected())
+        self.tree.itemSelectionChanged.connect(self._update_buttons)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.header().sectionClicked.connect(self._sort_by)
+        rv.addWidget(self.tree, 1)
+
+        actions = QHBoxLayout()
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setObjectName("Primary")
+        self.play_btn.setToolTip("Play the episode; it is downloaded first if it is not here")
+        self.play_btn.clicked.connect(self.play_selected)
+        self.download_btn = QPushButton("Download")
+        self.download_btn.clicked.connect(lambda: self.download_selected())
+        self.delete_btn = QPushButton("Delete download")
+        self.delete_btn.setToolTip("Remove the downloaded file; the episode stays in the "
+                                   "list")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        self.mark_btn = QPushButton("Mark played")
+        self.mark_btn.setToolTip("Keep track of what you have listened to")
+        self.mark_btn.clicked.connect(self.mark_selected)
+        actions.addWidget(self.play_btn)
+        actions.addWidget(self.download_btn)
+        actions.addWidget(self.delete_btn)
+        actions.addWidget(self.mark_btn)
+        actions.addStretch(1)
+        self.folder_note = QLabel()
+        self.folder_note.setObjectName("Muted")
+        self.folder_note.setToolTip("Downloads land here; sync sends them to the device's "
+                                    "Podcasts folder")
+        actions.addWidget(self.folder_note)
+        rv.addLayout(actions)
+
+        self.split = QSplitter(Qt.Horizontal)
+        self.split.addWidget(left)
+        self.split.addWidget(right)
+        self.split.setStretchFactor(0, 0)
+        self.split.setStretchFactor(1, 1)
+        self.split.setSizes([250, 750])
+        lay.addWidget(self.split, 1)
+
+        self._render()
+
+    # ---------------- drawing ----------------
+    def refresh(self):
+        self._render()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
+        if (not self._checked_once and self.store.get("feeds")
+                and self.config.get("podcast_check_on_open", True)
+                and not self._shutting_down
+                and (self._worker is None or not self._worker.isRunning())):
+            self._checked_once = True
+            self.check_feeds(None)
+
+    def _render(self):
+        self._render_feeds()
+        self._render_episodes()
+        self.folder_note.setText("Downloads: " + podcast_folder(self.config))
+
+    def _render_feeds(self):
+        selected = self._feed
+        self.feed_list.blockSignals(True)
+        self.feed_list.clear()
+        feeds = self.store.get("feeds") or []
+        total = sum(podcast_unplayed(feed) for feed in feeds)
+        item = QListWidgetItem("All Episodes" + (f" ({total} unplayed)" if total else ""))
+        item.setData(Qt.UserRole, "")
+        item.setToolTip("Every episode of every subscription")
+        self.feed_list.addItem(item)
+        row = 0
+        for index, feed in enumerate(feeds, 1):
+            unplayed = podcast_unplayed(feed)
+            title = feed.get("title") or feed.get("url") or "Podcast"
+            item = QListWidgetItem(title + (f" ({unplayed} unplayed)" if unplayed else ""))
+            item.setData(Qt.UserRole, feed.get("url") or "")
+            detail = feed.get("last_error") or feed.get("description") or feed.get("url")
+            item.setToolTip(detail)
+            self.feed_list.addItem(item)
+            if feed.get("url") == selected:
+                row = index
+        self.feed_list.blockSignals(False)
+        self._feed = selected if any(f.get("url") == selected for f in feeds) else ""
+        self.feed_list.setCurrentRow(row)
+        count = len(feeds)
+        self.count_label.setText(f"{count} subscription{'s' if count != 1 else ''}")
+        self._render_info()
+        self._update_buttons()
+
+    def _feed_entry(self):
+        return podcast_find_feed(self.store, self._feed) if self._feed else None
+
+    def _render_info(self):
+        feed = self._feed_entry()
+        if feed is None:
+            episodes = len(podcast_episodes(self.store))
+            self.show_info.hide()
+            self.tree.setToolTip(f"{episodes} episode{'s' if episodes != 1 else ''} in "
+                                 f"all subscriptions")
+            return
+        parts = [f"<b>{html.escape(feed.get('title') or 'Podcast')}</b>"]
+        if feed.get("author"):
+            parts.append(html.escape(feed["author"]))
+        if feed.get("link"):
+            link = html.escape(str(feed["link"]), quote=True)
+            parts.append(f'<a href="{link}">website</a>')
+        if feed.get("last_error"):
+            parts.append("last check failed: " + html.escape(str(feed["last_error"])))
+        elif feed.get("last_checked"):
+            parts.append("checked " + time.strftime("%Y-%m-%d %H:%M",
+                                                    time.localtime(feed["last_checked"])))
+        description = str(feed.get("description") or "").strip()
+        if description:
+            short = re.sub(r"<[^>]+>", " ", description)
+            short = re.sub(r"\s+", " ", html.unescape(short)).strip()
+            if len(short) > 240:
+                short = short[:237].rstrip() + "…"
+            parts.append(html.escape(short))
+        self.show_info.setText(" · ".join(parts))
+        self.show_info.show()
+
+    @staticmethod
+    def _episode_sort_key(row, column):
+        _feed, _key, episode, _path = row
+        if column == 1:
+            return str(episode.get("title") or "").casefold()
+        if column == 2:
+            return str(episode.get("date") or "")
+        if column == 3:
+            return float(episode.get("duration") or 0)
+        if column == 4:
+            return str(episode.get("downloaded") or "")
+        return str(episode.get("date") or "")
+
+    def _render_episodes(self):
+        previous = self.tree.currentItem()
+        keep = previous.data(0, Qt.UserRole) if previous is not None else None
+        self.tree.clear()
+        self._rows = {}
+        self._items = {}
+        rows = podcast_episodes(self.store, self._feed or None)
+        if self._sort_column is None:
+            rows.sort(key=lambda row: (str(row[2].get("date") or ""),
+                                       str(row[2].get("title") or "")), reverse=True)
+        else:
+            rows.sort(key=lambda row: self._episode_sort_key(row, self._sort_column),
+                      reverse=self._sort_desc)
+        query = self.search.text().strip().casefold()
+        shown = 0
+        for feed, key, episode in rows:
+            show = feed.get("title") or feed.get("url") or "Podcast"
+            title = episode.get("title") or "Untitled episode"
+            if query and query not in f"{title} {show}".casefold():
+                continue
+            path = str(episode.get("downloaded") or "")
+            if path and not os.path.isfile(path):
+                path = ""           # deleted outside the app
+            identifier = (feed.get("url") or "", key)
+            item = QTreeWidgetItem(self.tree, [
+                title, show, str(episode.get("date") or ""),
+                fmt_time(episode.get("duration") or 0),
+                self._status_text(identifier, episode, path)])
+            item.setData(0, Qt.UserRole, identifier)
+            item.setToolTip(0, str(episode.get("description") or ""))
+            if episode.get("played"):
+                item.setForeground(0, QBrush(QColor(MUTED)))
+                item.setForeground(1, QBrush(QColor(MUTED)))
+            self._rows[identifier] = (feed, key, episode, path)
+            self._items[identifier] = item
+            shown += 1
+        total = len(rows)
+        self.count_label.setText(f"{len(self.store.get('feeds') or [])} subscription"
+                                 f"{'s' if len(self.store.get('feeds') or []) != 1 else ''}"
+                                 f" · {shown if query else total} episode"
+                                 f"{'s' if (shown if query else total) != 1 else ''}")
+        if keep is not None and keep in self._items:
+            self.tree.setCurrentItem(self._items[keep])
+        self._update_buttons()
+        self._render_info()
+
+    def _status_text(self, identifier, episode, path):
+        if identifier == self._download_id:
+            return (f"Downloading {self._download_percent}%"
+                    if self._download_percent else "Downloading…")
+        if path:
+            return "Played" if episode.get("played") else "Downloaded"
+        return "Not downloaded"
+
+    def _sort_by(self, column):
+        if column == 0:
+            return
+        if self._sort_column == column:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_column = column
+            self._sort_desc = column == 2
+        order = Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder
+        self.tree.header().setSortIndicator(column, order)
+        self.tree.header().setSortIndicatorShown(True)
+        self._render_episodes()
+
+    def _feed_changed(self, row):
+        item = self.feed_list.item(row)
+        self._feed = (item.data(Qt.UserRole) if item is not None else "") or ""
+        self._render_episodes()
+        self._update_buttons()
+
+    def _selected(self):
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        identifier = items[0].data(0, Qt.UserRole)
+        return self._rows.get(identifier)
+
+    def _update_buttons(self):
+        row = self._selected()
+        have = bool(row and row[3])
+        busy = bool(self._download_id)
+        self.play_btn.setEnabled(row is not None and not busy)
+        self.download_btn.setEnabled(row is not None and not have and not busy)
+        self.delete_btn.setEnabled(have and not busy)
+        self.mark_btn.setEnabled(row is not None)
+        self.mark_btn.setText("Mark unplayed" if row and row[2].get("played")
+                              else "Mark played")
+        self.remove_btn.setEnabled(self._feed_entry() is not None)
+
+    # ---------------- subscribing and checking ----------------
+    def add_podcast(self):
+        dialog = AddPodcastDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.feeds:
+            self.subscribe(dialog.feeds)
+
+    def subscribe(self, urls):
+        clean = []
+        for url in urls or []:
+            url = podcast_feed_url(url)
+            if url and url not in clean:
+                clean.append(url)
+        existing = {feed.get("url") for feed in self.store.get("feeds") or []}
+        fresh = [url for url in clean if url not in existing]
+        skipped = len(clean) - len(fresh)
+        if not fresh:
+            if skipped:
+                self.window().notify("Already subscribed")
+            return False
+        return self.check_feeds(fresh, adding=True)
+
+    def check_feeds(self, urls=None, adding=False):
+        """Check some or all subscriptions on a worker; adding a feed lives here too."""
+        if self._worker is not None and self._worker.isRunning():
+            self.window().notify("Feeds are already being checked")
+            return False
+        feeds = self.store.get("feeds") or []
+        if urls is None:
+            urls = [feed.get("url") for feed in feeds if feed.get("url")]
+        if not urls:
+            self.window().notify("No podcasts subscribed yet - use Add podcast…")
+            return False
+        targets = []
+        for url in urls:
+            feed = podcast_find_feed(self.store, url)
+            targets.append({"url": url, "title": (feed or {}).get("title") or url})
+        self.progress.setRange(0, len(targets))
+        self.progress.setValue(0)
+        self.progress.setFormat("Checking feeds %v/%m")
+        self.progress.show()
+        self.add_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+
+        def job(progress, _log, cancel):
+            results = []
+            for index, target in enumerate(targets):
+                if cancel():
+                    break
+                progress(index, len(targets), target["title"])
+                try:
+                    parsed = parse_podcast_feed(podcast_fetch(target["url"]), target["url"])
+                    results.append((target["url"], parsed, ""))
+                except Exception as exc:
+                    results.append((target["url"], None, str(exc)))
+            progress(len(targets), len(targets), "")
+            return results
+
+        worker = Worker(job, self)
+        self._worker = worker
+        worker.progress.connect(lambda d, t, _m: (self.progress.setMaximum(max(t, 1)),
+                                                  self.progress.setValue(d)))
+        worker.done.connect(lambda results, a=adding: self._check_done(results, a))
+        worker.failed.connect(self._check_failed)
+        worker.finished.connect(self._check_finished)
+        worker.start()
+        return True
+
+    def _check_done(self, results, adding=False):
+        errors = []
+        added = []
+        for url, parsed, error in results or []:
+            feed = podcast_find_feed(self.store, url)
+            if error or parsed is None:
+                if feed is not None:
+                    feed["last_error"] = error or "the feed could not be read"
+                errors.append(f"{url}: {error or 'the feed could not be read'}")
+                continue
+            if feed is None:
+                if not adding:
+                    continue
+                feed = {"url": url, "added": time.time(), "episodes": {}}
+                self.store.setdefault("feeds", []).append(feed)
+                added.append(feed)
+            podcast_merge_feed(feed, parsed)
+        save_podcast_store(self.store)
+        self._render()
+        if added:
+            self._checked_once = True
+            feed = added[0]
+            self._feed = feed.get("url") or ""
+            self._render()
+            count = len(added)
+            self.window().notify(f"Subscribed to {feed.get('title') or 'the podcast'}"
+                                 + (f" and {count - 1} more" if count > 1 else ""))
+        elif not errors:
+            self.window().notify("Feeds are up to date")
+        if errors:
+            if adding:
+                QMessageBox.warning(self, "Podcasts",
+                                    "These feeds could not be read:\n\n"
+                                    + "\n".join(errors))
+            else:
+                # a background check must not interrupt what the user is doing
+                self.window().notify(f"{len(errors)} feed"
+                                     f"{'s' if len(errors) != 1 else ''} could not be "
+                                     "checked")
+
+    def _check_failed(self, trace):
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        QMessageBox.warning(self, "Podcasts", f"Checking the feeds failed:\n{last}")
+
+    def _check_finished(self):
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.deleteLater()
+        self.progress.hide()
+        self.add_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+
+    # ---------------- episodes ----------------
+    def play_selected(self):
+        row = self._selected()
+        if row is None:
+            return
+        feed, key, episode, path = row
+        if path:
+            self._start_playback(feed, key, episode, path)
+        else:
+            self.download_episode(feed, key, play_after=True)
+
+    def _start_playback(self, feed, key, episode, path):
+        self.player.set_queue([path], 0, play=True)
+        if not episode.get("played"):
+            episode["played"] = True
+            episode["played_at"] = time.time()
+            save_podcast_store(self.store)
+        self._render_episodes()
+        self.window().notify(f"Playing: {episode.get('title') or os.path.basename(path)}")
+
+    def download_selected(self):
+        row = self._selected()
+        if row is not None:
+            feed, key, _episode, path = row
+            if not path:
+                self.download_episode(feed, key)
+
+    def download_episode(self, feed, key, play_after=False):
+        if self._download_id or (self._download_worker is not None
+                                 and self._download_worker.isRunning()):
+            self.window().notify("A download is already running")
+            return False
+        episode = (feed.get("episodes") or {}).get(key) or {}
+        if not episode.get("url"):
+            return False
+        identifier = (feed.get("url") or "", key)
+        dest = podcast_episode_path(episode, feed.get("title") or "", self.config)
+        if os.path.exists(dest) and episode.get("downloaded") != dest:
+            dest = unique_path(dest)
+        self._download_id = identifier
+        self._download_percent = 0
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("Downloading episode %p%")
+        self.progress.show()
+        self._update_buttons()
+        url = episode.get("url")
+
+        def job(progress, _log, cancel):
+            podcast_download(url, dest,
+                             progress=lambda done, total: progress(done, total, ""),
+                             cancel=cancel)
+            return {"path": dest}
+
+        worker = Worker(job, self)
+        self._download_worker = worker
+        worker.progress.connect(self._download_progress)
+        worker.done.connect(lambda result, f=feed, k=key, p=play_after:
+                            self._download_done(f, k, result, p))
+        worker.failed.connect(self._download_failed)
+        worker.finished.connect(self._download_finished)
+        worker.start()
+        return True
+
+    def _download_progress(self, done, total, _message):
+        try:
+            done, total = int(done), int(total)
+        except (TypeError, ValueError):
+            return
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(min(done, total))
+            self._download_percent = max(1, min(99, int(done * 100 / total)))
+        else:
+            self.progress.setRange(0, 0)
+            self._download_percent = 0
+        item = self._items.get(self._download_id)
+        if item is not None:
+            item.setText(4, (f"Downloading {self._download_percent}%"
+                             if self._download_percent else "Downloading…"))
+
+    def _download_done(self, feed, key, result, play_after=False):
+        episode = (feed.get("episodes") or {}).get(key) or {}
+        path = (result or {}).get("path") if isinstance(result, dict) else ""
+        if path:
+            episode["downloaded"] = path
+            episode["downloaded_at"] = time.time()
+            save_podcast_store(self.store)
+            self.window().notify(f"Downloaded {episode.get('title') or os.path.basename(path)}")
+        self._download_id = ""
+        self._render_episodes()
+        if path and play_after:
+            self._start_playback(feed, key, episode, path)
+
+    def _download_failed(self, trace):
+        last = trace.strip().splitlines()[-1] if trace.strip() else "unknown error"
+        QMessageBox.warning(self, "Podcasts", f"The download failed:\n{last}")
+
+    def _download_finished(self):
+        worker, self._download_worker = self._download_worker, None
+        if worker is not None:
+            worker.deleteLater()
+        self._download_id = ""
+        self.progress.hide()
+        self._render_episodes()
+
+    def delete_selected(self):
+        row = self._selected()
+        if row is None or not row[3]:
+            return
+        feed, key, episode, path = row
+        try:
+            os.remove(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Podcasts", f"{path}\n\n{exc}")
+            return
+        episode["downloaded"] = ""
+        save_podcast_store(self.store)
+        self._render_episodes()
+        self.window().notify("Download deleted")
+
+    def mark_selected(self):
+        row = self._selected()
+        if row is None:
+            return
+        feed, key, episode, path = row
+        played = not episode.get("played")
+        episode["played"] = played
+        episode["played_at"] = time.time() if played else 0
+        if played and path and self.config.get("podcast_delete_played"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            else:
+                episode["downloaded"] = ""
+        save_podcast_store(self.store)
+        self._render_episodes()
+        self.window().notify("Marked played" if played else "Marked unplayed")
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        row = self._selected()
+        if row is None:
+            return
+        feed, _key, episode, path = row
+        menu = QMenu(self)
+        menu.addAction("Play", self.play_selected)
+        menu.addAction("Download", self.download_selected).setEnabled(not path)
+        menu.addAction("Delete download", self.delete_selected).setEnabled(bool(path))
+        menu.addAction("Mark unplayed" if episode.get("played") else "Mark played",
+                       self.mark_selected)
+        menu.addSeparator()
+        menu.addAction("Refresh this feed", lambda: self.check_feeds([feed.get("url")]))
+        if feed.get("link"):
+            menu.addAction("Open website", lambda: QDesktopServices.openUrl(
+                QUrl(str(feed.get("link")))))
+        menu.addAction("Copy episode address", lambda: QApplication.clipboard().setText(
+            str(episode.get("url") or "")))
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    # ---------------- subscriptions and files ----------------
+    def remove_feed(self):
+        feed = self._feed_entry()
+        if feed is None:
+            return
+        title = feed.get("title") or feed.get("url") or "this podcast"
+        answer = QMessageBox.question(
+            self, "Remove podcast",
+            f"Unsubscribe from {title}?\n\nDownloaded episodes stay in "
+            f"{podcast_folder(self.config)}.")
+        if answer != QMessageBox.Yes:
+            return
+        self.store["feeds"] = [entry for entry in self.store.get("feeds") or []
+                               if entry.get("url") != feed.get("url")]
+        save_podcast_store(self.store)
+        self._feed = ""
+        self._render()
+        self.window().notify(f"Removed {title}")
+
+    def open_folder(self):
+        folder = podcast_folder(self.config)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            subprocess.Popen(["xdg-open", folder])
+        except OSError as exc:
+            QMessageBox.information(self, "Podcasts", f"{folder}\n\n{exc}")
+
+    def import_opml(self):
+        path, _chosen = QFileDialog.getOpenFileName(
+            self, "Import podcast list", os.path.expanduser("~"),
+            "OPML files (*.opml *.xml);;All files (*)", options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                urls = [url for _title, url in podcast_opml_urls(fh.read())]
+        except (OSError, ET.ParseError) as exc:
+            QMessageBox.warning(self, "Import OPML", f"That file could not be read:\n{exc}")
+            return
+        if not urls:
+            QMessageBox.information(self, "Import OPML", "That file lists no podcast feeds.")
+            return
+        self.subscribe(urls)
+
+    def export_opml(self):
+        feeds = self.store.get("feeds") or []
+        if not feeds:
+            QMessageBox.information(self, "Export OPML", "There are no subscriptions to "
+                                   "export yet.")
+            return
+        start = os.path.join(os.path.expanduser("~"), "podcasts.opml")
+        path, _chosen = QFileDialog.getSaveFileName(
+            self, "Export podcast list", start, "OPML files (*.opml);;All files (*)",
+            options=FILE_DIALOG_OPTIONS)
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(podcast_opml(self.store))
+        except OSError as exc:
+            QMessageBox.warning(self, "Export OPML", str(exc))
+            return
+        self.window().notify(f"Exported {len(feeds)} subscription(s)")
+
+    def shutdown(self):
+        self._shutting_down = True
+        for worker in (self._worker, self._download_worker):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait(8000)
+
+
 class AudiobooksTab(QWidget):
     """Audiobooks, kept apart from the music library.
 
@@ -28543,6 +30061,110 @@ class AudiobooksTab(QWidget):
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
 
+# ======================================================================
+# limits.py - what the app may use on this machine
+# ======================================================================
+def system_cpus():
+    """The CPUs this process was started with (a taskset already applied)."""
+    return list(ALL_CPUS)
+
+
+def _affinity_cpus():
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = list(range(os.cpu_count() or 1))
+    return cpus or [0]
+
+
+# Kept from import time: once a limit is applied, sched_getaffinity() reports the
+# limit back, not what the system offered.
+ALL_CPUS = _affinity_cpus()
+
+# Off first, then the sizes a background music player can live with.
+MEMORY_LIMITS = ((0, "No limit"), (512, "512 MB"), (768, "768 MB"), (1024, "1 GB"),
+                 (1536, "1.5 GB"), (2048, "2 GB"), (3072, "3 GB"), (4096, "4 GB"))
+
+
+def apply_cpu_limit(cores):
+    """Let the app run on at most `cores` CPUs; 0 uses every CPU it was given.
+
+    The limit is a CPU affinity mask, so the scheduler can only place this app's
+    threads on those cores and the other cores stay free for everything else on
+    the machine. Every thread is set, not only the calling one: an audio, scan or
+    sync thread started earlier would otherwise keep the whole machine. Threads
+    started afterwards inherit their parent's mask.
+
+    Returns the number of CPUs the app may now use, or 0 where the platform has
+    no such control.
+    """
+    try:
+        wanted = int(cores or 0)
+    except (TypeError, ValueError):
+        wanted = 0
+    if wanted <= 0 or wanted >= len(ALL_CPUS):
+        cpus = list(ALL_CPUS)
+    else:
+        cpus = ALL_CPUS[:max(1, wanted)]
+    if not hasattr(os, "sched_setaffinity"):
+        return 0
+    try:
+        tasks = [int(t) for t in os.listdir("/proc/self/task")]
+    except (OSError, ValueError):
+        tasks = [0]
+    mask = set(cpus)
+    for tid in tasks:
+        try:
+            os.sched_setaffinity(tid, mask)
+        except (OSError, ValueError):
+            continue
+    try:
+        return len(os.sched_getaffinity(0))
+    except OSError:
+        return 0
+
+
+def process_rss_mb():
+    """This process's resident memory in megabytes, or 0 where it cannot be read."""
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            pages = int(fh.read().split()[1])
+        return max(0, pages * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024))
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def start_hidden(config, argv=()):
+    """Start without a window: --tray or --hidden, or the Preferences setting."""
+    return ("--tray" in argv or "--hidden" in argv
+            or bool((config or {}).get("start_in_tray")))
+
+
+def tray_available():
+    """Whether a tray icon would actually be seen on this desktop.
+
+    Qt's own probe is false under some Wayland sessions that do host the icon
+    through StatusNotifier, so a session with that watcher on the bus counts too.
+    A session with neither keeps the window, because hiding it there would leave
+    the app with no way back.
+    """
+    try:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            return True
+    except Exception:
+        pass
+    try:
+        from PySide6.QtDBus import QDBusConnection
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return False
+        interface = bus.interface()
+        return bool(interface is not None
+                    and interface.isServiceRegistered("org.kde.StatusNotifierWatcher"))
+    except Exception:
+        return False
+
+
 def saved_size_fills_screen(w, h, avail):
     """Is a saved window size the work area itself, i.e. was the window maximized?
 
@@ -28564,8 +30186,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(QIcon(ICON_FILE))
         self.config = load_config()
+        self._started_hidden = bool(self.config.get("start_in_tray"))
         migrate_collections(self.config)
         self._sleep_timer = QTimer(self, singleShot=True, timeout=self._sleep_fire)
+        self._limit_timer = QTimer(self, interval=5000, timeout=self._enforce_memory_budget)
+        self._quitting = False          # a real quit, not a close into the tray
+        self._tray_hint_shown = False
         apply_theme(QApplication.instance(), self.config)
         # The smallest the window may be dragged: 1080x720 keeps the sidebar, the
         # list and the whole player bar laid out properly. On a display smaller than
@@ -28604,6 +30230,7 @@ class MainWindow(QMainWindow):
         self.library_tab = LibraryTab(self.library, self.config, self.player,
                                       self.playlists, self.smart)
         self.audiobooks_tab = AudiobooksTab(self.player, self.config)
+        self.podcasts_tab = PodcastsTab(self.player, self.config)
         self.tagger_tab = TaggerTab(self.library)
         self.devices_tab = DevicesTab(self.player, self.config, self.library)
         self.sync_tab = SyncTab(self.config, self.library)
@@ -28611,6 +30238,7 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self.library_tab, "Music")
         self.tabs.addTab(self.audiobooks_tab, "Audiobooks")
+        self.tabs.addTab(self.podcasts_tab, "Podcasts")
         self.tabs.addTab(self.tagger_tab, "Tags")
         self.tabs.addTab(self.devices_tab, "Devices")
         self.tabs.addTab(self.sync_tab, "Syncing")
@@ -28629,7 +30257,7 @@ class MainWindow(QMainWindow):
         self.sync_tab.activity.connect(self.sync_activity.set_text)
         self.devices_tab.activity.connect(self.sync_activity.set_text)
         self.tabs.currentChanged.connect(self._tab_changed)
-        self.tabs.setCurrentIndex(min(max(int(self.config.get("tab", 0)), 0), 4))
+        self.tabs.setCurrentIndex(min(max(int(self.config.get("tab", 0)), 0), 5))  # 6 tabs
 
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -28665,6 +30293,8 @@ class MainWindow(QMainWindow):
         self._timer.start()
         # the drives are watched on their own thread: probing a drive can block for seconds
         self._cd_watcher.start()
+        # 1.33: Preferences > Performance applies from the first window
+        self.apply_resource_limits()
 
         if not self.config["library_folders"]:
             QTimer.singleShot(400, self._first_run)
@@ -28712,7 +30342,8 @@ class MainWindow(QMainWindow):
         bar = self.menuBar()
         self._menu_sets = {"library": [], "audiobooks": [], "tags": []}
         self._menu_mode = None
-        self._menu_shortcuts = {"library": [], "audiobooks": [], "tags": []}
+        self._menu_shortcuts = {"library": [], "audiobooks": [], "podcasts": [],
+                                "tags": []}
 
         music = QMenu("&Music", bar)
         music.addAction("Add music folder…", self.library_tab.add_folder, "Ctrl+O")
@@ -28728,13 +30359,21 @@ class MainWindow(QMainWindow):
         music.addAction("Play random album", self.library_tab.play_random_album)
         music.addAction("Clear queue", self.library_tab.clear_queue)
         music.addSeparator()
-        music.addAction("Quit", self.close, "Ctrl+Q")
+        music.addAction("Quit", self._quit, "Ctrl+Q")
         self._menu_sets["library"].append(music)
 
         audiobooks = QMenu("&Audiobooks", bar)
         audiobooks.addAction("Select folder…", self.audiobooks_tab.add_folder)
         audiobooks.addAction("Remove folder…", self.audiobooks_tab.remove_folder)
         audiobooks.addAction("Refresh", self.audiobooks_tab.refresh, "F5")
+
+        podcasts = QMenu("&Podcasts", bar)
+        podcasts.addAction("Add podcast…", self.podcasts_tab.add_podcast)
+        podcasts.addAction("Refresh all feeds", lambda: self.podcasts_tab.check_feeds(None))
+        podcasts.addAction("Import OPML…", self.podcasts_tab.import_opml)
+        podcasts.addAction("Export OPML…", self.podcasts_tab.export_opml)
+        podcasts.addSeparator()
+        podcasts.addAction("Open downloads folder", self.podcasts_tab.open_folder)
 
         playlist = QMenu("&Playlist", bar)
         playlist.addAction("Save queue as playlist…", self.library_tab.save_playlist, "Ctrl+S")
@@ -28789,6 +30428,7 @@ class MainWindow(QMainWindow):
 
         # On the Audiobooks tab this replaces the Music menu, so it sits next to Playlist.
         self._menu_sets["audiobooks"] = [audiobooks, playlist, tools, playback, help_menu]
+        self._menu_sets["podcasts"] = [podcasts, playlist, tools, playback, help_menu]
 
         # ---- mp3tag's tag-editor menu bar (shown while the Tags tab is active)
         file_menu = QMenu("&File", bar)
@@ -28800,7 +30440,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Revert changes", self.tagger_tab.revert, "Ctrl+R")
         file_menu.addSeparator()
         file_menu.addAction("Close list", self.tagger_tab.clear, "Ctrl+W")
-        file_menu.addAction("Exit", self.close, "Ctrl+Q")
+        file_menu.addAction("Exit", self._quit, "Ctrl+Q")
         self._menu_sets["tags"].append(file_menu)
 
         edit_menu = QMenu("&Edit", bar)
@@ -28890,6 +30530,8 @@ class MainWindow(QMainWindow):
             mode = "tags"
         elif widget is self.audiobooks_tab:
             mode = "audiobooks"
+        elif widget is self.podcasts_tab:
+            mode = "podcasts"
         else:
             mode = "library"
         if self._menu_mode == mode:
@@ -29029,6 +30671,8 @@ class MainWindow(QMainWindow):
             f"<p>Contact: {CONTACT_EMAIL}</p>")
 
     def _first_run(self):
+        if self._started_hidden:
+            return                     # started in the tray: there is no window to ask in
         if QMessageBox.question(self, f"Welcome to {APP_SHORT}", "Choose your music folder now?") \
                 == QMessageBox.Yes:
             self.library_tab.add_folder()
@@ -29090,7 +30734,7 @@ class MainWindow(QMainWindow):
         self._tray_mute.toggled.connect(self._tray_mute_toggled)
         menu.addSeparator()
         menu.addAction(f"Show {APP_SHORT}", self._show_from_tray)
-        menu.addAction("Quit", self.close)
+        menu.addAction("Quit", self._quit)
         menu.aboutToShow.connect(self._sync_tray_state)
         tray.setContextMenu(menu)
         tray.activated.connect(self._tray_activated)
@@ -29135,6 +30779,75 @@ class MainWindow(QMainWindow):
         if self.player.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause_playback()
         self.notify("Sleep timer: playback paused")
+
+    # ---------------- limits and tray-only running ----------------
+    def apply_resource_limits(self):
+        """Apply Preferences > Performance to this process."""
+        cores = apply_cpu_limit(self.config.get("cpu_cores", 0))
+        if int(self.config.get("memory_limit_mb") or 0) > 0:
+            if not self._limit_timer.isActive():
+                self._limit_timer.start()
+        else:
+            self._limit_timer.stop()
+        self._update_polling()
+        return cores
+
+    def _enforce_memory_budget(self):
+        """Give memory back when the app is over the budget it was given.
+
+        Decoded covers and the library's icon cache are the first things that can
+        go: neither is needed to play, and both come back when the list is drawn
+        again. Returns True when something was released.
+        """
+        budget = int(self.config.get("memory_limit_mb") or 0)
+        if budget <= 0 or process_rss_mb() <= budget:
+            return False
+        QPixmapCache.clear()
+        cache = getattr(self.library_tab, "cover_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+        gc.collect()
+        return True
+
+    def _update_polling(self):
+        """Device polling runs only while the window is there, when that is asked for."""
+        timer = getattr(self, "_timer", None)
+        if timer is None:
+            return
+        paused = not self.isVisible() and bool(self.config.get("poll_hidden", True))
+        if paused and timer.isActive():
+            timer.stop()
+        elif not paused and not timer.isActive():
+            timer.start()
+
+    def _close_to_tray(self):
+        """A closed window leaves the app in the tray, the way Steam does."""
+        return bool(self.config.get("close_to_tray", True)) and tray_available()
+
+    def _hide_to_tray(self, announce=False):
+        self.hide()
+        self._update_polling()
+        if announce and getattr(self, "_tray", None) is not None:
+            self._tray.showMessage(
+                APP_SHORT,
+                f"{APP_SHORT} is still running. Click the tray icon to bring the window "
+                "back, or Quit in its menu to stop it.",
+                QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    def _quit(self):
+        """Stop the app, from the tray menu, a menu bar or Ctrl+Q."""
+        self._quitting = True
+        self.close()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._update_polling()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._update_polling()
+        if getattr(self, "_known", None) is not None and not self._quitting:
+            self.poll_devices()        # whatever changed while the window was away
 
     def _show_from_tray(self):
         self.showNormal()
@@ -29496,6 +31209,11 @@ class MainWindow(QMainWindow):
         self._last_buffer_text = text
 
     def closeEvent(self, e):
+        if not self._quitting and self._close_to_tray():
+            e.ignore()
+            self._hide_to_tray(announce=not self._tray_hint_shown)
+            self._tray_hint_shown = True
+            return
         mpris = getattr(self, "mpris", None)
         if mpris is not None:
             mpris.shutdown()
@@ -29516,6 +31234,7 @@ class MainWindow(QMainWindow):
         self.library_tab.shutdown()
         self.devices_tab.shutdown()
         self.audiobooks_tab.shutdown()
+        self.podcasts_tab.shutdown()
         store_active_collection(self.config)
         self.config["tab"] = self.tabs.currentIndex()
         # While maximized or fullscreen, width()/height() are the work area or the
@@ -29533,6 +31252,11 @@ class MainWindow(QMainWindow):
             self.config["last_position"] = int(self.player.player.position())
         save_config(self.config)
         super().closeEvent(e)
+        # quitOnLastWindowClosed is off (a hidden window must not end the app), so a
+        # real close asks for the end itself.
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 
 def main():
@@ -29547,9 +31271,16 @@ def main():
     # generic icon and no name for the running app.
     app.setDesktopFileName("ariance-music-center")
     app.setWindowIcon(QIcon(ICON_FILE))
+    # A window that closes into the tray is hidden, not the last window gone: the
+    # event loop has to outlive it. A real close calls quit() from closeEvent.
+    app.setQuitOnLastWindowClosed(False)
     install_app_style(app)
     w = MainWindow()
-    if getattr(w, "_start_maximized", False):
+    if start_hidden(w.config, sys.argv[1:]):
+        w._started_hidden = True
+        w.hide()               # tray only: the icon is the app until it is clicked
+        w._update_polling()
+    elif getattr(w, "_start_maximized", False):
         w.showMaximized()      # the window manager keeps it off the taskbar
     else:
         w.show()
