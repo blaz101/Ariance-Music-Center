@@ -1,10 +1,10 @@
-# Corresponding Source for Ariance Music Center 1.31
+# Corresponding Source for Ariance Music Center 1.32
 
 Ariance Music Center is licensed under **GPL-3.0-only**. The complete source code for
-version 1.31 is distributed with the release as:
+version 1.32 is distributed with the release as:
 
 ```text
-ariance-music-center_1.31.orig.tar.xz
+ariance-music-center_1.32.orig.tar.xz
 ```
 
 It is also available from:
@@ -19,7 +19,7 @@ build and packaging scripts, the artwork and the license/notice files.
 
 ## Written offer
 
-For at least three years from the date Ariance Music Center 1.31 is distributed,
+For at least three years from the date Ariance Music Center 1.32 is distributed,
 Roger Barthares will provide the Corresponding Source for the application and the
 bundled LGPL components to any third party, at no charge beyond the cost of
 physically performing the source distribution.
@@ -33,7 +33,7 @@ roger.barthares@gmail.com
 
 ## Exact third-party source
 
-The versions bundled in 1.31 include the following. These are the upstream source
+The versions bundled in 1.32 include the following. These are the upstream source
 archives used for the corresponding libraries:
 
 ```text
@@ -84,4 +84,4 @@ bash packaging/build-deb.sh
 ```
 
 The build script uses the source tree in this archive and writes the package to
-`release-1.31/`. It does not fetch or relicense any third-party component.
+`release-1.32/`. It does not fetch or relicense any third-party component.

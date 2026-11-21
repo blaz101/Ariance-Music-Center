@@ -1,4 +1,11 @@
-# Ariance Music Center 1.31
+# Ariance Music Center 1.32
+
+## What's new in 1.32
+
+- Audiobook playback speed controls
+  saved for each book
+- MPRIS2 support (media keys, lock screen, desktop media controls)
+- Fixed two queue rows marked as playing when a track was queued twice
 
 ## What's new in 1.31
 
@@ -88,8 +95,8 @@ https://github.com/blaz101/Ariance-Music-Center
 Extract the release archive and start the app:
 
 ```bash
-tar -xf ariance-music-center_1.31.orig.tar.xz
-cd ariance-music-center-1.31
+tar -xf ariance-music-center_1.32.orig.tar.xz
+cd ariance-music-center-1.32
 ./run.sh
 ```
 
@@ -106,7 +113,7 @@ Nothing is installed system-wide and nothing is written outside your home.
 ## Install it (.deb, Debian and Ubuntu)
 
 ```bash
-sudo apt install ./ariance-music-center_1.31_amd64.deb
+sudo apt install ./ariance-music-center_1.32_amd64.deb
 ariance-music-center              # or pick it from the menu
 ```
 
@@ -459,8 +466,8 @@ by folder when there is no albumartist; a single track gets track tags only. If
 
 - Config: `~/Ariance/settings/config.json` (queue, volume, view, grouping, columns,
   collections, ReplayGain mode, window state)
-- Audiobook bookmarks: `~/Ariance/settings/audiobooks.json` (the chapter and
-  timestamp of every book, and the one to reopen at start); the same file is
+- Audiobook bookmarks: `~/Ariance/settings/audiobooks.json` (the chapter,
+  timestamp and playback speed of every book, and the one to reopen at start); the same file is
   rewritten as you listen, so a position saved mid-chapter never touches the config
 - Smart playlists: `~/Ariance/settings/smart_playlists.json`
 - Sync profiles: `~/Ariance/settings/profiles.json`; PC hash cache:
@@ -476,9 +483,9 @@ by folder when there is no albumartist; a single track gets track tags only. If
 
 ## Verification
 
-The 1.31 source and package were checked with:
+The 1.32 source and package were checked with:
 
-- the deep suite: **374/374 checks passed**;
+- the deep suite: **397/397 checks passed**;
 - `run.sh --check` from the extracted `.deb`, using a fresh cache;
 - a package audit confirming no VirtualKeyboard, PDF, `qpdf`, `rcrack` or `.aax`
   files are bundled.

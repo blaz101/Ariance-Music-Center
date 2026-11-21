@@ -32,6 +32,9 @@ DATA = os.path.join(HOME, "Ariance")
 CACHE = os.path.join(HOME, ".cache", "Ariance")
 os.environ["ARIANCE_DATA"] = DATA
 os.environ["ARIANCE_CACHE"] = CACHE
+# Keep the suite off the real session bus: the app under test must not take over
+# the desktop's media-player name while the user is listening to something.
+os.environ["ARIANCE_NO_MPRIS"] = "1"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 atexit.register(shutil.rmtree, HOME, True)
 
@@ -185,13 +188,13 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.31", ariance.VERSION == "1.31", ariance.VERSION)
+check("version is 1.32", ariance.VERSION == "1.32", ariance.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Ariance Music Center 1.31\n"), readme[:40])
-check("README has a 1.31 section", "## What's new in 1.31" in readme)
+      readme.startswith("# Ariance Music Center 1.32\n"), readme[:40])
+check("README has a 1.32 section", "## What's new in 1.32" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.31", "\nV=1.31\n" in build, build[:200])
+check("the package script builds 1.32", "\nV=1.32\n" in build, build[:200])
 check("the package is named after the app", "PKG=ariance-music-center" in build, build[:200])
 
 # ------------------------------------------------------- the move from 1.29
@@ -322,6 +325,19 @@ check("a collection database that moved with the app is repointed",
       followed["collections"][0]["db"])
 check("the path migration is recorded so it runs once", followed["ui_revision"] == 44,
       followed["ui_revision"])
+# 1.32: a config that saved revision 44 while still naming ~/Nebula must be repaired
+# on the next load; 1.31 bumped the revision even when it could not follow the move.
+with open(ariance.CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump({"ui_revision": 44, "library_folders": [MUSIC],
+               "collections": [{"name": "Music", "folders": [MUSIC],
+                                "db": os.path.join(ariance.LEGACY_DATA_ROOT,
+                                                   "library", "library.db")}],
+               "active_collection": 0}, f)
+repaired = ariance.load_config()
+check("a 1.31 config still naming the old database is repaired on load",
+      repaired["collections"][0]["db"] ==
+      os.path.join(ariance.DATA_ROOT, "library", "library.db"),
+      repaired["collections"][0]["db"])
 check("a music folder that merely shares the old name is left alone",
       ariance.follow_moved_root(AB, ariance.LEGACY_DATA_ROOT,
                                 ariance.DATA_ROOT) == AB, AB)
@@ -1640,6 +1656,84 @@ check("the config's old bookmarks move into the file, leaving the config",
 check("a migrated bookmark never overwrites the newer place in the file",
       moved.state("b") == (0, 3.0) and moved.last == "c", moved.books)
 
+# Audiobook speed: chosen from the gauge button, kept per book, and handed to the
+# player. The file must keep the rate while remember() rewrites the place.
+check("the audiobook bar offers 0.5x to 2x in 0.1 steps",
+      ariance.AUDIOBOOK_SPEEDS == tuple(round(0.5 + 0.1 * i, 1) for i in range(16)),
+      ariance.AUDIOBOOK_SPEEDS)
+check("a rate saved by the older 0.25-step menu lands on the new 0.1 grid",
+      ariance._saved_speed(1.75) == 1.8 and ariance._saved_speed(3.0) == 2.0,
+      (ariance._saved_speed(1.75), ariance._saved_speed(3.0)))
+check("the speed button starts at normal speed with the gauge glyph",
+      ab.ab_player.speed == 1.0 and ab.ab_player.speed_btn.text() == "1×"
+      and not ab.ab_player.speed_btn.icon().isNull(),
+      (ab.ab_player.speed, ab.ab_player.speed_btn.text()))
+ab.ab_player.load_book({"key": "speed", "title": "Speed", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+ab.ab_player.set_speed(1.5)
+check("choosing 1.5x updates the button and the player's rate",
+      ab.ab_player.speed == 1.5 and ab.ab_player.speed_btn.text() == "1.5×",
+      (ab.ab_player.speed, ab.ab_player.speed_btn.text()))
+speed_file = json.load(open(ariance.AUDIOBOOK_STATE_FILE, encoding="utf-8"))
+check("the chosen speed is saved with the book it belongs to",
+      speed_file["books"]["speed"].get("speed") == 1.5,
+      speed_file["books"].get("speed"))
+ab.ab_player.load_book({"key": "speedless", "title": "Plain", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+check("a book with no saved speed opens at normal speed",
+      ab.ab_player.speed == 1.0, ab.ab_player.speed)
+ab.ab_player.load_book({"key": "speed", "title": "Speed", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+check("reopening a book restores its own speed",
+      ab.ab_player.speed == 1.5 and ab.ab_player.speed_btn.text() == "1.5×",
+      (ab.ab_player.speed, ab.ab_player.speed_btn.text()))
+ab.ab_player.set_speed(9.0)
+check("a rate the menu does not offer is ignored",
+      ab.ab_player.speed == 1.5, ab.ab_player.speed)
+rate_probe = ariance.QMediaPlayer()
+rate_probe.setPlaybackRate(1.75)
+check("Qt keeps the playback rates the audiobook bar offers",
+      abs(rate_probe.playbackRate() - 1.75) < 0.001, rate_probe.playbackRate())
+rate_probe.deleteLater()
+
+# The strip's gauge is the same control as the audiobook bar's, reachable from the
+# music tab while a book is playing.
+strip_btn = w.library_tab.speed_strip_btn
+check("the far-left strip carries the audiobook speed gauge",
+      not strip_btn.icon().isNull() and strip_btn.menu() is not None)
+check("the strip's gauge lists every playback speed",
+      tuple(w.library_tab.speed_strip_actions) == ariance.AUDIOBOOK_SPEEDS,
+      tuple(w.library_tab.speed_strip_actions))
+abp = w.audiobooks_tab.ab_player
+abp.book = {"key": "strip-test", "title": "Strip"}
+w.library_tab.speed_strip_actions[1.1].trigger()
+check("the strip's gauge changes the audiobook speed", abp.speed == 1.1, abp.speed)
+check("the audiobook bar's own button follows the strip",
+      abp.speed_btn.text() == "1.1\u00d7", abp.speed_btn.text())
+abp.book = {}
+abp.set_speed(1.0)
+
+# A queue may hold the same file twice; only the entry the player is on is playing.
+saved_queue, saved_index = list(w.player.queue), w.player.index
+saved_stopped = w.player._stopped
+w.player.set_queue([WAV1, WAV2, WAV1], start=2)
+w.player._stopped = False
+w.library_tab.rebuild_queue()
+w.library_tab.table.clearSelection()
+w.library_tab._on_index_changed(2)
+lit = [r for r in range(3)
+       if w.library_tab.table.item(r, 1).background().color().name().lower()
+       == ariance.ACCENT_DIM.lower()]
+check("a file queued twice shows only one playing row", lit == [2], lit)
+w.player.index = 0
+w.library_tab._highlight(WAV1)
+lit = [r for r in range(3)
+       if w.library_tab.table.item(r, 1).background().color().name().lower()
+       == ariance.ACCENT_DIM.lower()]
+check("moving to the first copy moves the playing row with it", lit == [0], lit)
+w.player.set_queue(saved_queue, start=saved_index if saved_index >= 0 else None)
+w.player._stopped = saved_stopped
+
 
 class _StubMedia:
     """Just enough of a QMediaPlayer to watch when the resume seek is issued."""
@@ -1648,6 +1742,10 @@ class _StubMedia:
         self.state = state
         self.seekable = seekable
         self.seeks = []
+        self.rates = []
+
+    def setPlaybackRate(self, rate):
+        self.rates.append(rate)
 
     def isSeekable(self):
         return self.seekable
@@ -1661,6 +1759,40 @@ class _StubMedia:
     def play(self):
         pass
 
+
+ab.ab_player.load_book({"key": "rate", "title": "Rate", "author": "Author"},
+                       ab._book_chapters[book_key], 0, 0.0, autoplay=False)
+rate_media = _StubMedia(ariance.QMediaPlayer.PlayingState)
+ab.ab_player.media = rate_media
+ab.ab_player.set_speed(2.0)
+check("changing speed tells the player the rate the button shows",
+      rate_media.rates == [2.0], rate_media.rates)
+ab.ab_player.set_speed(1.0)
+
+# MPRIS: what a desktop media key, lock screen or sound menu reads and calls.
+section("MPRIS")
+check("the bundled Qt provides QtDBus for MPRIS", ariance.MPRIS_AVAILABLE)
+first_id = ariance.mpris_track_id(WAV1)
+check("a track gets a stable MPRIS object path",
+      first_id == ariance.mpris_track_id(WAV1)
+      and first_id.startswith("/org/ariance/MediaPlayer2/Track/t")
+      and first_id != ariance.mpris_track_id(WAV2),
+      (first_id, ariance.mpris_track_id(WAV2)))
+mpris_values = ariance.mpris_metadata(WAV1, 60000)
+check("MPRIS metadata carries the tags, length and file URL",
+      mpris_values.get("mpris:trackid") == first_id
+      and mpris_values.get("mpris:length") == 60000000
+      and mpris_values.get("xesam:title")
+      and mpris_values.get("xesam:artist")
+      and mpris_values.get("xesam:url", "").startswith("file://"),
+      mpris_values)
+check("nothing playing means empty MPRIS metadata",
+      ariance.mpris_metadata("", 0) == {})
+check("the MPRIS service name belongs to Ariance",
+      ariance.MPRIS_BUS_NAME == "org.mpris.MediaPlayer2.ariance")
+quiet_mpris = ariance.MprisServer(ab.player, None)
+check("the test run keeps MPRIS off the real session bus",
+      not quiet_mpris.available, quiet_mpris.available)
 
 media_before = ab.ab_player.media
 ab.ab_player.load_book({"key": "resume", "title": "Resume", "author": "Author"},

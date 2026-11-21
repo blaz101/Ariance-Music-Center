@@ -43,6 +43,16 @@ each asset came from.
   the button paints these six bars as paths (like `player_icon`) rather than
   loading the file at runtime.
 
+## Playback-speed icon
+
+- **File:** `assets/icons/gauge.svg`
+- **Icon:** Lucide `gauge`, supplied by the copyright holder.
+- **Source:** <https://lucide.dev/icons/gauge>
+- **License:** ISC, with Feather-derived portions under MIT. See
+  `LICENSES/Lucide.txt`.
+- **Note:** painted as vector paths (`gauge_icon_pixmap`), like the EQ and chapter
+  glyphs, because `PySide6.QtSvg` is not bundled.
+
 ## Other UI icons
 
 - The remaining interface glyphs are drawn in `ariance.py`, use Qt standard icons,

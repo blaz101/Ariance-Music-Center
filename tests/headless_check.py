@@ -33,6 +33,8 @@ DATA_ROOT = os.path.join(HOME, "Ariance")
 CACHE_ROOT = os.path.join(HOME, ".cache", "Ariance")
 os.environ["ARIANCE_DATA"] = DATA_ROOT
 os.environ["ARIANCE_CACHE"] = CACHE_ROOT
+# never take the real desktop's media-player name during a test run
+os.environ["ARIANCE_NO_MPRIS"] = "1"
 atexit.register(shutil.rmtree, HOME, True)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

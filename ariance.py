@@ -145,7 +145,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Ariance Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Ariance"                 # short name used in menus and messages
-VERSION = "1.31"
+VERSION = "1.32"
 SOURCE_URL = "https://github.com/blaz101/Ariance-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -404,8 +404,11 @@ def load_config():
         # 1.31: 1.30 moved ~/Nebula to ~/Ariance but left the config's absolute paths
         # (the collection database) pointing at the old folder, so the app could not
         # open its library at all.
-        repoint_legacy_paths(cfg)
         cfg["ui_revision"] = 44
+    # 1.32: 1.31 recorded the revision even when the move could not be followed yet
+    # (a leftover ~/Nebula, a drive not mounted), and then never looked again. Follow
+    # the move on every load; once the stored paths are new this changes nothing.
+    repoint_legacy_paths(cfg)
     for key, val in DEFAULT_CONFIG.items():
         if key not in cfg or not isinstance(cfg[key], type(val)):
             # Never hand out a mutable default: a tab changing its own settings
@@ -8494,6 +8497,11 @@ QPushButton#PlayerButton:hover, QPushButton#PlayerBig:hover {{ background: {PLAY
 QPushButton#PlayerButton:pressed, QPushButton#PlayerBig:pressed {{ background: {PLAYER_BUTTON}; }}
 QPushButton#PlayerToggle {{ background: transparent; border: 0; border-radius: 14px; padding: 0; }}
 QPushButton#PlayerToggle:hover {{ background: {PLAYER_BUTTON_HOVER}; }}
+QToolButton#SpeedButton {{ background: transparent; border: 0; border-radius: 14px;
+    padding: 0 7px; color: {TEXT}; font-size: 9pt; font-weight: bold; }}
+QToolButton#SpeedButton:hover {{ background: {PLAYER_BUTTON_HOVER}; }}
+QToolButton#SpeedButton:disabled {{ color: {MUTED}; }}
+QToolButton#SpeedButton::menu-indicator {{ image: none; width: 0; }}
 QPushButton#StopAfter {{ background: transparent; border: 1px solid {STOP_AFTER}; color: {MUTED};
     border-radius: 3px; padding: 2px 6px; font-size: 9pt; }}
 QPushButton#StopAfter:checked {{ background: transparent; border-color: {AMBER}; color: {AMBER}; }}
@@ -10456,6 +10464,30 @@ def chapters_icon_pixmap(color, px=20):
     for y in (7.5, 12.0, 16.5):
         painter.drawLine(QPointF(6.0 * scale, y * scale),
                          QPointF(18.0 * scale, y * scale))
+    painter.end()
+    return pixmap
+
+
+def gauge_icon_pixmap(color, px=18):
+    """The playback-speed gauge from assets/icons/gauge.svg, painted at any size."""
+    pixmap = QPixmap(px, px)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(max(1.0, px * 2.0 / 24.0))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    scale = px / 24.0
+    arc = QRectF(2.0 * scale, 4.0 * scale, 20.0 * scale, 20.0 * scale)
+    path = QPainterPath()
+    path.arcMoveTo(arc, -30.0)
+    path.arcTo(arc, -30.0, 240.0)      # over the top, open at the bottom
+    painter.drawPath(path)
+    painter.drawLine(QPointF(12.0 * scale, 14.0 * scale),
+                     QPointF(16.0 * scale, 10.0 * scale))
     painter.end()
     return pixmap
 
@@ -14410,6 +14442,599 @@ class PlayerBar(QWidget):
             self.error.emit(self._players[deck].errorString() or "Playback failed")
         else:
             self._preloaded = None
+# ---------------- MPRIS: media keys, lock screens and desktop media widgets ----------------
+# The player is published on the session bus as the standard MPRIS2 service, so a
+# desktop's media keys, its lock screen and its sound menu can read and control it
+# without knowing anything about Ariance. Nothing here is required for playback: a
+# session without a bus (or a Qt build without QtDBus) simply gets no MPRIS service.
+MPRIS_BUS_NAME = "org.mpris.MediaPlayer2.ariance"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT_IFACE = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+MPRIS_NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+MPRIS_AVAILABLE = False
+try:
+    from PySide6.QtCore import (ClassInfo as _ClassInfo, Property as _Property,
+                                Signal as _Signal, Slot as _Slot)
+    from PySide6.QtDBus import (QDBusAbstractAdaptor as _QDBusAbstractAdaptor,
+                                QDBusConnection as _QDBusConnection,
+                                QDBusMessage as _QDBusMessage,
+                                QDBusObjectPath as _QDBusObjectPath,
+                                QDBusVariant as _QDBusVariant)
+    MPRIS_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def mpris_track_id(path):
+    """A stable MPRIS object path for one queue entry."""
+    digest = hashlib.md5(str(path).encode("utf-8", "surrogateescape")).hexdigest()
+    return "/org/ariance/MediaPlayer2/Track/t" + digest
+
+
+def _mpris_number(value):
+    """The leading number of a tag such as "03/12", or 0 when there is none."""
+    match = re.match(r"\s*(\d+)", str(value or ""))
+    return int(match.group(1)) if match else 0
+
+
+def mpris_art_url(path):
+    """A file URL for a track's cover, copied into the cover cache, or ""."""
+    data = read_cover(path)
+    if not data:
+        return ""
+    ext = (".png" if data.startswith(b"\x89PNG")
+           else ".jpg" if data[:2] == b"\xff\xd8" else ".img")
+    digest = hashlib.md5(str(path).encode("utf-8", "surrogateescape")).hexdigest()
+    dest = os.path.join(COVERS_DIR, "mpris-" + digest + ext)
+    try:
+        os.makedirs(COVERS_DIR, exist_ok=True)
+        if not os.path.isfile(dest) or os.path.getsize(dest) != len(data):
+            with open(dest, "wb") as handle:
+                handle.write(data)
+    except OSError:
+        return ""
+    return QUrl.fromLocalFile(dest).toString()
+
+
+def mpris_metadata(path, duration_ms=0):
+    """The plain values for MPRIS Metadata, or {} when nothing is loaded."""
+    if not path:
+        return {}
+    values = {"mpris:trackid": mpris_track_id(path)}
+    title = artist = album = albumartist = url = art_path = ""
+    track = disc = year = 0
+    length_us = 0
+    if is_cd_entry(path):
+        meta = cd_entry_meta(path)
+        title = str(meta.get("title") or "")
+        artist = str(meta.get("artist") or "")
+        album = str(meta.get("album") or "")
+        track = _mpris_number(meta.get("track") or meta.get("tracknumber"))
+        disc = _mpris_number(meta.get("disc"))
+        try:
+            length_us = int(cd_entry_frames(path) * 1000000 / CD_FRAMES_PER_SECOND)
+        except (TypeError, ValueError):
+            length_us = 0
+    elif is_device_entry(path):
+        row = (device_entry_info(path) or {}).get("meta") or {}
+        title = str(row.get("title") or os.path.basename(path))
+        artist = str(row.get("artist") or "")
+        album = str(row.get("album") or "")
+        albumartist = str(row.get("albumartist") or "")
+        track = _mpris_number(row.get("track") or row.get("tracknumber"))
+        disc = _mpris_number(row.get("disc") or row.get("discnumber"))
+        year = _mpris_number(row.get("year") or row.get("date"))
+        art_path = str(row.get("cover_path") or "")
+    else:
+        tags = read_tags(path)
+        title = tags.get("title") or os.path.basename(path)
+        artist = tags.get("artist") or ""
+        album = tags.get("album") or ""
+        albumartist = tags.get("albumartist") or ""
+        track = _mpris_number(tags.get("tracknumber"))
+        disc = _mpris_number(tags.get("discnumber"))
+        year = _mpris_number(tags.get("date"))
+        url = QUrl.fromLocalFile(path).toString()
+        try:
+            length_us = int(float(tags.get("length") or 0.0) * 1000000)
+        except (TypeError, ValueError):
+            length_us = 0
+    if duration_ms and duration_ms > 0:
+        length_us = int(duration_ms * 1000)
+    if title:
+        values["xesam:title"] = title
+    if artist:
+        values["xesam:artist"] = [artist]
+    if album:
+        values["xesam:album"] = album
+    if albumartist:
+        values["xesam:albumArtist"] = [albumartist]
+    if track:
+        values["xesam:trackNumber"] = track
+    if disc:
+        values["xesam:discNumber"] = disc
+    if year:
+        values["xesam:contentCreated"] = str(year)
+    if url:
+        values["xesam:url"] = url
+    if length_us > 0:
+        values["mpris:length"] = length_us
+    art_url = ""
+    if art_path and os.path.isfile(art_path):
+        art_url = QUrl.fromLocalFile(art_path).toString()
+    elif not is_cd_entry(path) and not is_device_entry(path):
+        art_url = mpris_art_url(path)
+    if art_url:
+        values["mpris:artUrl"] = art_url
+    return values
+
+
+_MPRIS_ROOT_XML = """
+<interface name="org.mpris.MediaPlayer2">
+  <method name="Raise"/>
+  <method name="Quit"/>
+  <property name="Identity" type="s" access="read"/>
+  <property name="CanQuit" type="b" access="read"/>
+  <property name="CanRaise" type="b" access="read"/>
+  <property name="HasTrackList" type="b" access="read"/>
+  <property name="DesktopEntry" type="s" access="read"/>
+  <property name="SupportedUriSchemes" type="as" access="read"/>
+  <property name="SupportedMimeTypes" type="as" access="read"/>
+</interface>"""
+
+_MPRIS_PLAYER_XML = """
+<interface name="org.mpris.MediaPlayer2.Player">
+  <method name="Next"/>
+  <method name="Previous"/>
+  <method name="Pause"/>
+  <method name="PlayPause"/>
+  <method name="Stop"/>
+  <method name="Play"/>
+  <method name="Seek"><arg direction="in" type="x" name="Offset"/></method>
+  <method name="SetPosition">
+    <arg direction="in" type="o" name="TrackId"/>
+    <arg direction="in" type="x" name="Position"/>
+  </method>
+  <method name="OpenUri"><arg direction="in" type="s" name="Uri"/></method>
+  <signal name="Seeked"><arg type="x" name="Position"/></signal>
+  <property name="PlaybackStatus" type="s" access="read"/>
+  <property name="LoopStatus" type="s" access="readwrite"/>
+  <property name="Rate" type="d" access="readwrite"/>
+  <property name="Shuffle" type="b" access="readwrite"/>
+  <property name="Metadata" type="a{sv}" access="read"/>
+  <property name="Volume" type="d" access="readwrite"/>
+  <property name="Position" type="x" access="read"/>
+  <property name="MinimumRate" type="d" access="read"/>
+  <property name="MaximumRate" type="d" access="read"/>
+  <property name="CanGoNext" type="b" access="read"/>
+  <property name="CanGoPrevious" type="b" access="read"/>
+  <property name="CanPlay" type="b" access="read"/>
+  <property name="CanPause" type="b" access="read"/>
+  <property name="CanSeek" type="b" access="read"/>
+  <property name="CanControl" type="b" access="read"/>
+</interface>"""
+
+if MPRIS_AVAILABLE:
+    @_ClassInfo({"D-Bus Interface": MPRIS_ROOT_IFACE,
+                 "D-Bus Introspection": _MPRIS_ROOT_XML})
+    class _MprisRootAdaptor(_QDBusAbstractAdaptor):
+        """org.mpris.MediaPlayer2: who the player is, raise it, quit it."""
+
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.server = parent
+
+        @_Slot()
+        def Raise(self):
+            self.server.raise_window()
+
+        @_Slot()
+        def Quit(self):
+            self.server.quit_app()
+
+        @_Property(str)
+        def Identity(self):
+            return APP_NAME
+
+        @_Property(bool)
+        def CanQuit(self):
+            return True
+
+        @_Property(bool)
+        def CanRaise(self):
+            return True
+
+        @_Property(bool)
+        def HasTrackList(self):
+            return False
+
+        @_Property(str)
+        def DesktopEntry(self):
+            return "ariance-music-center"
+
+        @_Property("QStringList")
+        def SupportedUriSchemes(self):
+            return ["file"]
+
+        @_Property("QStringList")
+        def SupportedMimeTypes(self):
+            return ["audio/mpeg", "audio/flac", "audio/ogg", "audio/opus",
+                    "audio/mp4", "audio/x-wav", "audio/aiff"]
+
+    @_ClassInfo({"D-Bus Interface": MPRIS_PLAYER_IFACE,
+                 "D-Bus Introspection": _MPRIS_PLAYER_XML})
+    class _MprisPlayerAdaptor(_QDBusAbstractAdaptor):
+        """org.mpris.MediaPlayer2.Player: transport, modes and now-playing data."""
+
+        Seeked = _Signal("qlonglong")
+
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.server = parent
+
+        @_Slot()
+        def Play(self):
+            self.server.play()
+
+        @_Slot()
+        def Pause(self):
+            self.server.pause()
+
+        @_Slot()
+        def PlayPause(self):
+            self.server.play_pause()
+
+        @_Slot()
+        def Stop(self):
+            self.server.stop()
+
+        @_Slot()
+        def Next(self):
+            self.server.next()
+
+        @_Slot()
+        def Previous(self):
+            self.server.previous()
+
+        @_Slot("qlonglong")
+        def Seek(self, offset):
+            self.server.seek(int(offset))
+
+        @_Slot("QDBusObjectPath", "qlonglong")
+        def SetPosition(self, track_id, position):
+            self.server.set_position(track_id.path(), int(position))
+
+        @_Slot(str)
+        def OpenUri(self, uri):
+            self.server.open_uri(uri)
+
+        @_Property(str)
+        def PlaybackStatus(self):
+            return self.server.playback_status()
+
+        @_Property(str)
+        def LoopStatus(self):
+            return self.server.loop_status()
+
+        @LoopStatus.setter
+        def LoopStatus(self, value):
+            self.server.set_loop_status(value)
+
+        @_Property(float)
+        def Rate(self):
+            return 1.0
+
+        @Rate.setter
+        def Rate(self, _value):
+            pass
+
+        @_Property(bool)
+        def Shuffle(self):
+            return self.server.shuffle()
+
+        @Shuffle.setter
+        def Shuffle(self, value):
+            self.server.set_shuffle(value)
+
+        @_Property("QVariantMap")
+        def Metadata(self):
+            return self.server.metadata_variants()
+
+        @_Property(float)
+        def Volume(self):
+            return self.server.volume()
+
+        @Volume.setter
+        def Volume(self, value):
+            self.server.set_volume(value)
+
+        @_Property("qlonglong")
+        def Position(self):
+            return self.server.position_us()
+
+        @_Property(float)
+        def MinimumRate(self):
+            return 1.0
+
+        @_Property(float)
+        def MaximumRate(self):
+            return 1.0
+
+        @_Property(bool)
+        def CanGoNext(self):
+            return self.server.can_go_next()
+
+        @_Property(bool)
+        def CanGoPrevious(self):
+            return self.server.can_go_previous()
+
+        @_Property(bool)
+        def CanPlay(self):
+            return self.server.can_play()
+
+        @_Property(bool)
+        def CanPause(self):
+            return self.server.can_pause()
+
+        @_Property(bool)
+        def CanSeek(self):
+            return self.server.can_seek()
+
+        @_Property(bool)
+        def CanControl(self):
+            return True
+
+
+class MprisServer(QObject):
+    """Publishes the music player on the session bus as the standard MPRIS2 service.
+
+    The service is optional in every direction: no session bus, no QtDBus, or a
+    second copy of the app already owning the name simply leaves `available` false
+    and playback carries on untouched.
+    """
+
+    def __init__(self, bar, window=None, parent=None):
+        super().__init__(parent)
+        self.bar = bar
+        self.window = window
+        self.bus = None
+        self.available = False
+        self._pending = {}
+        self._meta_cache = None
+        self._prop_timer = QTimer(self, singleShot=True, interval=0,
+                                  timeout=self._flush_props)
+        if not MPRIS_AVAILABLE or os.environ.get("ARIANCE_NO_MPRIS"):
+            return
+        try:
+            bus = _QDBusConnection.sessionBus()
+        except Exception:
+            return
+        if bus is None or not bus.isConnected():
+            return
+        self._root_adaptor = _MprisRootAdaptor(self)
+        self._player_adaptor = _MprisPlayerAdaptor(self)
+        if not bus.registerObject(MPRIS_PATH, self):
+            return
+        if not bus.registerService(MPRIS_BUS_NAME):
+            bus.unregisterObject(MPRIS_PATH)
+            return
+        self.bus = bus
+        self.available = True
+        bar.track_changed.connect(self._track_changed)
+        bar.queue_changed.connect(self._queue_changed)
+        bar.index_changed.connect(self._queue_changed)
+        bar.mode_changed.connect(self._mode_changed)
+        bar.vol.valueChanged.connect(self._volume_changed)
+        bar.seek.sliderMoved.connect(self._seeked)
+        bar.seek.clicked.connect(self._seeked)
+        for media in getattr(bar, "_players", ()):
+            media.playbackStateChanged.connect(self._state_changed)
+            media.durationChanged.connect(self._duration_changed)
+
+    # ---------- what the service reports ----------
+    def playback_status(self):
+        state = self.bar.player.playbackState()
+        if state == QMediaPlayer.PlayingState:
+            return "Playing"
+        if state == QMediaPlayer.PausedState:
+            return "Paused"
+        return "Stopped"
+
+    def loop_status(self):
+        return {"off": "None", "all": "Playlist", "one": "Track"}.get(
+            self.bar.repeat, "None")
+
+    def shuffle(self):
+        return bool(self.bar.shuffle)
+
+    def volume(self):
+        return max(0.0, min(1.0, self.bar.vol.value() / 100.0))
+
+    def position_us(self):
+        return max(0, int(self.bar.player.position() * 1000))
+
+    def can_play(self):
+        return bool(self.bar.queue)
+
+    def can_pause(self):
+        return not self.bar.player.source().isEmpty()
+
+    def can_go_next(self):
+        return bool(self.bar.queue)
+
+    def can_go_previous(self):
+        return bool(self.bar.queue)
+
+    def can_seek(self):
+        return self.bar.player.duration() > 0
+
+    def metadata(self):
+        """Metadata for the current entry, read from tags once per track."""
+        path = self.bar.current_path()
+        if not path:
+            return {}
+        duration = int(self.bar.player.duration() or 0)
+        cache = self._meta_cache
+        if cache and cache[0] == path and abs(cache[1] - duration) < 1000:
+            return cache[2]
+        values = mpris_metadata(path, duration)
+        self._meta_cache = (path, duration, values)
+        return values
+
+    def metadata_variants(self):
+        # Qt wraps every map value in the variant a{sv} requires; wrapping them here
+        # as well would send a variant inside a variant to the desktop.
+        return {key: _QDBusObjectPath(value) if key == "mpris:trackid" else value
+                for key, value in self.metadata().items()}
+
+    # ---------- what a desktop asks it to do ----------
+    def play(self):
+        if self.bar.queue and self.bar.player.playbackState() != QMediaPlayer.PlayingState:
+            self.bar.toggle()
+
+    def pause(self):
+        if self.bar.player.playbackState() == QMediaPlayer.PlayingState:
+            self.bar.toggle()
+
+    def play_pause(self):
+        if self.bar.queue:
+            self.bar.toggle()
+
+    def stop(self):
+        self.bar.stop()
+
+    def next(self):
+        if self.bar.queue:
+            self.bar.next()
+
+    def previous(self):
+        if self.bar.queue:
+            self.bar.prev()
+
+    def seek(self, offset_us):
+        duration = self.bar.player.duration()
+        if duration <= 0:
+            return
+        target = max(0, min(duration,
+                            int(self.bar.player.position() + int(offset_us) / 1000)))
+        self.bar.player.setPosition(target)
+        self._emit_seeked(target * 1000)
+
+    def set_position(self, track_id, position_us):
+        path = self.bar.current_path()
+        if not path or track_id not in (mpris_track_id(path), MPRIS_NO_TRACK):
+            return
+        duration = self.bar.player.duration()
+        target = max(0, int(position_us) // 1000)
+        if duration > 0:
+            target = min(target, duration)
+        self.bar.player.setPosition(target)
+        self._emit_seeked(target * 1000)
+
+    def open_uri(self, uri):
+        url = QUrl(uri)
+        if not url.isLocalFile():
+            return
+        path = url.toLocalFile()
+        if path and os.path.isfile(path):
+            self.bar.set_queue([path], 0, play=True)
+
+    def set_shuffle(self, value):
+        self.bar.set_modes(shuffle=bool(value))
+
+    def set_loop_status(self, value):
+        repeat = {"None": "off", "Playlist": "all", "Track": "one"}.get(str(value))
+        if repeat:
+            self.bar.set_modes(repeat=repeat)
+
+    def set_volume(self, value):
+        try:
+            level = float(value)
+        except (TypeError, ValueError):
+            return
+        self.bar.vol.setValue(int(round(max(0.0, min(1.0, level)) * 100)))
+
+    def raise_window(self):
+        window = self.window
+        if window is None:
+            return
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def quit_app(self):
+        if self.window is not None:
+            self.window.close()
+        else:
+            QApplication.instance().quit()
+
+    # ---------- change notifications ----------
+    def _note(self, **values):
+        if not self.available:
+            return
+        self._pending.update(values)
+        if not self._prop_timer.isActive():
+            self._prop_timer.start()
+
+    def _flush_props(self):
+        if not self.available or not self._pending:
+            return
+        changed = {key: _QDBusVariant(value)
+                   for key, value in self._pending.items()}
+        self._pending.clear()
+        message = _QDBusMessage.createSignal(
+            MPRIS_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged")
+        message.setArguments([MPRIS_PLAYER_IFACE, changed, []])
+        self.bus.send(message)
+
+    def _emit_seeked(self, position_us):
+        if self.available:
+            self._player_adaptor.Seeked.emit(int(position_us))
+
+    def _track_changed(self, _path):
+        self._meta_cache = None
+        self._note(Metadata=self.metadata_variants(),
+                   PlaybackStatus=self.playback_status(),
+                   CanSeek=self.can_seek(), CanPlay=self.can_play(),
+                   CanPause=self.can_pause(), CanGoNext=self.can_go_next(),
+                   CanGoPrevious=self.can_go_previous())
+
+    def _state_changed(self, _state):
+        self._note(PlaybackStatus=self.playback_status(),
+                   CanPause=self.can_pause())
+
+    def _duration_changed(self, _duration):
+        self._meta_cache = None
+        self._note(Metadata=self.metadata_variants(), CanSeek=self.can_seek())
+
+    def _queue_changed(self, *_args):
+        self._note(CanGoNext=self.can_go_next(), CanGoPrevious=self.can_go_previous(),
+                   CanPlay=self.can_play())
+
+    def _mode_changed(self):
+        self._note(Shuffle=self.shuffle(), LoopStatus=self.loop_status())
+
+    def _volume_changed(self, _value):
+        self._note(Volume=self.volume())
+
+    def _seeked(self, milliseconds):
+        self._emit_seeked(int(milliseconds) * 1000)
+
+    def shutdown(self):
+        if not self.available:
+            return
+        self._prop_timer.stop()
+        self._pending.clear()
+        self.bus.unregisterService(MPRIS_BUS_NAME)
+        self.bus.unregisterObject(MPRIS_PATH)
+        self.bus = None
+        self.available = False
+
+
 # ======================================================================
 # ui/library_tab.py - icon strip, collection tree, playlists, queue
 # ======================================================================
@@ -17166,9 +17791,60 @@ class LibraryTab(QWidget):
             b.clicked.connect(lambda _checked=False, k=key: self.set_view(k))
             lay.addWidget(b)
             self.strip_buttons[key] = b
-        lay.addStretch()
+        lay.addStretch(1)
+        # The audiobook speed lives here as well as in the audiobook bar: a book keeps
+        # playing while the music tab is open, and this is the one control on the strip
+        # that belongs to the other player.
+        speed = QToolButton()
+        speed.setObjectName("StripButton")
+        speed.setIconSize(QSize(24, 24))
+        speed.setFixedSize(44, 42)
+        speed.setToolTip("Audiobook playback speed")
+        speed.setCursor(Qt.PointingHandCursor)
+        speed.setPopupMode(QToolButton.InstantPopup)
+        speed.setIcon(self._speed_strip_icon())
+        menu = QMenu(speed)
+        self.speed_strip_actions = {}
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for rate in AUDIOBOOK_SPEEDS:
+            action = menu.addAction(f"{rate:g}\u00d7")
+            action.setCheckable(True)
+            action.setData(rate)
+            group.addAction(action)
+            self.speed_strip_actions[rate] = action
+            action.triggered.connect(
+                lambda _checked=False, chosen=rate: self._strip_set_speed(chosen))
+        menu.aboutToShow.connect(self._sync_strip_speed)
+        speed.setMenu(menu)
+        self.speed_strip_btn = speed
+        lay.addWidget(speed, 0, Qt.AlignHCenter)
+        lay.addStretch(1)
         self.set_view(self.config.get("view", "collection"))
         return strip
+
+    def _speed_strip_icon(self):
+        """The gauge in the strip's two states: muted, and bright under the pointer."""
+        icon = QIcon()
+        icon.addPixmap(gauge_icon_pixmap(MUTED, 24), QIcon.Normal, QIcon.Off)
+        icon.addPixmap(gauge_icon_pixmap(TEXT, 24), QIcon.Active, QIcon.Off)
+        return icon
+
+    def _sync_strip_speed(self):
+        """Show the audiobook player's current rate in the strip's menu."""
+        tab = getattr(self.window(), "audiobooks_tab", None)
+        rate = tab.ab_player.speed if tab is not None else 1.0
+        for value, action in self.speed_strip_actions.items():
+            action.setChecked(value == rate)
+        self.speed_strip_btn.setToolTip(f"Audiobook playback speed: {rate:g}\u00d7")
+
+    def _strip_set_speed(self, rate):
+        """Set the open book's speed from the strip; say so when no book is open."""
+        tab = getattr(self.window(), "audiobooks_tab", None)
+        if tab is None or not tab.ab_player.book_key:
+            self.window().notify("Open a book in Audiobooks to change its speed")
+            return
+        tab.ab_player.set_speed(rate)
 
     def set_view(self, key):
         order = ["collection", "playlists", "smart"]
@@ -18198,6 +18874,8 @@ class LibraryTab(QWidget):
         """Recolour what is painted by hand after the theme changed."""
         for key, button in getattr(self, "strip_buttons", {}).items():
             button.setIcon(strip_icon(key))
+        if hasattr(self, "speed_strip_btn"):
+            self.speed_strip_btn.setIcon(self._speed_strip_icon())
         self.cover_pix_cache.clear()
         self._on_index_changed(self.player.index)
 
@@ -18855,7 +19533,7 @@ class LibraryTab(QWidget):
                                f"({device.get('source')})").strip()
                     item.setToolTip(tip)
                 self.table.setItem(r, c, item)
-            if path == current:
+            if current and r == self.player.index:
                 self._paint_current_row(r)
         self.table.setUpdatesEnabled(True)
         self.queue_status.setText(f"{len(paths)} tracks · {fmt_time(total)}")
@@ -18874,13 +19552,16 @@ class LibraryTab(QWidget):
                 item.setBackground(QBrush(QColor(ACCENT_DIM)))
                 item.setForeground(QBrush(QColor("#ffffff")))
 
-    def _on_index_changed(self, _i):
+    def _on_index_changed(self, i):
+        # By index, not by path: the same file can sit in the queue twice, and then
+        # only the entry the player is actually on may be marked as playing.
         current = self.player.current_path()
+        live = bool(current) and 0 <= i < self.table.rowCount()
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 1)
             if not item:
                 continue
-            on = item.data(PATH_ROLE) == current
+            on = live and r == i
             for c in range(self.table.columnCount()):
                 cell = self.table.item(r, c)
                 if not cell:
@@ -26348,6 +27029,42 @@ def _bookmark_state(state):
     return chapter, position
 
 
+# The rates the audiobook bar offers, in 0.1 steps from half speed to double so
+# rates such as 1.1x can be picked. The menu is built from this tuple and the
+# bookmarks file rejects anything else, so a hand-edited file cannot make a book
+# play at a rate no button can show.
+AUDIOBOOK_SPEEDS = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4,
+                    1.5, 1.6, 1.7, 1.8, 1.9, 2.0)
+
+
+def _book_speed(value):
+    """One stored playback rate, or None when it is not one of the offered rates."""
+    try:
+        rate = round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+    return rate if rate in AUDIOBOOK_SPEEDS else None
+
+
+def _saved_speed(value):
+    """A bookmark's rate, moved onto the current 0.1 grid when it is an older one.
+
+    The first 1.32 menu offered 0.75, 1.25, 1.75, 2.5 and 3.0; a book saved at one
+    of those keeps the nearest rate the buttons can still show instead of dropping
+    back to normal speed.
+    """
+    rate = _book_speed(value)
+    if rate is not None:
+        return rate
+    try:
+        old = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0.5 <= old <= 3.0:
+        return None
+    return _book_speed(min(2.0, max(0.5, round(old, 1))))
+
+
 class AudiobookBookmarks:
     """Where the user is in every audiobook, in one file of its own.
 
@@ -26377,6 +27094,9 @@ class AudiobookBookmarks:
                     continue
                 chapter, position = parsed
                 entry = {"chapter": chapter, "position": round(position, 2)}
+                speed = _saved_speed(state.get("speed"))
+                if speed is not None:
+                    entry["speed"] = speed
                 for field in ("title", "author", "chapter_name"):
                     text = str(state.get(field) or "").strip()
                     if text:
@@ -26415,6 +27135,27 @@ class AudiobookBookmarks:
         parsed = _bookmark_state(self.books.get(str(key or "")))
         return parsed if parsed else (0, 0.0)
 
+    def speed(self, key):
+        """The playback rate this book was last left at (1.0 when it has none)."""
+        state = self.books.get(str(key or ""))
+        rate = _book_speed(state.get("speed")) if isinstance(state, dict) else None
+        return rate if rate is not None else 1.0
+
+    def set_speed(self, key, rate):
+        """Remember one book's speed without touching its place."""
+        key = str(key or "")
+        rate = _book_speed(rate)
+        if not key or rate is None:
+            return False
+        entry = self.books.get(key)
+        if not isinstance(entry, dict):
+            entry = {"chapter": 0, "position": 0.0}
+            self.books[key] = entry
+        if entry.get("speed") == rate:
+            return True
+        entry["speed"] = rate
+        return self.save()
+
     def remember(self, key, chapter, position, title="", author="", chapter_name=""):
         """Store one book's place, and make it the book start-up resumes."""
         key = str(key or "")
@@ -26426,6 +27167,12 @@ class AudiobookBookmarks:
         if not key:
             return False
         entry = {"chapter": chapter, "position": position}
+        # remember() owns the place, not the rate: rewriting the entry every 15
+        # seconds must not drop the speed chosen for this book.
+        previous = self.books.get(key)
+        speed = _book_speed(previous.get("speed")) if isinstance(previous, dict) else None
+        if speed is not None:
+            entry["speed"] = speed
         for field, text in (("title", title), ("author", author),
                             ("chapter_name", chapter_name)):
             text = str(text or "").strip()
@@ -26565,6 +27312,33 @@ class AudiobookBar(QWidget):
         self.ff_btn.setIconSize(QSize(22, 22))
         self.ff_btn.setIcon(transport_icon("forward", 22))
         self.ff_btn.setToolTip("Forward 30 seconds")
+        # The rate stays in the label ("1×", "1.5×"), so a book is never playing
+        # faster or slower than the bar says it is. The gauge glyph opens the menu.
+        self.speed = 1.0
+        self.speed_btn = QToolButton()
+        self.speed_btn.setObjectName("SpeedButton")
+        self.speed_btn.setPopupMode(QToolButton.InstantPopup)
+        self.speed_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.speed_btn.setIcon(QIcon(gauge_icon_pixmap(TEXT, 18)))
+        self.speed_btn.setIconSize(QSize(18, 18))
+        self.speed_btn.setFixedHeight(30)
+        self.speed_btn.setMinimumWidth(58)
+        self.speed_btn.setCursor(Qt.PointingHandCursor)
+        self.speed_btn.setToolTip("Playback speed")
+        self.speed_menu = QMenu(self.speed_btn)
+        self._speed_actions = {}
+        group = QActionGroup(self.speed_menu)
+        group.setExclusive(True)
+        for rate in AUDIOBOOK_SPEEDS:
+            action = self.speed_menu.addAction(f"{rate:g}×")
+            action.setCheckable(True)
+            action.setData(rate)
+            group.addAction(action)
+            self._speed_actions[rate] = action
+            action.triggered.connect(
+                lambda _checked=False, chosen=rate: self.set_speed(chosen))
+        self.speed_btn.setMenu(self.speed_menu)
+        self._sync_speed_button()
         for button in (self.rewind_btn, self.prev_btn, self.play_btn,
                        self.next_btn, self.ff_btn):
             button.setCursor(Qt.PointingHandCursor)
@@ -26576,6 +27350,8 @@ class AudiobookBar(QWidget):
         for button in (self.rewind_btn, self.prev_btn, self.play_btn,
                        self.next_btn, self.ff_btn):
             transport.addWidget(button, 0, Qt.AlignVCenter)
+        transport.addSpacing(4)
+        transport.addWidget(self.speed_btn, 0, Qt.AlignVCenter)
         transport.addStretch(1)
 
         chapter_row = QHBoxLayout()
@@ -26659,6 +27435,28 @@ class AudiobookBar(QWidget):
         self.media.mediaStatusChanged.connect(self._status_changed)
         self.media.errorOccurred.connect(
             lambda *_args: self.error.emit(self.media.errorString() or "Playback failed"))
+        self._apply_speed()
+
+    def _apply_speed(self):
+        if self.media is not None:
+            self.media.setPlaybackRate(self.speed)
+
+    def _sync_speed_button(self):
+        self.speed_btn.setText(f"{self.speed:g}×")
+        self.speed_btn.setToolTip(f"Playback speed: {self.speed:g}×")
+        for rate, action in self._speed_actions.items():
+            action.setChecked(rate == self.speed)
+
+    def set_speed(self, rate):
+        """Change the audiobook rate; this book keeps it for the next time it opens."""
+        rate = _book_speed(rate)
+        if rate is None:
+            return
+        self.speed = rate
+        self._apply_speed()
+        self._sync_speed_button()
+        if self.book_key:
+            self.bookmarks.set_speed(self.book_key, rate)
 
     def _refresh_play_icon(self):
         kind = "pause" if self.playing else "play"
@@ -26672,11 +27470,12 @@ class AudiobookBar(QWidget):
         self.next_btn.setIcon(transport_icon("chapter_next", 22))
         self.rewind_btn.setIcon(transport_icon("rewind", 22))
         self.ff_btn.setIcon(transport_icon("forward", 22))
+        self.speed_btn.setIcon(QIcon(gauge_icon_pixmap(TEXT, 18)))
         self._refresh_play_icon()
 
     def _set_enabled(self, on):
         for widget in (self.rewind_btn, self.prev_btn, self.play_btn, self.next_btn,
-                       self.ff_btn, self.seek, self.chapters_btn):
+                       self.ff_btn, self.speed_btn, self.seek, self.chapters_btn):
             widget.setEnabled(bool(on))
 
     def _embedded(self):
@@ -26709,6 +27508,9 @@ class AudiobookBar(QWidget):
         if self.book_key and self.chapters:
             self.save_state()
         self.book = dict(book or {})
+        self.speed = self.bookmarks.speed(self.book_key)
+        self._apply_speed()
+        self._sync_speed_button()
         self.chapters = [dict(row) for row in (chapters or [])]
         if not self.chapters:
             self.chapter = 0
@@ -27785,6 +28587,7 @@ class MainWindow(QMainWindow):
         self.player.error.connect(self.notify)
         self.player.buffer_status.connect(self._show_buffer_status)
         self._last_buffer_text = ""
+        self.mpris = MprisServer(self.player, self)
         self.disc_tab = None      # the CD tab while an audio CD is in a drive
         self._burn_job = None     # the disc burn in progress, if any
         self._burn_worker = None
@@ -28693,6 +29496,9 @@ class MainWindow(QMainWindow):
         self._last_buffer_text = text
 
     def closeEvent(self, e):
+        mpris = getattr(self, "mpris", None)
+        if mpris is not None:
+            mpris.shutdown()
         if getattr(self, "_tray", None) is not None:
             self._tray.hide()
         self._cd_watcher.stop()
