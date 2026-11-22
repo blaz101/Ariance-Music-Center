@@ -188,13 +188,14 @@ launcher_assignments = [line.strip() for line in launcher.splitlines()
                         if line.strip().startswith(("XDG_CONFIG_HOME=", "XDG_DATA_HOME="))]
 check("the launcher leaves the desktop config and data homes alone",
       not launcher_assignments, launcher_assignments)
-check("version is 1.33", ariance.VERSION == "1.33", ariance.VERSION)
+check("version is 1.33.1", ariance.VERSION == "1.33.1", ariance.VERSION)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 check("README title matches the version",
-      readme.startswith("# Ariance Music Center 1.33\n"), readme[:40])
-check("README has a 1.33 section", "## What's new in 1.33" in readme)
+      readme.startswith("# Ariance Music Center 1.33.1\n"), readme[:40])
+check("README has a 1.33.1 section", "## What's new in 1.33.1" in readme
+      and "## What's new in 1.33\n" in readme)
 build = open(os.path.join(ROOT, "packaging", "build-deb.sh"), encoding="utf-8").read()
-check("the package script builds 1.33", "\nV=1.33\n" in build, build[:200])
+check("the package script builds 1.33.1", "\nV=1.33.1\n" in build, build[:200])
 check("the package is named after the app", "PKG=ariance-music-center" in build, build[:200])
 
 # ------------------------------------------------------- the move from 1.29
@@ -1474,6 +1475,40 @@ w.config["cpu_cores"] = 0
 w.apply_resource_limits()
 check("the window removes the limit when it is taken away",
       sorted(os.sched_getaffinity(0)) == cores, sorted(os.sched_getaffinity(0)))
+
+# 1.33.1: a second launch brings the running copy back instead of starting again
+check("a cold start is not mistaken for a second launch",
+      ariance.notify_running_instance(200) is False)
+instance_server = ariance.claim_instance_socket()
+check("a running copy can claim the app's instance socket",
+      instance_server is not None)
+asked = []
+
+
+def _instance_request():
+    while instance_server is not None and instance_server.hasPendingConnections():
+        sock = instance_server.nextPendingConnection()
+        if sock is None:
+            break
+        if not sock.waitForReadyRead(300):
+            sock.deleteLater()
+            continue
+        asked.append(bytes(sock.readAll()))
+        sock.disconnectFromServer()
+        sock.deleteLater()
+
+
+if instance_server is not None:
+    instance_server.newConnection.connect(_instance_request)
+    reached = ariance.notify_running_instance(500)
+    app.processEvents()
+    check("a second launch asks the running copy to show its window",
+          reached and b"show" in b"".join(asked), (reached, asked))
+    instance_server.close()
+    ariance.QLocalServer.removeServer(ariance.instance_socket_name())
+else:
+    check("a second launch asks the running copy to show its window", False,
+          "no instance socket")
 
 # ---------------------------------------------------------------- grids
 section("grids: movable columns, remembered order and widths")

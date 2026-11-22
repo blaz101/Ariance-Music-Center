@@ -70,6 +70,7 @@ from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServic
                            QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QPixmapCache, QPolygonF, QShortcut, QTextCursor)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -149,7 +150,7 @@ except ImportError:  # no multimedia module at all
 # ======================================================================
 APP_NAME = "Ariance Music Center"      # the full title, used in About and the desktop entry
 APP_SHORT = "Ariance"                 # short name used in menus and messages
-VERSION = "1.33"
+VERSION = "1.33.1"
 SOURCE_URL = "https://github.com/blaz101/Ariance-Music-Center"
 CONTACT_EMAIL = "roger.barthares@gmail.com"
 # Let the desktop provide its own file chooser. The native GTK/portal dialog follows
@@ -30165,6 +30166,79 @@ def tray_available():
         return False
 
 
+# ---------------- one running copy ----------------
+def instance_socket_name():
+    """The local socket naming this user's copy, one per settings folder.
+
+    DATA_ROOT is part of the name, so a test home or a second profile can never
+    wake the copy that is using the real library.
+    """
+    digest = hashlib.sha256(os.path.abspath(DATA_ROOT).encode("utf-8")).hexdigest()[:10]
+    return f"ariance-{getattr(os, 'getuid', lambda: 0)()}-{digest}"
+
+
+def notify_running_instance(timeout_ms=400):
+    """Ask a copy that is already running to show its window.
+
+    True means the request was delivered and this process should exit: the running
+    copy owns the window, the player and the tray icon. A cold start gets False.
+    """
+    sock = QLocalSocket()
+    sock.connectToServer(instance_socket_name())
+    if not sock.waitForConnected(timeout_ms):
+        return False
+    sock.write(b"show\n")
+    sock.flush()
+    sock.waitForBytesWritten(timeout_ms)
+    sock.disconnectFromServer()
+    return True
+
+
+def claim_instance_socket():
+    """Listen for later launches; None when another copy got the name first."""
+    name = instance_socket_name()
+    # A crash leaves the socket behind; a cold start clears it. connectToServer()
+    # has already failed, so no live copy is using this name.
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if server.listen(name):
+        return server
+    return None
+
+
+def acquire_single_instance(timeout_ms=400):
+    """(server, already_running) for main(): claim the name or hand over to it."""
+    if notify_running_instance(timeout_ms):
+        return None, True
+    server = claim_instance_socket()
+    if server is not None:
+        return server, False
+    # Two cold starts can race (both failed to connect, one listened first): the
+    # one that lost the race is a second launch after all.
+    if notify_running_instance(timeout_ms * 2):
+        return None, True
+    return None, False
+
+
+def serve_instance_requests(server, app):
+    """Bring the window back when a second launch (taskbar, menu, launcher) arrives."""
+    while server.hasPendingConnections():
+        sock = server.nextPendingConnection()
+        if sock is None:
+            break
+        if not sock.waitForReadyRead(300):
+            sock.deleteLater()
+            continue
+        request = bytes(sock.readAll()).strip()
+        sock.disconnectFromServer()
+        sock.deleteLater()
+        if request.startswith(b"show"):
+            window = getattr(app, "_ariance_window", None)
+            if window is not None:
+                window._show_from_tray()
+
+
 def saved_size_fills_screen(w, h, avail):
     """Is a saved window size the work area itself, i.e. was the window maximized?
 
@@ -30830,8 +30904,8 @@ class MainWindow(QMainWindow):
         if announce and getattr(self, "_tray", None) is not None:
             self._tray.showMessage(
                 APP_SHORT,
-                f"{APP_SHORT} is still running. Click the tray icon to bring the window "
-                "back, or Quit in its menu to stop it.",
+                f"{APP_SHORT} is still running. Click its icon (taskbar or tray) to "
+                "bring the window back, or Quit in the tray menu to stop it.",
                 QSystemTrayIcon.MessageIcon.Information, 4000)
 
     def _quit(self):
@@ -30853,6 +30927,13 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        # Wayland may ignore activateWindow() unless the window asks its handle; the
+        # request is best effort and harmless where it is not needed.
+        handle = self.windowHandle()
+        if handle is not None:
+            request = getattr(handle, "requestActivate", None)
+            if request is not None:
+                request()
 
     def _tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
@@ -31260,8 +31341,6 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    shutil.rmtree(CD_BUFFER_DIR, ignore_errors=True)   # buffered tracks only live as long as the queue
-    shutil.rmtree(DEVICE_BUFFER_DIR, ignore_errors=True)   # and device copies only live for the session
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
@@ -31274,8 +31353,20 @@ def main():
     # A window that closes into the tray is hidden, not the last window gone: the
     # event loop has to outlive it. A real close calls quit() from closeEvent.
     app.setQuitOnLastWindowClosed(False)
+    # A launch while the app is already running (the taskbar icon with the window
+    # hidden, or the app menu) belongs to that copy: ask it to show and exit before
+    # touching the session's buffer folders or opening a second window.
+    instance, already_running = acquire_single_instance()
+    if already_running:
+        return
+    if instance is not None:
+        instance.newConnection.connect(
+            lambda: serve_instance_requests(instance, app))
+    shutil.rmtree(CD_BUFFER_DIR, ignore_errors=True)   # buffered tracks only live as long as the queue
+    shutil.rmtree(DEVICE_BUFFER_DIR, ignore_errors=True)   # and device copies only live for the session
     install_app_style(app)
     w = MainWindow()
+    app._ariance_window = w
     if start_hidden(w.config, sys.argv[1:]):
         w._started_hidden = True
         w.hide()               # tray only: the icon is the app until it is clicked

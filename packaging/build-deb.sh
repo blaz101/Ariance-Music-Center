@@ -1,12 +1,12 @@
 #!/bin/bash
 # Copyright (C) 2026 Roger Barthares
 # SPDX-License-Identifier: GPL-3.0-only
-# Build ariance-music-center_1.33_amd64.deb from the source tree.
+# Build ariance-music-center_1.33.1_amd64.deb from the source tree.
 # The bundle is the same one the zip and the AppImage ship: PySide6, mutagen and
 # the X11/font/audio helper libraries, so the package needs no distro Qt.
 set -euo pipefail
 
-V=1.33
+V=1.33.1
 PKG=ariance-music-center
 ARCH=amd64
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
